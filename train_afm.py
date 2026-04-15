@@ -13,24 +13,31 @@ from torch.utils.data import DataLoader
 from data.dataset import ClimateSRDatasetNPY, inverse_transform, load_domain_stats
 from models.afm import AFMModel
 from uda import (
-    coral_loss, mmd_loss, spectral_density_loss,
-    DomainDiscriminator, dann_loss, dann_grl_schedule,
-    fda_transfer, apply_adabn,
+    DomainDiscriminator,
+    coral_loss,
+    dann_grl_schedule,
+    dann_loss,
+    fda_transfer,
+    mmd_loss,
+    spectral_density_loss,
 )
 
 _NEEDS_TARGET_FORWARD = {"coral", "mmd", "spectral", "dann"}
 _NEEDS_FEATURES = {"coral", "mmd", "dann"}
 
 
-def _tag(s, t): return f"{Path(s).stem}__to__{Path(t).stem}"
-def _base_hp_path(o, s, t): return Path(o) / "base_hp" / f"{_tag(s, t)}.json"
+def _tag(s, t):
+    return f"{Path(s).stem}__to__{Path(t).stem}"
+
+
+def _base_hp_path(o, s, t):
+    return Path(o) / "base_hp" / f"{_tag(s, t)}.json"
 
 
 def build_loaders(args, ss, ts, bs=None):
     bs = bs or args.batch_size
     nw = min(args.num_workers, 2)
-    kw = dict(num_workers=nw, pin_memory=True, persistent_workers=nw > 0,
-              prefetch_factor=2 if nw > 0 else None)
+    kw = dict(num_workers=nw, pin_memory=True, persistent_workers=nw > 0, prefetch_factor=2 if nw > 0 else None)
     mk = lambda p, sp, st: ClimateSRDatasetNPY(p, sp, stats=st, subset_size=args.subset_size)
     return (
         DataLoader(mk(args.source_path, "train", ss), bs, shuffle=True, drop_last=True, **kw),
@@ -41,26 +48,31 @@ def build_loaders(args, ss, ts, bs=None):
 
 
 def build_uda(method, device):
-    if method == "coral": return {"loss_fn": coral_loss}, []
-    if method == "mmd": return {"loss_fn": mmd_loss}, []
-    if method == "spectral": return {"loss_fn": spectral_density_loss}, []
+    if method == "coral":
+        return {"loss_fn": coral_loss}, []
+    if method == "mmd":
+        return {"loss_fn": mmd_loss}, []
+    if method == "spectral":
+        return {"loss_fn": spectral_density_loss}, []
     if method == "dann":
         d = DomainDiscriminator(1024, 256).to(device)
         return {"disc": d}, list(d.parameters())
     return {}, []
 
 
-def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method,
-                    lam, beta, device, epoch, total):
+def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method, lam, beta, device, epoch, total):
     model.train()
-    sf, se, su, n = 0., 0., 0., 0
+    sf, se, su, n = 0.0, 0.0, 0.0, 0
     use_f = method in _NEEDS_FEATURES
     alpha = dann_grl_schedule(epoch, total) if method == "dann" else 1.0
     tgt_it = iter(tgt_ld)
 
     for sb in src_ld:
-        try: tb = next(tgt_it)
-        except StopIteration: tgt_it = iter(tgt_ld); tb = next(tgt_it)
+        try:
+            tb = next(tgt_it)
+        except StopIteration:
+            tgt_it = iter(tgt_ld)
+            tb = next(tgt_it)
 
         xs, ss, ys = (t.to(device, non_blocking=True) for t in sb)
         xt, st, _ = (t.to(device, non_blocking=True) for t in tb)
@@ -79,8 +91,7 @@ def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method,
                 uda = uda_comp["loss_fn"](out["features"]["bottleneck"], tf["bottleneck"])
             elif method == "dann":
                 _, tf = model(xt, st, extract_features=True)
-                uda = dann_loss(uda_comp["disc"], out["features"]["bottleneck"],
-                                tf["bottleneck"], alpha)
+                uda = dann_loss(uda_comp["disc"], out["features"]["bottleneck"], tf["bottleneck"], alpha)
             elif method == "spectral":
                 sp = model.encoder(xs, ss)
                 tp = model.encoder(xt, st)
@@ -92,16 +103,18 @@ def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method,
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        sf += out["flow_loss"].item(); se += out["encoder_loss"].item()
-        su += uda.item(); n += 1
+        sf += out["flow_loss"].item()
+        se += out["encoder_loss"].item()
+        su += uda.item()
+        n += 1
 
-    return {"flow": sf/n, "enc": se/n, "uda": su/n, "sigma_z": model.sigma_z.item()}
+    return {"flow": sf / n, "enc": se / n, "uda": su / n, "sigma_z": model.sigma_z.item()}
 
 
 @torch.no_grad()
 def evaluate(model, loader, device, stats, var="precipitation", n_ens=0, steps=20):
     model.eval()
-    sl, sm, n = 0., 0., 0
+    sl, sm, n = 0.0, 0.0, 0
     crit = nn.MSELoss()
     for b in loader:
         x, s, y = (t.to(device, non_blocking=True) for t in b)
@@ -110,12 +123,14 @@ def evaluate(model, loader, device, stats, var="precipitation", n_ens=0, steps=2
             sl += crit(mu, y).item()
         p = inverse_transform(mu.float().cpu().numpy(), var, stats)
         t = inverse_transform(y.float().cpu().numpy(), var, stats)
-        sm += float(np.abs(p - t).mean()); n += 1
-    return {"loss": sl/n, "mae_mm": sm/n}
+        sm += float(np.abs(p - t).mean())
+        n += 1
+    return {"loss": sl / n, "mae_mm": sm / n}
 
 
-def run_training(args, device, lr=None, lambda_uda=None, batch_size=None,
-                 fda_beta=None, weight_decay=None, enc_w=None, trial=None):
+def run_training(
+    args, device, lr=None, lambda_uda=None, batch_size=None, fda_beta=None, weight_decay=None, enc_w=None, trial=None
+):
     _lr = lr or args.lr
     _lam = lambda_uda if lambda_uda is not None else args.lambda_uda
     _bs = batch_size or args.batch_size
@@ -142,27 +157,34 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None,
     best, wait = float("inf"), 0
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        tr = train_one_epoch(model, src_tr, tgt_tr, opt, uc,
-                             args.uda_method, _lam, _beta, device, epoch, args.epochs)
+        tr = train_one_epoch(model, src_tr, tgt_tr, opt, uc, args.uda_method, _lam, _beta, device, epoch, args.epochs)
         sched.step()
         val = evaluate(model, src_val, device, ss)
         tgt = evaluate(model, tgt_te, device, ts)
 
-        print(f"[{epoch:3d}/{args.epochs}] {time.time()-t0:5.1f}s  "
-              f"flow={tr['flow']:.4f} enc={tr['enc']:.4f} uda={tr['uda']:.4f} "
-              f"σz={tr['sigma_z']:.4f} val={val['loss']:.4f} tgt_mae={tgt['mae_mm']:.3f}mm")
+        print(
+            f"[{epoch:3d}/{args.epochs}] {time.time()-t0:5.1f}s  "
+            f"flow={tr['flow']:.4f} enc={tr['enc']:.4f} uda={tr['uda']:.4f} "
+            f"σz={tr['sigma_z']:.4f} val={val['loss']:.4f} tgt_mae={tgt['mae_mm']:.3f}mm"
+        )
 
         if tgt["loss"] < best:
-            best = tgt["loss"]; wait = 0
-            if trial is None: torch.save(model.state_dict(), out / "best.pt")
-        else: wait += 1
+            best = tgt["loss"]
+            wait = 0
+            if trial is None:
+                torch.save(model.state_dict(), out / "best.pt")
+        else:
+            wait += 1
 
         if args.patience > 0 and wait >= args.patience:
-            print(f"Early stopping at epoch {epoch}"); break
+            print(f"Early stopping at epoch {epoch}")
+            break
         if trial is not None:
             trial.report(tgt["loss"], epoch)
             if trial.should_prune():
-                import optuna; raise optuna.TrialPruned()
+                import optuna
+
+                raise optuna.TrialPruned()
 
     if args.uda_method == "adabn" and trial is None:
         if (out / "best.pt").exists():
@@ -174,8 +196,16 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None,
         torch.save(model.state_dict(), out / "best_adabn.pt")
 
     if trial is None:
-        cfg = {**vars(args), "lr": _lr, "bs": _bs, "wd": _wd,
-               "lambda": _lam, "beta": _beta, "enc_w": _ew, "best_tgt_loss": best}
+        cfg = {
+            **vars(args),
+            "lr": _lr,
+            "bs": _bs,
+            "wd": _wd,
+            "lambda": _lam,
+            "beta": _beta,
+            "enc_w": _ew,
+            "best_tgt_loss": best,
+        }
         (out / "config.json").write_text(json.dumps(cfg, indent=2))
     return best
 
@@ -185,8 +215,10 @@ def _adabn_afm(model, loader, device):
     """AdaBN for AFM. Uses encoder prediction (not target labels) for flow net pass."""
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
-            m.running_mean.zero_(); m.running_var.fill_(1.0)
-            m.num_batches_tracked.zero_(); m.momentum = None
+            m.running_mean.zero_()
+            m.running_var.fill_(1.0)
+            m.num_batches_tracked.zero_()
+            m.momentum = None
     model.train()
     for x, s, _ in loader:
         x, s = x.to(device), s.to(device)
@@ -202,49 +234,99 @@ def _adabn_afm(model, loader, device):
 
 # --- Optuna ---
 
+
 def _p1_obj(trial, args, device):
     lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
     wd = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
     ew = trial.suggest_float("encoder_loss_weight", 0.01, 1.0, log=True)
-    saved = args.uda_method; args.uda_method = "none"
-    try: return run_training(args, device, lr=lr, weight_decay=wd, enc_w=ew,
-                             lambda_uda=0.0, trial=trial)
-    finally: args.uda_method = saved
+    saved = args.uda_method
+    args.uda_method = "none"
+    try:
+        return run_training(args, device, lr=lr, weight_decay=wd, enc_w=ew, lambda_uda=0.0, trial=trial)
+    finally:
+        args.uda_method = saved
+
 
 def run_phase1(args, device):
     import optuna
     from optuna.storages import RDBStorage
+
     tag = _tag(args.source_path, args.target_path)
     db = Path(args.output_dir) / "optuna" / f"afm_p1_{tag}.db"
     db.parent.mkdir(parents=True, exist_ok=True)
     st = RDBStorage(f"sqlite:///{db}", engine_kwargs={"connect_args": {"timeout": 60}})
+<<<<<<< HEAD
     study = optuna.create_study(f"afm_p1_{tag}", storage=st, direction="minimize",
                                 load_if_exists=True,
                                 pruner=optuna.pruners.MedianPruner(5, n_warmup_steps=10))
     study.optimize(lambda t: _p1_obj(t, args, device), n_trials=args.n_trials,
                    timeout=args.optuna_timeout)
     best = study.best_params
+=======
+    study = optuna.create_study(
+        f"afm_p1_{tag}",
+        storage=st,
+        direction="minimize",
+        load_if_exists=True,
+        pruner=optuna.pruners.MedianPruner(5, n_warmup_steps=10),
+    )
+    study.optimize(lambda t: _p1_obj(t, args, device), n_trials=args.n_trials, timeout=args.optuna_timeout)
+    best = study.best_params
+    best["batch_size"] = args.batch_size
+>>>>>>> a49660f798561e912ab8c0466219a036663b79ce
     print(f"\nAFM Phase 1 best: {best}")
     hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
     hp.parent.mkdir(parents=True, exist_ok=True)
     hp.write_text(json.dumps(best, indent=2))
     args.uda_method = "none"
+<<<<<<< HEAD
     run_training(args, device, lr=best["lr"], weight_decay=best["weight_decay"],
                  enc_w=best["encoder_loss_weight"], lambda_uda=0.0)
+=======
+    run_training(
+        args,
+        device,
+        lr=best["lr"],
+        weight_decay=best["weight_decay"],
+        batch_size=best["batch_size"],
+        enc_w=best["encoder_loss_weight"],
+        lambda_uda=0.0,
+    )
+
+>>>>>>> a49660f798561e912ab8c0466219a036663b79ce
 
 def _p2_obj(trial, args, device, bhp):
     lam = trial.suggest_float("lambda_uda", 0.001, 1.0, log=True)
     beta = args.fda_beta
+<<<<<<< HEAD
     if args.uda_method == "fda": beta = trial.suggest_float("fda_beta", 0.001, 0.1, log=True)
     return run_training(args, device, lr=bhp["lr"],
                         weight_decay=bhp["weight_decay"],
                         enc_w=bhp.get("encoder_loss_weight", 0.1),
                         lambda_uda=lam, fda_beta=beta, trial=trial)
+=======
+    if args.uda_method == "fda":
+        beta = trial.suggest_float("fda_beta", 0.001, 0.1, log=True)
+    return run_training(
+        args,
+        device,
+        lr=bhp["lr"],
+        batch_size=bhp["batch_size"],
+        weight_decay=bhp["weight_decay"],
+        enc_w=bhp.get("encoder_loss_weight", 0.1),
+        lambda_uda=lam,
+        fda_beta=beta,
+        trial=trial,
+    )
+
+>>>>>>> a49660f798561e912ab8c0466219a036663b79ce
 
 def run_phase2(args, device):
     import optuna
     from optuna.storages import RDBStorage
-    if args.uda_method == "none": return
+
+    if args.uda_method == "none":
+        return
     hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
     bhp = json.loads(hp.read_text())
     tag = _tag(args.source_path, args.target_path)
@@ -252,19 +334,36 @@ def run_phase2(args, device):
     db = Path(args.output_dir) / "optuna" / f"{name}.db"
     db.parent.mkdir(parents=True, exist_ok=True)
     st = RDBStorage(f"sqlite:///{db}", engine_kwargs={"connect_args": {"timeout": 60}})
-    study = optuna.create_study(name, storage=st, direction="minimize", load_if_exists=True,
-                                pruner=optuna.pruners.MedianPruner(3, n_warmup_steps=10))
-    study.optimize(lambda t: _p2_obj(t, args, device, bhp), n_trials=args.n_trials,
-                   timeout=args.optuna_timeout)
+    study = optuna.create_study(
+        name,
+        storage=st,
+        direction="minimize",
+        load_if_exists=True,
+        pruner=optuna.pruners.MedianPruner(3, n_warmup_steps=10),
+    )
+    study.optimize(lambda t: _p2_obj(t, args, device, bhp), n_trials=args.n_trials, timeout=args.optuna_timeout)
     best = study.best_params
     print(f"\nAFM Phase 2 ({args.uda_method}): {best}")
     combined = {**bhp, **best, "uda_method": args.uda_method}
     combo = Path(args.output_dir) / "best_hp" / f"afm_{tag}__{args.uda_method}.json"
     combo.parent.mkdir(parents=True, exist_ok=True)
     combo.write_text(json.dumps(combined, indent=2))
+<<<<<<< HEAD
     run_training(args, device, lr=bhp["lr"],
                  weight_decay=bhp["weight_decay"], enc_w=bhp.get("encoder_loss_weight", 0.1),
                  lambda_uda=best["lambda_uda"], fda_beta=best.get("fda_beta", args.fda_beta))
+=======
+    run_training(
+        args,
+        device,
+        lr=bhp["lr"],
+        batch_size=bhp["batch_size"],
+        weight_decay=bhp["weight_decay"],
+        enc_w=bhp.get("encoder_loss_weight", 0.1),
+        lambda_uda=best["lambda_uda"],
+        fda_beta=best.get("fda_beta", args.fda_beta),
+    )
+>>>>>>> a49660f798561e912ab8c0466219a036663b79ce
 
 
 def parse_args():
@@ -272,8 +371,7 @@ def parse_args():
     p.add_argument("--source_path", required=True)
     p.add_argument("--target_path", required=True)
     p.add_argument("--output_dir", default="./experiments")
-    p.add_argument("--uda_method", default="none",
-                   choices=["none","coral","mmd","spectral","fda","dann","adabn"])
+    p.add_argument("--uda_method", default="none", choices=["none", "coral", "mmd", "spectral", "fda", "dann", "adabn"])
     p.add_argument("--lambda_uda", type=float, default=0.1)
     p.add_argument("--fda_beta", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=100)
@@ -296,7 +394,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed); device = torch.device("cuda")
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
     if args.optuna:
@@ -305,10 +404,24 @@ def main():
         hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
         if hp.exists():
             b = json.loads(hp.read_text())
+<<<<<<< HEAD
             run_training(args, device, lr=b["lr"],
                          weight_decay=b["weight_decay"],
                          enc_w=b.get("encoder_loss_weight", 0.1))
         else: run_training(args, device)
+=======
+            run_training(
+                args,
+                device,
+                lr=b["lr"],
+                batch_size=b["batch_size"],
+                weight_decay=b["weight_decay"],
+                enc_w=b.get("encoder_loss_weight", 0.1),
+            )
+        else:
+            run_training(args, device)
+
+>>>>>>> a49660f798561e912ab8c0466219a036663b79ce
 
 if __name__ == "__main__":
     main()

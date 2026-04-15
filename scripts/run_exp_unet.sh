@@ -31,23 +31,23 @@
 #SBATCH --output outputs/%j
 #SBATCH --error  job_errors/%j
 
-#SBATCH --partition gpu-gh
+#SBATCH --partition gpu
 #SBATCH --gres gpu:1
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task 12
-#SBATCH --mem 400G
+#SBATCH --mem 435G
 #SBATCH --time 72:00:00
 
 set -euo pipefail
 
-export SINGULARITY_BINDPATH="/work,/scratch,/users"
-export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/lib/libucp.so.0:/opt/hpcx/ucx/lib/libucs.so.0"
+# export SINGULARITY_BINDPATH="/work,/scratch,/users"
+# export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/lib/libucp.so.0:/opt/hpcx/ucx/lib/libucs.so.0"
 
 # --- Configuration --------------------------------------------------------
 CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
-CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/WeatherAdaptSR"
+CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/rainshift_npy"
 OUTPUT_DIR="/scratch/fquareng/rainshift_uda/unet"
 DATA_FORMAT="npy"
@@ -58,8 +58,8 @@ PHASE="${PHASE:-1}"
 
 REGIONS=(
     "europe_west"
-    "blacksea"
-    "horn-of-africa"
+    # "blacksea"
+    # "horn-of-africa"
     "melanesia"
 )
 
@@ -70,10 +70,10 @@ METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn")
 EPOCHS=100
 PATIENCE=10
 NUM_WORKERS=8
-SUBSET_SIZE=5000
+SUBSET_SIZE=1000
 
 # Optuna settings
-N_TRIALS_P1=10      # phase 1: more trials, 3D search space
+N_TRIALS_P1=10      
 N_TRIALS_P2=10      # phase 2: fewer trials, 1-2D search space
 OPTUNA_TIMEOUT=172800
 
