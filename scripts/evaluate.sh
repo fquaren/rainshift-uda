@@ -28,7 +28,7 @@ export SINGULARITY_BINDPATH="/work,/scratch,/users"
 export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/lib/libucp.so.0:/opt/hpcx/ucx/lib/libucs.so.0"
 
 CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
-CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/WeatherAdaptSR"
+CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
 OUTPUT_DIR="/scratch/fquareng/rainshift_uda"
 RESULTS_DIR="/scratch/fquareng/rainshift_uda/results"
 

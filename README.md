@@ -9,18 +9,18 @@ Unsupervised domain adaptation for precipitation super-resolution on the [RainSh
 
 ## UDA methods
 
-| Method | Type | Reference |
-|--------|------|-----------|
-| CORAL | Feature-level (2nd-order stats) | Sun & Saenko, ECCV-W 2016 |
-| MMD | Feature-level (kernel) | Gretton et al., JMLR 2012 |
-| DANN | Feature-level (adversarial) | Ganin et al., JMLR 2016 |
-| Spectral | Output-level (PSD matching) | — |
-| FDA | Input-level (Fourier amplitude swap) | Yang & Soatto, CVPR 2020 |
-| AdaBN | Test-time (BN stat replacement) | Li et al., 2018 |
+| Method   | Type                                 | Reference                 |
+| -------- | ------------------------------------ | ------------------------- |
+| CORAL    | Feature-level (2nd-order stats)      | Sun & Saenko, ECCV-W 2016 |
+| MMD      | Feature-level (kernel)               | Gretton et al., JMLR 2012 |
+| DANN     | Feature-level (adversarial)          | Ganin et al., JMLR 2016   |
+| Spectral | Output-level (PSD matching)          | —                         |
+| FDA      | Input-level (Fourier amplitude swap) | Yang & Soatto, CVPR 2020  |
+| AdaBN    | Test-time (BN stat replacement)      | Li et al., 2018           |
 
 ## Repository structure
 
-```
+``` plaintext
 data/
   dataset.py              ClimateSRDatasetNPY (fast, recommended)
   convert_zarr_to_npy.py  one-time preprocessing from zarr
@@ -90,6 +90,7 @@ sbatch scripts/evaluate.sh
 ## Domain difficulty ranking
 
 Domains are ranked by normalised Wasserstein-1 distance to europe_west (source):
+
 - **blacksea** — easy (W₁ ≈ 0.00)
 - **horn-of-africa** — medium (W₁ ≈ 0.05)
 - **melanesia** — hard (W₁ ≈ 0.16)
