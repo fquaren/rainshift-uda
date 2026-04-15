@@ -272,7 +272,6 @@ def run_phase1(args, device):
                    n_trials=args.n_trials, timeout=args.optuna_timeout)
 
     best = study.best_params
-    best["batch_size"] = args.batch_size
     print(f"\nPhase 1 best: {best} (value={study.best_value:.6f})")
 
     hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
@@ -281,7 +280,7 @@ def run_phase1(args, device):
 
     args.uda_method = "none"
     run_training(args, device, lr=best["lr"], weight_decay=best["weight_decay"],
-                 batch_size=best["batch_size"], lambda_uda=0.0)
+                 lambda_uda=0.0)
     return best
 
 
@@ -298,7 +297,6 @@ def _phase2_objective(trial, args, device, base_hp):
     if args.uda_method == "fda":
         beta = trial.suggest_float("fda_beta", 0.001, 0.1, log=True)
     return run_training(args, device, lr=base_hp["lr"],
-                        batch_size=base_hp["batch_size"],
                         weight_decay=base_hp["weight_decay"],
                         lambda_uda=lam, fda_beta=beta, trial=trial)
 
@@ -335,7 +333,7 @@ def run_phase2(args, device):
     combo.parent.mkdir(parents=True, exist_ok=True)
     combo.write_text(json.dumps(combined, indent=2))
 
-    run_training(args, device, lr=base_hp["lr"], batch_size=base_hp["batch_size"],
+    run_training(args, device, lr=base_hp["lr"],
                  weight_decay=base_hp["weight_decay"], lambda_uda=best["lambda_uda"],
                  fda_beta=best.get("fda_beta", args.fda_beta))
 
@@ -389,7 +387,6 @@ def main():
         if hp.exists():
             base = json.loads(hp.read_text())
             run_training(args, device, lr=base["lr"],
-                         batch_size=base["batch_size"],
                          weight_decay=base["weight_decay"])
         else:
             run_training(args, device)

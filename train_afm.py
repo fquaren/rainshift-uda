@@ -182,17 +182,20 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None,
 
 @torch.no_grad()
 def _adabn_afm(model, loader, device):
+    """AdaBN for AFM. Uses encoder prediction (not target labels) for flow net pass."""
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
             m.running_mean.zero_(); m.running_var.fill_(1.0)
             m.num_batches_tracked.zero_(); m.momentum = None
     model.train()
-    for x, s, y in loader:
-        x, s, y = x.to(device), s.to(device), y.to(device)
+    for x, s, _ in loader:
+        x, s = x.to(device), s.to(device)
         mu = model.encoder(x, s)
         t = torch.rand(x.shape[0], device=device)
         z = mu + model.sigma_z * torch.randn_like(mu)
-        xt = (1 - t[:, None, None, None]) * z + t[:, None, None, None] * y
+        # use mu (not target y) as proxy — keeps AdaBN fully unsupervised
+        te = t[:, None, None, None]
+        xt = (1 - te) * z + te * mu
         model.flow_net(xt, t, x, s)
     model.eval()
 
@@ -220,21 +223,20 @@ def run_phase1(args, device):
                                 pruner=optuna.pruners.MedianPruner(5, n_warmup_steps=10))
     study.optimize(lambda t: _p1_obj(t, args, device), n_trials=args.n_trials,
                    timeout=args.optuna_timeout)
-    best = study.best_params; best["batch_size"] = args.batch_size
+    best = study.best_params
     print(f"\nAFM Phase 1 best: {best}")
     hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
     hp.parent.mkdir(parents=True, exist_ok=True)
     hp.write_text(json.dumps(best, indent=2))
     args.uda_method = "none"
     run_training(args, device, lr=best["lr"], weight_decay=best["weight_decay"],
-                 batch_size=best["batch_size"], enc_w=best["encoder_loss_weight"],
-                 lambda_uda=0.0)
+                 enc_w=best["encoder_loss_weight"], lambda_uda=0.0)
 
 def _p2_obj(trial, args, device, bhp):
     lam = trial.suggest_float("lambda_uda", 0.001, 1.0, log=True)
     beta = args.fda_beta
     if args.uda_method == "fda": beta = trial.suggest_float("fda_beta", 0.001, 0.1, log=True)
-    return run_training(args, device, lr=bhp["lr"], batch_size=bhp["batch_size"],
+    return run_training(args, device, lr=bhp["lr"],
                         weight_decay=bhp["weight_decay"],
                         enc_w=bhp.get("encoder_loss_weight", 0.1),
                         lambda_uda=lam, fda_beta=beta, trial=trial)
@@ -260,7 +262,7 @@ def run_phase2(args, device):
     combo = Path(args.output_dir) / "best_hp" / f"afm_{tag}__{args.uda_method}.json"
     combo.parent.mkdir(parents=True, exist_ok=True)
     combo.write_text(json.dumps(combined, indent=2))
-    run_training(args, device, lr=bhp["lr"], batch_size=bhp["batch_size"],
+    run_training(args, device, lr=bhp["lr"],
                  weight_decay=bhp["weight_decay"], enc_w=bhp.get("encoder_loss_weight", 0.1),
                  lambda_uda=best["lambda_uda"], fda_beta=best.get("fda_beta", args.fda_beta))
 
@@ -303,7 +305,7 @@ def main():
         hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
         if hp.exists():
             b = json.loads(hp.read_text())
-            run_training(args, device, lr=b["lr"], batch_size=b["batch_size"],
+            run_training(args, device, lr=b["lr"],
                          weight_decay=b["weight_decay"],
                          enc_w=b.get("encoder_loss_weight", 0.1))
         else: run_training(args, device)
