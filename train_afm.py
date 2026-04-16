@@ -1,4 +1,4 @@
-"""AFM training with UDA. Mirrors train_unet.py structure."""
+"""AFM training with UDA. Single-phase Optuna workflow."""
 
 import argparse
 import json
@@ -83,7 +83,7 @@ def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method, lam, beta, dev
 
             out = model(xs, ss, x_target=ys, extract_features=(use_f or method == "spectral"))
             task = out["total_loss"]
-            uda = torch.zeros(1, device=device)
+            uda = torch.tensor(0.0, device=device)
 
             if method in ("coral", "mmd"):
                 tgt_out = model(xt, st, extract_features=True)
@@ -168,8 +168,8 @@ def run_training(
             f"σz={tr['sigma_z']:.4f} val={val['loss']:.4f} tgt_mae={tgt['mae_mm']:.3f}mm"
         )
 
-        if tgt["loss"] < best:
-            best = tgt["loss"]
+        if val["loss"] < best:
+            best = val["loss"]
             wait = 0
             if trial is None:
                 torch.save(model.state_dict(), out / "best.pt")
@@ -179,11 +179,11 @@ def run_training(
         if args.patience > 0 and wait >= args.patience:
             print(f"Early stopping at epoch {epoch}")
             break
+            
         if trial is not None:
-            trial.report(tgt["loss"], epoch)
+            trial.report(val["loss"], epoch)
             if trial.should_prune():
                 import optuna
-
                 raise optuna.TrialPruned()
 
     if args.uda_method == "adabn" and trial is None:
@@ -192,7 +192,6 @@ def run_training(
         _adabn_afm(model, tgt_tr, device)
         tgt = evaluate(model, tgt_te, device, ts)
         print(f"  AdaBN -> tgt_mae={tgt['mae_mm']:.3f}mm")
-        best = min(best, tgt["loss"])
         torch.save(model.state_dict(), out / "best_adabn.pt")
 
     if trial is None:
@@ -204,9 +203,15 @@ def run_training(
             "lambda": _lam,
             "beta": _beta,
             "enc_w": _ew,
-            "best_tgt_loss": best,
+            "best_val_loss": best,
         }
+        if args.uda_method != "none":
+            combo = Path(args.output_dir) / "best_hp" / f"afm_{_tag(args.source_path, args.target_path)}__{args.uda_method}.json"
+            combo.parent.mkdir(parents=True, exist_ok=True)
+            combo.write_text(json.dumps(cfg, indent=2))
+
         (out / "config.json").write_text(json.dumps(cfg, indent=2))
+        
     return best
 
 
@@ -225,7 +230,6 @@ def _adabn_afm(model, loader, device):
         mu = model.encoder(x, s)
         t = torch.rand(x.shape[0], device=device)
         z = mu + model.sigma_z * torch.randn_like(mu)
-        # use mu (not target y) as proxy — keeps AdaBN fully unsupervised
         te = t[:, None, None, None]
         xt = (1 - te) * z + te * mu
         model.flow_net(xt, t, x, s)
@@ -234,15 +238,16 @@ def _adabn_afm(model, loader, device):
 
 # --- Optuna ---
 
-
 def _p1_obj(trial, args, device):
     lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
     wd = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
     ew = trial.suggest_float("encoder_loss_weight", 0.01, 1.0, log=True)
+    bs = trial.suggest_categorical("batch_size", [16, 32, 64])
+    
     saved = args.uda_method
     args.uda_method = "none"
     try:
-        return run_training(args, device, lr=lr, weight_decay=wd, enc_w=ew, lambda_uda=0.0, trial=trial)
+        return run_training(args, device, lr=lr, weight_decay=wd, batch_size=bs, enc_w=ew, lambda_uda=0.0, trial=trial)
     finally:
         args.uda_method = saved
 
@@ -255,34 +260,23 @@ def run_phase1(args, device):
     db = Path(args.output_dir) / "optuna" / f"afm_p1_{tag}.db"
     db.parent.mkdir(parents=True, exist_ok=True)
     st = RDBStorage(f"sqlite:///{db}", engine_kwargs={"connect_args": {"timeout": 60}})
-<<<<<<< HEAD
-    study = optuna.create_study(f"afm_p1_{tag}", storage=st, direction="minimize",
-                                load_if_exists=True,
-                                pruner=optuna.pruners.MedianPruner(5, n_warmup_steps=10))
-    study.optimize(lambda t: _p1_obj(t, args, device), n_trials=args.n_trials,
-                   timeout=args.optuna_timeout)
-    best = study.best_params
-=======
+
     study = optuna.create_study(
-        f"afm_p1_{tag}",
+        study_name=f"afm_p1_{tag}",
         storage=st,
         direction="minimize",
         load_if_exists=True,
         pruner=optuna.pruners.MedianPruner(5, n_warmup_steps=10),
     )
     study.optimize(lambda t: _p1_obj(t, args, device), n_trials=args.n_trials, timeout=args.optuna_timeout)
+    
     best = study.best_params
-    best["batch_size"] = args.batch_size
->>>>>>> a49660f798561e912ab8c0466219a036663b79ce
     print(f"\nAFM Phase 1 best: {best}")
     hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
     hp.parent.mkdir(parents=True, exist_ok=True)
     hp.write_text(json.dumps(best, indent=2))
+    
     args.uda_method = "none"
-<<<<<<< HEAD
-    run_training(args, device, lr=best["lr"], weight_decay=best["weight_decay"],
-                 enc_w=best["encoder_loss_weight"], lambda_uda=0.0)
-=======
     run_training(
         args,
         device,
@@ -293,84 +287,13 @@ def run_phase1(args, device):
         lambda_uda=0.0,
     )
 
->>>>>>> a49660f798561e912ab8c0466219a036663b79ce
-
-def _p2_obj(trial, args, device, bhp):
-    lam = trial.suggest_float("lambda_uda", 0.001, 1.0, log=True)
-    beta = args.fda_beta
-<<<<<<< HEAD
-    if args.uda_method == "fda": beta = trial.suggest_float("fda_beta", 0.001, 0.1, log=True)
-    return run_training(args, device, lr=bhp["lr"],
-                        weight_decay=bhp["weight_decay"],
-                        enc_w=bhp.get("encoder_loss_weight", 0.1),
-                        lambda_uda=lam, fda_beta=beta, trial=trial)
-=======
-    if args.uda_method == "fda":
-        beta = trial.suggest_float("fda_beta", 0.001, 0.1, log=True)
-    return run_training(
-        args,
-        device,
-        lr=bhp["lr"],
-        batch_size=bhp["batch_size"],
-        weight_decay=bhp["weight_decay"],
-        enc_w=bhp.get("encoder_loss_weight", 0.1),
-        lambda_uda=lam,
-        fda_beta=beta,
-        trial=trial,
-    )
-
->>>>>>> a49660f798561e912ab8c0466219a036663b79ce
-
-def run_phase2(args, device):
-    import optuna
-    from optuna.storages import RDBStorage
-
-    if args.uda_method == "none":
-        return
-    hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
-    bhp = json.loads(hp.read_text())
-    tag = _tag(args.source_path, args.target_path)
-    name = f"afm_p2_{tag}__{args.uda_method}"
-    db = Path(args.output_dir) / "optuna" / f"{name}.db"
-    db.parent.mkdir(parents=True, exist_ok=True)
-    st = RDBStorage(f"sqlite:///{db}", engine_kwargs={"connect_args": {"timeout": 60}})
-    study = optuna.create_study(
-        name,
-        storage=st,
-        direction="minimize",
-        load_if_exists=True,
-        pruner=optuna.pruners.MedianPruner(3, n_warmup_steps=10),
-    )
-    study.optimize(lambda t: _p2_obj(t, args, device, bhp), n_trials=args.n_trials, timeout=args.optuna_timeout)
-    best = study.best_params
-    print(f"\nAFM Phase 2 ({args.uda_method}): {best}")
-    combined = {**bhp, **best, "uda_method": args.uda_method}
-    combo = Path(args.output_dir) / "best_hp" / f"afm_{tag}__{args.uda_method}.json"
-    combo.parent.mkdir(parents=True, exist_ok=True)
-    combo.write_text(json.dumps(combined, indent=2))
-<<<<<<< HEAD
-    run_training(args, device, lr=bhp["lr"],
-                 weight_decay=bhp["weight_decay"], enc_w=bhp.get("encoder_loss_weight", 0.1),
-                 lambda_uda=best["lambda_uda"], fda_beta=best.get("fda_beta", args.fda_beta))
-=======
-    run_training(
-        args,
-        device,
-        lr=bhp["lr"],
-        batch_size=bhp["batch_size"],
-        weight_decay=bhp["weight_decay"],
-        enc_w=bhp.get("encoder_loss_weight", 0.1),
-        lambda_uda=best["lambda_uda"],
-        fda_beta=best.get("fda_beta", args.fda_beta),
-    )
->>>>>>> a49660f798561e912ab8c0466219a036663b79ce
-
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--source_path", required=True)
     p.add_argument("--target_path", required=True)
     p.add_argument("--output_dir", default="./experiments")
+    p.add_argument("--data_format", type=str, default="npy")
     p.add_argument("--uda_method", default="none", choices=["none", "coral", "mmd", "spectral", "fda", "dann", "adabn"])
     p.add_argument("--lambda_uda", type=float, default=0.1)
     p.add_argument("--fda_beta", type=float, default=0.01)
@@ -386,7 +309,7 @@ def parse_args():
     p.add_argument("--encoder_loss_weight", type=float, default=0.1)
     p.add_argument("--compile", action="store_true")
     p.add_argument("--optuna", action="store_true")
-    p.add_argument("--optuna_phase", type=int, default=1, choices=[1, 2])
+    p.add_argument("--optuna_phase", type=int, default=1, choices=[1])
     p.add_argument("--n_trials", type=int, default=50)
     p.add_argument("--optuna_timeout", type=int, default=None)
     return p.parse_args()
@@ -398,18 +321,14 @@ def main():
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
-    if args.optuna:
-        (run_phase1 if args.optuna_phase == 1 else run_phase2)(args, device)
+    
+    if args.optuna and args.optuna_phase == 1:
+        run_phase1(args, device)
     else:
         hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
         if hp.exists():
             b = json.loads(hp.read_text())
-<<<<<<< HEAD
-            run_training(args, device, lr=b["lr"],
-                         weight_decay=b["weight_decay"],
-                         enc_w=b.get("encoder_loss_weight", 0.1))
-        else: run_training(args, device)
-=======
+            print(f"Loaded Phase 1 base HPs: {b}")
             run_training(
                 args,
                 device,
@@ -419,9 +338,10 @@ def main():
                 enc_w=b.get("encoder_loss_weight", 0.1),
             )
         else:
+            if args.uda_method != "none":
+                print(f"WARNING: Base HPs not found at {hp}. Defaulting to argparse values.")
             run_training(args, device)
 
->>>>>>> a49660f798561e912ab8c0466219a036663b79ce
 
 if __name__ == "__main__":
     main()

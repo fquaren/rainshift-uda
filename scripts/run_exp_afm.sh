@@ -1,6 +1,10 @@
 #!/bin/bash -l
 # ===========================================================================
 #  RainShift UDA — AFM two-phase experiments
+#
+#  PHASE 1: Optuna search for base HPs on vanilla model.
+#  PHASE 2: Standard training for UDA methods (Fixed HPs, no Optuna).
+#
 #  Usage: PHASE=1 sbatch scripts/run_exp_afm.sh
 #         PHASE=2 sbatch scripts/run_exp_afm.sh
 # ===========================================================================
@@ -20,7 +24,7 @@
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task 12
-#SBATCH --mem 400G
+#SBATCH --mem 350G
 #SBATCH --time 72:00:00
 
 set -euo pipefail
@@ -32,27 +36,31 @@ CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
 CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/rainshift_npy"
 OUTPUT_DIR="/scratch/fquareng/rainshift_uda/afm"
+DATA_FORMAT="npy"
 
 PHASE="${PHASE:-1}"
+echo "Selected PHASE: ${PHASE}"
 
 REGIONS=(
     "europe_west"
-    # "blacksea"
-    # "horn-of-africa"
+    "blacksea"
+    "horn-of-africa"
     "melanesia"
 )
 
 METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn")
 
-EPOCHS=100
-PATIENCE=10
+EPOCHS=25
+PATIENCE=-1
 NUM_WORKERS=8
-SUBSET_SIZE=5000
+SUBSET_SIZE=1000
 BATCH_SIZE=32
 
 N_TRIALS_P1=10
-N_TRIALS_P2=10
 OPTUNA_TIMEOUT=172800
+
+FDA_BETA=0.01
+LAMBDA_UDA=0.1
 
 COMPILE="--compile"
 
@@ -69,7 +77,7 @@ if [[ "${PHASE}" == "1" ]]; then
         done
     done
 
-    echo "=== AFM PHASE 1: Base HP search ==="
+    echo "=== AFM PHASE 1: Baseline (no UDA) (Optional base HP search) ==="
     echo "Domain pairs: ${#PAIRS[@]}"
 
     for i in "${!PAIRS[@]}"; do
@@ -86,6 +94,7 @@ if [[ "${PHASE}" == "1" ]]; then
             --source_path "${DATA_ROOT}/${src}" \
             --target_path "${DATA_ROOT}/${tgt}" \
             --output_dir  "${OUTPUT_DIR}" \
+            --data_format "${DATA_FORMAT}" \
             --uda_method  none \
             --epochs      "${EPOCHS}" \
             --batch_size  "${BATCH_SIZE}" \
@@ -117,7 +126,7 @@ elif [[ "${PHASE}" == "2" ]]; then
         done
     done
 
-    echo "=== AFM PHASE 2: UDA weight search ==="
+    echo "=== AFM PHASE 2: UDA training (Fixed Hyperparameters) ==="
     echo "Total runs: ${#RUNS[@]}"
 
     for i in "${!RUNS[@]}"; do
@@ -134,16 +143,15 @@ elif [[ "${PHASE}" == "2" ]]; then
             --source_path "${DATA_ROOT}/${src}" \
             --target_path "${DATA_ROOT}/${tgt}" \
             --output_dir  "${OUTPUT_DIR}" \
+            --data_format "${DATA_FORMAT}" \
             --uda_method  "${method}" \
+            --lambda_uda  "${LAMBDA_UDA}" \
+            --fda_beta    "${FDA_BETA}" \
             --epochs      "${EPOCHS}" \
-            --batch_size  "${BATCH_SIZE}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
             --subset_size "${SUBSET_SIZE}" \
             ${COMPILE} \
-            --optuna --optuna_phase 2 \
-            --n_trials    "${N_TRIALS_P2}" \
-            --optuna_timeout "${OPTUNA_TIMEOUT}" \
             2>&1 | tee "${OUTPUT_DIR}/afm_phase2_${src}__to__${tgt}__${method}.log"
         echo ""
     done

@@ -10,8 +10,8 @@
 
 #SBATCH --chdir /scratch/fquareng/
 #SBATCH --job-name eval
-#SBATCH --output outputs/eval_%j.out
-#SBATCH --error  job_errors/eval_%j.err
+#SBATCH --output outputs/%j
+#SBATCH --error  job_errors/%j
 
 #SBATCH --partition gpu-gh
 #SBATCH --gres gpu:1
@@ -19,7 +19,7 @@
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task 12
-#SBATCH --mem 90G
+#SBATCH --mem 450G
 #SBATCH --time 12:00:00
 
 set -euo pipefail

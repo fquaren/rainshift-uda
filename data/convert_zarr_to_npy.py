@@ -10,7 +10,6 @@ from tqdm import tqdm
 import xarray as xr
 import zarr
 from numpy.lib.format import open_memmap
-from tqdm import tqdm
 
 _LOG_VARS = {"tp", "cp", "precipitation", "z"}
 _PASSTHROUGH_VARS = {"lsm"}
@@ -25,8 +24,13 @@ STATIC_VARS = ["lsm", "z"]
 def transform_var(data: np.ndarray, var_name: str) -> np.ndarray:
     if var_name in _UNIT_SCALE:
         data = data * _UNIT_SCALE[var_name]
+        
+    # --- THIS LINE DESTROYS ALL NaNs BEFORE THEY REACH THE MATH ---
+    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
     if var_name in _LOG_VARS:
         data = np.log(np.clip(data, 0.0, None) + _LOG_EPS)
+        
     return data.astype(np.float32)
 
 
@@ -76,17 +80,15 @@ def convert_region(zarr_root: Path, out_dir: Path, region: str):
 
         chunk_size = 512
         
-        # Accumulators for out-of-core variance calculation
         if split == "train":
             sum_x = np.zeros(len(INPUT_VARS), dtype=np.float64)
             sum_sq_x = np.zeros(len(INPUT_VARS), dtype=np.float64)
-            sum_y, sum_sq_y = 0.0, 0.0
-            pixel_count = 0
+            count_x = np.zeros(len(INPUT_VARS), dtype=np.int64)
+            sum_y, sum_sq_y, count_y = 0.0, 0.0, 0
 
         for i in tqdm(range(0, n, chunk_size), desc=f"Processing {split}"):
             end = min(i + chunk_size, n)
             
-            # Process input chunk
             x_channels = []
             for var in INPUT_VARS:
                 raw = z_in[var][i:end].astype(np.float32)
@@ -98,25 +100,24 @@ def convert_region(zarr_root: Path, out_dir: Path, region: str):
             
             x_memmap[i:end] = x_chunk
 
-            # Process output chunk
             y_raw = z_out[OUTPUT_VAR][i:end].astype(np.float32)
             y_chunk = transform_var(y_raw, OUTPUT_VAR)[:, np.newaxis, :, :]
             y_memmap[i:end] = y_chunk
 
-            # Accumulate statistics
             if split == "train":
-                elements_in_chunk = (end - i) * target_h * target_w
-                pixel_count += elements_in_chunk
-                
                 for c, var in enumerate(INPUT_VARS):
                     if var not in _PASSTHROUGH_VARS:
                         vals = x_chunk[:, c].astype(np.float64)
-                        sum_x[c] += np.sum(vals)
-                        sum_sq_x[c] += np.sum(vals ** 2)
+                        valid_mask = ~np.isnan(vals)
+                        count_x[c] += np.sum(valid_mask)
+                        sum_x[c] += np.nansum(vals)
+                        sum_sq_x[c] += np.nansum(vals ** 2)
                 
                 y_vals = y_chunk.astype(np.float64)
-                sum_y += np.sum(y_vals)
-                sum_sq_y += np.sum(y_vals ** 2)
+                valid_mask_y = ~np.isnan(y_vals)
+                count_y += np.sum(valid_mask_y)
+                sum_y += np.nansum(y_vals)
+                sum_sq_y += np.nansum(y_vals ** 2)
 
         x_memmap.flush()
         y_memmap.flush()
@@ -125,17 +126,44 @@ def convert_region(zarr_root: Path, out_dir: Path, region: str):
             stats = {}
             for c, var in enumerate(INPUT_VARS):
                 if var not in _PASSTHROUGH_VARS:
-                    mean = sum_x[c] / pixel_count
-                    var_val = (sum_sq_x[c] / pixel_count) - (mean ** 2)
-                    stats[var] = [float(mean), float(np.sqrt(max(var_val, 0.0)))]
+                    if count_x[c] > 0:
+                        mean = sum_x[c] / count_x[c]
+                        var_val = (sum_sq_x[c] / count_x[c]) - (mean ** 2)
+                        std = float(np.sqrt(max(var_val, 0.0)))
+                    else:
+                        mean, std = 0.0, 0.0
+                    
+                    if std == 0.0:
+                        std = 1.0
+                    stats[var] = [float(mean), std]
             
-            mean_y = sum_y / pixel_count
-            var_y = (sum_sq_y / pixel_count) - (mean_y ** 2)
-            stats[OUTPUT_VAR] = [float(mean_y), float(np.sqrt(max(var_y, 0.0)))]
+            if count_y > 0:
+                mean_y = sum_y / count_y
+                var_y = (sum_sq_y / count_y) - (mean_y ** 2)
+                std_y = float(np.sqrt(max(var_y, 0.0)))
+            else:
+                mean_y, std_y = 0.0, 0.0
+                
+            if std_y == 0.0:
+                std_y = 1.0
+            stats[OUTPUT_VAR] = [float(mean_y), std_y]
 
             for c, var in enumerate(STATIC_VARS):
                 if var not in _PASSTHROUGH_VARS:
-                    stats[var] = [float(np.mean(static[c])), float(np.std(static[c]))]
+                    mean = float(np.nanmean(static[c]))
+                    std = float(np.nanstd(static[c]))
+                    if std == 0.0 or np.isnan(std):
+                        std = 1.0
+                    if np.isnan(mean):
+                        mean = 0.0
+                    stats[var] = [mean, std]
+
+            # --- DEBUG VERIFICATION PRINT ---
+            print("\n!!! DEBUG CHECK !!!")
+            print(f"Total processed valid pixels for precipitation: {count_y}")
+            print(f"Calculated Mean: {mean_y} | Calculated Std: {std_y}")
+            print("If you do not see this message in your cluster logs, you are running an old file!")
+            print("!!! ----------- !!!\n")
 
             with open(out_path / "stats.json", "w") as f:
                 json.dump(stats, f, indent=2)

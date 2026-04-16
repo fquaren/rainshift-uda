@@ -33,7 +33,7 @@ set -euo pipefail
 
 # --- Configuration --------------------------------------------------------
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift"
-CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/WeatherAdaptSR"
+CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
 OUTPUT_DIR="/scratch/fquareng/rainshift_uda/unet"
 
 # RainShift regions
@@ -58,14 +58,14 @@ OUTPUT_DIR="/scratch/fquareng/rainshift_uda/unet"
 # )
 
 REGIONS=(
-  # "europe_west"       # Baseline
+  "europe_west"       # Baseline
   "blacksea"          # Easy (Norm. W_1≈0.00)
   "horn-of-africa"    # Medium (Norm. W_1≈0.05)
   "melanesia"         # Hard (Norm. W_1≈0.16)
 )
 
 
-singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/WeatherAdaptSR/data/convert_zarr_to_npy.py \
+singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda/data/convert_zarr_to_npy.py \
     --zarr_root /work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift \
     --out_root  /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/rainshift_npy \
     --regions ${REGIONS[@]} \

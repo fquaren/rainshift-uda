@@ -336,12 +336,22 @@ def compute_domain_stats(cluster_path: str, input_vars=None, output_var="precipi
 
     return stats
 
-
-def load_domain_stats(data_path: str) -> dict:
-    """Load pre-computed stats from .npy region directory."""
-    with open(Path(data_path) / "stats.json") as f:
-        return json.load(f)
-
+def load_domain_stats(stats_path):
+    # Depending on how your stats are saved, adapt the path resolution
+    if Path(stats_path).is_dir():
+        stats_file = Path(stats_path) / "stats.json"
+    else:
+        stats_file = Path(stats_path)
+        
+    stats = json.loads(stats_file.read_text())
+    
+    # Iterate through your variables to patch zero-variance
+    for var_name, var_stats in stats.items():
+        if "std" in var_stats and var_stats["std"] == 0.0:
+            print(f"WARNING: Zero variance detected for {var_name} at {stats_path}. Patching std=1.0")
+            var_stats["std"] = 1.0  # Prevents division by zero, yielding 0.0 for constant fields
+            
+    return stats
 
 def inverse_transform(prediction: np.ndarray, var_name: str,
                       stats: dict) -> np.ndarray:
@@ -357,3 +367,4 @@ def inverse_transform(prediction: np.ndarray, var_name: str,
         prediction = np.clip(prediction, 0.0, None)
 
     return prediction
+
