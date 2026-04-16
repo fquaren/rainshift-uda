@@ -2,11 +2,11 @@
 # ===========================================================================
 #  RainShift UDA — Two-phase experiment launcher
 #
-#  PHASE 1: Optuna search for base HPs (lr, batch_size, wd) on vanilla model.
+#  PHASE 1: Baseline training on vanilla model.
 #           One job per (source, target) pair.
 #           Results saved to {OUTPUT_DIR}/base_hp/{src}__to__{tgt}.json
 #
-#  PHASE 2: Standard training for UDA methods. (Method A: No UDA HP tuning).
+#  PHASE 2: Standard training for UDA methods.
 #           One job per (source, target, method) triple.
 #           Loads base HPs from phase 1 automatically.
 #
@@ -63,9 +63,6 @@ NUM_WORKERS=8
 SUBSET_SIZE=1000
 BATCH_SIZE=256
 
-N_TRIALS_P1=10
-OPTUNA_TIMEOUT=172800
-
 FDA_BETA=0.01
 LAMBDA_UDA=0.1
 
@@ -77,7 +74,7 @@ run_python() {
 }
 
 # ===========================================================================
-#  PHASE 1: Base HP search (vanilla, one per domain pair)
+#  PHASE 1: Baseline training (vanilla, one per domain pair)
 # ===========================================================================
 if [[ "${PHASE}" == "1" ]]; then
     PAIRS=()
@@ -88,11 +85,11 @@ if [[ "${PHASE}" == "1" ]]; then
         done
     done
 
-    echo "=== PHASE 1: Base HP search (vanilla) ==="
+    echo "=== PHASE 1: Baseline training (vanilla) ==="
     
     for i in "${!PAIRS[@]}"; do
         IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
-        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} -> ${tgt} | vanilla HP search ---"
+        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} -> ${tgt} | vanilla training ---"
 
         HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
         if [[ -f "${HP_FILE}" ]]; then
@@ -114,16 +111,11 @@ if [[ "${PHASE}" == "1" ]]; then
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
             ${SUBSET_FLAG} \
-            # ${COMPILE} \
-            # --optuna \
-            # --optuna_phase 1 \
-            # --n_trials    "${N_TRIALS_P1}" \
-            # --optuna_timeout "${OPTUNA_TIMEOUT}" \
             2>&1 | tee "${OUTPUT_DIR}/phase1_${src}__to__${tgt}.log"
     done
 
 # ===========================================================================
-#  PHASE 2: UDA application (Fixed HPs, no Optuna)
+#  PHASE 2: UDA application (Fixed HPs)
 # ===========================================================================
 elif [[ "${PHASE}" == "2" ]]; then
     RUNS=()
@@ -134,7 +126,6 @@ elif [[ "${PHASE}" == "2" ]]; then
             HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
             if [[ ! -f "${HP_FILE}" ]]; then
                 echo "WARNING: Missing base HPs for ${src} -> ${tgt}, defaulting to argparse values."
-                # continue
             fi
 
             for method in "${METHODS[@]}"; do
@@ -170,7 +161,6 @@ elif [[ "${PHASE}" == "2" ]]; then
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
             ${SUBSET_FLAG} \
-            # ${COMPILE} \
             2>&1 | tee "${OUTPUT_DIR}/phase2_${src}__to__${tgt}__${method}.log"
     done
 

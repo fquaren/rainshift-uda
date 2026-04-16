@@ -1,4 +1,4 @@
-"""AFM training with UDA. Single-phase Optuna workflow."""
+"""AFM training with UDA. Baseline training and UDA application workflow."""
 
 import argparse
 import json
@@ -128,9 +128,7 @@ def evaluate(model, loader, device, stats, var="precipitation", n_ens=0, steps=2
     return {"loss": sl / n, "mae_mm": sm / n}
 
 
-def run_training(
-    args, device, lr=None, lambda_uda=None, batch_size=None, fda_beta=None, weight_decay=None, enc_w=None, trial=None
-):
+def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_beta=None, weight_decay=None, enc_w=None):
     _lr = lr or args.lr
     _lam = lambda_uda if lambda_uda is not None else args.lambda_uda
     _bs = batch_size or args.batch_size
@@ -150,7 +148,7 @@ def run_training(
     opt = torch.optim.AdamW(list(model.parameters()) + ep, lr=_lr, weight_decay=_wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
 
-    tag = f"afm_{_tag(args.source_path, args.target_path)}__{args.uda_method}"
+    tag = f"afm_{_tag(args.source_path, args.target_path)}____{args.uda_method}"
     out = Path(args.output_dir) / tag
     out.mkdir(parents=True, exist_ok=True)
 
@@ -165,28 +163,21 @@ def run_training(
         print(
             f"[{epoch:3d}/{args.epochs}] {time.time()-t0:5.1f}s  "
             f"flow={tr['flow']:.4f} enc={tr['enc']:.4f} uda={tr['uda']:.4f} "
-            f"σz={tr['sigma_z']:.4f} val={val['loss']:.4f} tgt_mae={tgt['mae_mm']:.3f}mm"
+            f"sigma_z={tr['sigma_z']:.4f} val={val['loss']:.4f} tgt_mae={tgt['mae_mm']:.3f}mm"
         )
 
         if val["loss"] < best:
             best = val["loss"]
             wait = 0
-            if trial is None:
-                torch.save(model.state_dict(), out / "best.pt")
+            torch.save(model.state_dict(), out / "best.pt")
         else:
             wait += 1
 
         if args.patience > 0 and wait >= args.patience:
             print(f"Early stopping at epoch {epoch}")
             break
-            
-        if trial is not None:
-            trial.report(val["loss"], epoch)
-            if trial.should_prune():
-                import optuna
-                raise optuna.TrialPruned()
 
-    if args.uda_method == "adabn" and trial is None:
+    if args.uda_method == "adabn":
         if (out / "best.pt").exists():
             model.load_state_dict(torch.load(out / "best.pt", weights_only=True))
         _adabn_afm(model, tgt_tr, device)
@@ -194,24 +185,32 @@ def run_training(
         print(f"  AdaBN -> tgt_mae={tgt['mae_mm']:.3f}mm")
         torch.save(model.state_dict(), out / "best_adabn.pt")
 
-    if trial is None:
-        cfg = {
-            **vars(args),
-            "lr": _lr,
-            "bs": _bs,
-            "wd": _wd,
-            "lambda": _lam,
-            "beta": _beta,
-            "enc_w": _ew,
-            "best_val_loss": best,
-        }
-        if args.uda_method != "none":
-            combo = Path(args.output_dir) / "best_hp" / f"afm_{_tag(args.source_path, args.target_path)}__{args.uda_method}.json"
-            combo.parent.mkdir(parents=True, exist_ok=True)
-            combo.write_text(json.dumps(cfg, indent=2))
+    cfg = {
+        **vars(args),
+        "lr": _lr,
+        "bs": _bs,
+        "wd": _wd,
+        "lambda": _lam,
+        "beta": _beta,
+        "enc_w": _ew,
+        "best_val_loss": best,
+    }
 
-        (out / "config.json").write_text(json.dumps(cfg, indent=2))
-        
+    if args.uda_method == "none":
+        hp_path = _base_hp_path(args.output_dir, args.source_path, args.target_path)
+        hp_path.parent.mkdir(parents=True, exist_ok=True)
+        hp_path.write_text(json.dumps(cfg, indent=2))
+    else:
+        combo = (
+            Path(args.output_dir)
+            / "best_hp"
+            / f"afm_{_tag(args.source_path, args.target_path)}____{args.uda_method}.json"
+        )
+        combo.parent.mkdir(parents=True, exist_ok=True)
+        combo.write_text(json.dumps(cfg, indent=2))
+
+    (out / "config.json").write_text(json.dumps(cfg, indent=2))
+
     return best
 
 
@@ -236,58 +235,6 @@ def _adabn_afm(model, loader, device):
     model.eval()
 
 
-# --- Optuna ---
-
-def _p1_obj(trial, args, device):
-    lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    wd = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
-    ew = trial.suggest_float("encoder_loss_weight", 0.01, 1.0, log=True)
-    bs = trial.suggest_categorical("batch_size", [16, 32, 64])
-    
-    saved = args.uda_method
-    args.uda_method = "none"
-    try:
-        return run_training(args, device, lr=lr, weight_decay=wd, batch_size=bs, enc_w=ew, lambda_uda=0.0, trial=trial)
-    finally:
-        args.uda_method = saved
-
-
-def run_phase1(args, device):
-    import optuna
-    from optuna.storages import RDBStorage
-
-    tag = _tag(args.source_path, args.target_path)
-    db = Path(args.output_dir) / "optuna" / f"afm_p1_{tag}.db"
-    db.parent.mkdir(parents=True, exist_ok=True)
-    st = RDBStorage(f"sqlite:///{db}", engine_kwargs={"connect_args": {"timeout": 60}})
-
-    study = optuna.create_study(
-        study_name=f"afm_p1_{tag}",
-        storage=st,
-        direction="minimize",
-        load_if_exists=True,
-        pruner=optuna.pruners.MedianPruner(5, n_warmup_steps=10),
-    )
-    study.optimize(lambda t: _p1_obj(t, args, device), n_trials=args.n_trials, timeout=args.optuna_timeout)
-    
-    best = study.best_params
-    print(f"\nAFM Phase 1 best: {best}")
-    hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
-    hp.parent.mkdir(parents=True, exist_ok=True)
-    hp.write_text(json.dumps(best, indent=2))
-    
-    args.uda_method = "none"
-    run_training(
-        args,
-        device,
-        lr=best["lr"],
-        weight_decay=best["weight_decay"],
-        batch_size=best["batch_size"],
-        enc_w=best["encoder_loss_weight"],
-        lambda_uda=0.0,
-    )
-
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--source_path", required=True)
@@ -308,10 +255,6 @@ def parse_args():
     p.add_argument("--base_features", type=int, default=64)
     p.add_argument("--encoder_loss_weight", type=float, default=0.1)
     p.add_argument("--compile", action="store_true")
-    p.add_argument("--optuna", action="store_true")
-    p.add_argument("--optuna_phase", type=int, default=1, choices=[1])
-    p.add_argument("--n_trials", type=int, default=50)
-    p.add_argument("--optuna_timeout", type=int, default=None)
     return p.parse_args()
 
 
@@ -320,27 +263,24 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("high")
-    
-    if args.optuna and args.optuna_phase == 1:
-        run_phase1(args, device)
+    # torch.set_float32_matmul_precision("high")
+
+    hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
+    if hp.exists():
+        b = json.loads(hp.read_text())
+        print(f"Loaded base HPs: {b}")
+        run_training(
+            args,
+            device,
+            lr=b["lr"],
+            batch_size=b["batch_size"],
+            weight_decay=b["weight_decay"],
+            enc_w=b.get("encoder_loss_weight", 0.1),
+        )
     else:
-        hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
-        if hp.exists():
-            b = json.loads(hp.read_text())
-            print(f"Loaded Phase 1 base HPs: {b}")
-            run_training(
-                args,
-                device,
-                lr=b["lr"],
-                batch_size=b["batch_size"],
-                weight_decay=b["weight_decay"],
-                enc_w=b.get("encoder_loss_weight", 0.1),
-            )
-        else:
-            if args.uda_method != "none":
-                print(f"WARNING: Base HPs not found at {hp}. Defaulting to argparse values.")
-            run_training(args, device)
+        if args.uda_method != "none":
+            print(f"WARNING: Base HPs not found at {hp}. Defaulting to argparse values.")
+        run_training(args, device)
 
 
 if __name__ == "__main__":

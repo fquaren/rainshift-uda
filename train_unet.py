@@ -1,6 +1,6 @@
 """
 UNet training with UDA for climate super-resolution.
-GH200-optimised. Single-phase Optuna workflow for baseline hyperparameters.
+GH200-optimised. Baseline training and UDA application workflow.
 """
 
 import argparse
@@ -43,6 +43,7 @@ def _base_hp_path(out_dir, src, tgt):
 #  Data
 # ---------------------------------------------------------------------------
 
+
 def build_loaders(args, src_stats, tgt_stats, batch_size=None):
     bs = batch_size or args.batch_size
     nw = min(args.num_workers, 2)
@@ -62,6 +63,7 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
 #  UDA setup
 # ---------------------------------------------------------------------------
 
+
 def build_uda(method, device):
     if method == "coral":
         return {"loss_fn": coral_loss}, []
@@ -79,9 +81,20 @@ def build_uda(method, device):
 #  Training
 # ---------------------------------------------------------------------------
 
+
 def train_one_epoch(
-    model, src_loader, tgt_loader, optimiser, criterion, uda_comp, 
-    method, lambda_uda, fda_beta, device, epoch, total_epochs
+    model,
+    src_loader,
+    tgt_loader,
+    optimiser,
+    criterion,
+    uda_comp,
+    method,
+    lambda_uda,
+    fda_beta,
+    device,
+    epoch,
+    total_epochs,
 ):
     model.train()
     sum_task, sum_uda, n = 0.0, 0.0, 0
@@ -109,7 +122,7 @@ def train_one_epoch(
                 pred_s = model(x_s, s_s)
 
             task_loss = criterion(pred_s, y_s)
-            uda_loss = torch.tensor(0.0, device=device) # Fixed tensor broadcast issue
+            uda_loss = torch.tensor(0.0, device=device)
 
             if method in ("coral", "mmd"):
                 _, feats_t = model(x_t, s_t, extract_features=True)
@@ -142,11 +155,10 @@ def evaluate(model, loader, criterion, device, stats, var="precipitation"):
     for batch in loader:
         x, s, y = (t.to(device, non_blocking=True) for t in batch)
 
-        # Defensive check
         if torch.isnan(y).any() or torch.isnan(x).any():
             print("WARNING: NaN detected in target batch. Skipping.")
             continue
-        
+
         pred = model(x, s)
         sum_loss += criterion(pred, y).item()
         p = inverse_transform(pred.float().cpu().numpy(), var, stats)
@@ -160,7 +172,8 @@ def evaluate(model, loader, criterion, device, stats, var="precipitation"):
 #  Core run
 # ---------------------------------------------------------------------------
 
-def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_beta=None, weight_decay=None, trial=None):
+
+def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_beta=None, weight_decay=None):
     _lr = lr or args.lr
     _lam = lambda_uda if lambda_uda is not None else args.lambda_uda
     _bs = batch_size or args.batch_size
@@ -203,8 +216,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
         if val["loss"] < best:
             best = val["loss"]
             wait = 0
-            if trial is None:
-                torch.save(model.state_dict(), out / "best.pt")
+            torch.save(model.state_dict(), out / "best.pt")
         else:
             wait += 1
 
@@ -212,13 +224,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
             print(f"Early stopping at epoch {epoch}")
             break
 
-        if trial is not None:
-            trial.report(val["loss"], epoch)
-            if trial.should_prune():
-                import optuna
-                raise optuna.TrialPruned()
-
-    if args.uda_method == "adabn" and trial is None:
+    if args.uda_method == "adabn":
         if (out / "best.pt").exists():
             model.load_state_dict(torch.load(out / "best.pt", weights_only=True))
         apply_adabn(model, tgt_tr, device)
@@ -227,72 +233,28 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
         best = min(best, tgt["loss"])
         torch.save(model.state_dict(), out / "best_adabn.pt")
 
-    if trial is None:
-        cfg = {**vars(args), "lr": _lr, "bs": _bs, "wd": _wd, "lambda": _lam, "beta": _beta, "best_val_loss": best}
-        
-        if args.uda_method != "none":
-            combo = Path(args.output_dir) / "best_hp" / f"{tag}__{args.uda_method}.json"
-            combo.parent.mkdir(parents=True, exist_ok=True)
-            combo.write_text(json.dumps(cfg, indent=2))
-            
-        (out / "config.json").write_text(json.dumps(cfg, indent=2))
-        (out / "src_stats.json").write_text(json.dumps(src_stats))
-        (out / "tgt_stats.json").write_text(json.dumps(tgt_stats))
+    cfg = {**vars(args), "lr": _lr, "bs": _bs, "wd": _wd, "lambda": _lam, "beta": _beta, "best_val_loss": best}
+
+    if args.uda_method == "none":
+        hp_path = _base_hp_path(args.output_dir, args.source_path, args.target_path)
+        hp_path.parent.mkdir(parents=True, exist_ok=True)
+        hp_path.write_text(json.dumps(cfg, indent=2))
+    else:
+        combo = Path(args.output_dir) / "best_hp" / f"{tag}__{args.uda_method}.json"
+        combo.parent.mkdir(parents=True, exist_ok=True)
+        combo.write_text(json.dumps(cfg, indent=2))
+
+    (out / "config.json").write_text(json.dumps(cfg, indent=2))
+    (out / "src_stats.json").write_text(json.dumps(src_stats))
+    (out / "tgt_stats.json").write_text(json.dumps(tgt_stats))
 
     return best
 
-
-# ---------------------------------------------------------------------------
-#  Optuna Phase 1
-# ---------------------------------------------------------------------------
-
-def _phase1_objective(trial, args, device):
-    lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    wd = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
-    bs = trial.suggest_categorical("batch_size", [64, 128, 256])
-    
-    saved = args.uda_method
-    args.uda_method = "none"
-    try:
-        return run_training(args, device, lr=lr, weight_decay=wd, batch_size=bs, lambda_uda=0.0, trial=trial)
-    finally:
-        args.uda_method = saved
-
-def run_phase1(args, device):
-    import optuna
-    from optuna.storages import RDBStorage
-
-    tag = _tag(args.source_path, args.target_path)
-    db = Path(args.output_dir) / "optuna" / f"phase1_{tag}.db"
-    db.parent.mkdir(parents=True, exist_ok=True)
-    storage = RDBStorage(url=f"sqlite:///{db}", engine_kwargs={"connect_args": {"timeout": 60}})
-
-    study = optuna.create_study(
-        study_name=f"phase1_{tag}",
-        storage=storage,
-        direction="minimize",
-        load_if_exists=True,
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10),
-    )
-
-    study.optimize(lambda t: _phase1_objective(t, args, device), n_trials=args.n_trials, timeout=args.optuna_timeout)
-
-    best = study.best_params
-    print(f"\nPhase 1 best: {best} (value={study.best_value:.6f})")
-
-    hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
-    hp.parent.mkdir(parents=True, exist_ok=True)
-    hp.write_text(json.dumps(best, indent=2))
-
-    args.uda_method = "none"
-    run_training(
-        args, device, lr=best["lr"], weight_decay=best["weight_decay"], batch_size=best["batch_size"], lambda_uda=0.0
-    )
-    return best
 
 # ---------------------------------------------------------------------------
 #  CLI
 # ---------------------------------------------------------------------------
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -315,10 +277,6 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--compile", action="store_false")
 
-    p.add_argument("--optuna", action="store_false")
-    p.add_argument("--optuna_phase", type=int, default=1, choices=[1])
-    p.add_argument("--n_trials", type=int, default=50)
-    p.add_argument("--optuna_timeout", type=int, default=None)
     return p.parse_args()
 
 
@@ -327,27 +285,17 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("high")
+    # torch.set_float32_matmul_precision("high")
 
-    if args.optuna and args.optuna_phase == 1:
-        run_phase1(args, device)
+    hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
+    if hp.exists():
+        base = json.loads(hp.read_text())
+        print(f"Loaded base HPs: {base}")
+        run_training(args, device, lr=base["lr"], batch_size=base["batch_size"], weight_decay=base["weight_decay"])
     else:
-        # Automatically load base hyperparameters if present
-        hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
-        if hp.exists():
-            base = json.loads(hp.read_text())
-            print(f"Loaded Phase 1 base HPs: {base}")
-            run_training(
-                args, 
-                device, 
-                lr=base["lr"], 
-                batch_size=base["batch_size"], 
-                weight_decay=base["weight_decay"]
-            )
-        else:
-            if args.uda_method != "none":
-                print(f"WARNING: Base HPs not found at {hp}. Defaulting to argparse values.")
-            run_training(args, device)
+        if args.uda_method != "none":
+            print(f"WARNING: Base HPs not found at {hp}. Defaulting to argparse values.")
+        run_training(args, device)
 
 
 if __name__ == "__main__":

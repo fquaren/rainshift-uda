@@ -41,6 +41,7 @@ DEFAULT_STATIC_VARS = ["lsm", "z"]
 #  NPY dataset (recommended — fast, everything pre-transformed)
 # ===================================================================
 
+
 class ClimateSRDatasetNPY(Dataset):
     """
     Fast dataset loading pre-converted .npy files.
@@ -100,7 +101,7 @@ class ClimateSRDatasetNPY(Dataset):
         file_prefix = "test" if split == "test" else "train"
         x = np.load(root / f"{file_prefix}_x.npy")  # (N, C_in, H, W)
         y = np.load(root / f"{file_prefix}_y.npy")  # (N, 1, H, W)
-        static = np.load(root / "static.npy")        # (C_s, H, W)
+        static = np.load(root / "static.npy")  # (C_s, H, W)
 
         # --- train / validation split ---
         n = x.shape[0]
@@ -136,9 +137,11 @@ class ClimateSRDatasetNPY(Dataset):
         self.y = torch.from_numpy(np.ascontiguousarray(y))
         self.static = torch.from_numpy(np.ascontiguousarray(static))
 
-        print(f"[NPY] {split}: {len(self)} samples | "
-              f"x={list(self.x.shape)} y={list(self.y.shape)} "
-              f"static={list(self.static.shape)}")
+        print(
+            f"[NPY] {split}: {len(self)} samples | "
+            f"x={list(self.x.shape)} y={list(self.y.shape)} "
+            f"static={list(self.static.shape)}"
+        )
 
     def _zscore_inputs(self, x: np.ndarray) -> np.ndarray:
         """Z-score each input channel. x: (N, C, H, W)."""
@@ -176,6 +179,7 @@ class ClimateSRDatasetNPY(Dataset):
 #  Zarr dataset (original, slower but no preprocessing step)
 # ===================================================================
 
+
 class ClimateSRDataset(Dataset):
     """Dataset reading directly from zarr. See module docstring."""
 
@@ -207,12 +211,8 @@ class ClimateSRDataset(Dataset):
             raise ValueError(f"Missing normalization stats for: {missing}")
 
         file_prefix = "test_data" if split == "test" else "train_data"
-        ds_in = xr.open_zarr(
-            f"{cluster_path}/{file_prefix}_in.zarr", consolidated=True
-        )
-        ds_static = xr.open_dataset(
-            f"{cluster_path}/static_variables.nc"
-        ).load()
+        ds_in = xr.open_zarr(f"{cluster_path}/{file_prefix}_in.zarr", consolidated=True)
+        ds_static = xr.open_dataset(f"{cluster_path}/static_variables.nc").load()
 
         self.num_samples_total = ds_in.sizes["time"]
         all_indices = np.arange(self.num_samples_total)
@@ -241,9 +241,7 @@ class ClimateSRDataset(Dataset):
         for var in self.static_vars:
             data = ds_static[var].values.astype(np.float32)
             static_data_list.append(self._normalize(data, var))
-        self.static_tensor = torch.from_numpy(
-            np.stack(static_data_list, axis=0)
-        ).float()
+        self.static_tensor = torch.from_numpy(np.stack(static_data_list, axis=0)).float()
 
         print(f"Loading {len(self.indices)} samples into RAM for {split} split...")
         z_in = zarr.open(f"{cluster_path}/{file_prefix}_in.zarr", mode="r")
@@ -284,8 +282,10 @@ class ClimateSRDataset(Dataset):
         target_h, target_w = y_target.shape[-2], y_target.shape[-1]
         x_dynamic = x_dynamic.unsqueeze(0)
         x_dynamic = F.interpolate(
-            x_dynamic, size=(target_h, target_w),
-            mode="bicubic", align_corners=False,
+            x_dynamic,
+            size=(target_h, target_w),
+            mode="bicubic",
+            align_corners=False,
         )
         x_dynamic = x_dynamic.squeeze(0)
 
@@ -296,8 +296,8 @@ class ClimateSRDataset(Dataset):
 #  Utilities
 # ===================================================================
 
-def compute_domain_stats(cluster_path: str, input_vars=None, output_var="precipitation",
-                         static_vars=None) -> dict:
+
+def compute_domain_stats(cluster_path: str, input_vars=None, output_var="precipitation", static_vars=None) -> dict:
     """Compute per-domain (mean, std) on zarr training data. Post log-transform."""
     input_vars = input_vars or DEFAULT_INPUT_VARS
     static_vars = static_vars or DEFAULT_STATIC_VARS
@@ -336,25 +336,26 @@ def compute_domain_stats(cluster_path: str, input_vars=None, output_var="precipi
 
     return stats
 
+
 def load_domain_stats(stats_path):
     # Depending on how your stats are saved, adapt the path resolution
     if Path(stats_path).is_dir():
         stats_file = Path(stats_path) / "stats.json"
     else:
         stats_file = Path(stats_path)
-        
+
     stats = json.loads(stats_file.read_text())
-    
+
     # Iterate through your variables to patch zero-variance
     for var_name, var_stats in stats.items():
         if "std" in var_stats and var_stats["std"] == 0.0:
             print(f"WARNING: Zero variance detected for {var_name} at {stats_path}. Patching std=1.0")
             var_stats["std"] = 1.0  # Prevents division by zero, yielding 0.0 for constant fields
-            
+
     return stats
 
-def inverse_transform(prediction: np.ndarray, var_name: str,
-                      stats: dict) -> np.ndarray:
+
+def inverse_transform(prediction: np.ndarray, var_name: str, stats: dict) -> np.ndarray:
     """Map model output back to physical units (mm for precipitation)."""
     if var_name not in _PASSTHROUGH_VARS:
         mean, std = stats[var_name]
@@ -367,4 +368,3 @@ def inverse_transform(prediction: np.ndarray, var_name: str,
         prediction = np.clip(prediction, 0.0, None)
 
     return prediction
-

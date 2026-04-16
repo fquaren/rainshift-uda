@@ -2,8 +2,8 @@
 # ===========================================================================
 #  RainShift UDA — AFM two-phase experiments
 #
-#  PHASE 1: Optuna search for base HPs on vanilla model.
-#  PHASE 2: Standard training for UDA methods (Fixed HPs, no Optuna).
+#  PHASE 1: Baseline training on vanilla model.
+#  PHASE 2: Standard training for UDA methods.
 #
 #  Usage: PHASE=1 sbatch scripts/run_exp_afm.sh
 #         PHASE=2 sbatch scripts/run_exp_afm.sh
@@ -56,9 +56,6 @@ NUM_WORKERS=8
 SUBSET_SIZE=1000
 BATCH_SIZE=32
 
-N_TRIALS_P1=10
-OPTUNA_TIMEOUT=172800
-
 FDA_BETA=0.01
 LAMBDA_UDA=0.1
 
@@ -77,7 +74,7 @@ if [[ "${PHASE}" == "1" ]]; then
         done
     done
 
-    echo "=== AFM PHASE 1: Baseline (no UDA) (Optional base HP search) ==="
+    echo "=== AFM PHASE 1: Baseline (no UDA) ==="
     echo "Domain pairs: ${#PAIRS[@]}"
 
     for i in "${!PAIRS[@]}"; do
@@ -102,9 +99,6 @@ if [[ "${PHASE}" == "1" ]]; then
             --num_workers "${NUM_WORKERS}" \
             --subset_size "${SUBSET_SIZE}" \
             ${COMPILE} \
-            --optuna --optuna_phase 1 \
-            --n_trials    "${N_TRIALS_P1}" \
-            --optuna_timeout "${OPTUNA_TIMEOUT}" \
             2>&1 | tee "${OUTPUT_DIR}/afm_phase1_${src}__to__${tgt}.log"
         echo ""
     done
