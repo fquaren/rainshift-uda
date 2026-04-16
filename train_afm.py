@@ -141,8 +141,6 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
     src_tr, src_val, tgt_tr, tgt_te = build_loaders(args, ss, ts, _bs)
 
     model = AFMModel(9, 2, 1, args.base_features, encoder_loss_weight=_ew).to(device)
-    if args.compile:
-        model = torch.compile(model, mode="max-autotune")
 
     uc, ep = build_uda(args.uda_method, device)
     opt = torch.optim.AdamW(list(model.parameters()) + ep, lr=_lr, weight_decay=_wd)
@@ -254,7 +252,6 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--base_features", type=int, default=64)
     p.add_argument("--encoder_loss_weight", type=float, default=0.1)
-    p.add_argument("--compile", action="store_true")
     return p.parse_args()
 
 

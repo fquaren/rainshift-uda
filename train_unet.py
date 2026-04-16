@@ -185,8 +185,6 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
     src_tr, src_val, tgt_tr, tgt_te = build_loaders(args, src_stats, tgt_stats, _bs)
 
     model = DualEncoderUNet(dynamic_channels=9, static_channels=2, out_channels=1, base_features=64).to(device)
-    if args.compile:
-        model = torch.compile(model, mode="max-autotune")
 
     uda_comp, extra_params = build_uda(args.uda_method, device)
     opt = torch.optim.AdamW(list(model.parameters()) + extra_params, lr=_lr, weight_decay=_wd)
@@ -262,11 +260,9 @@ def parse_args():
     p.add_argument("--target_path", required=True)
     p.add_argument("--output_dir", default="./experiments")
     p.add_argument("--data_format", type=str, default="npy")
-
     p.add_argument("--uda_method", default="none", choices=["none", "coral", "mmd", "spectral", "fda", "dann", "adabn"])
     p.add_argument("--lambda_uda", type=float, default=0.1)
     p.add_argument("--fda_beta", type=float, default=0.01)
-
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -275,8 +271,6 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--subset_size", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--compile", action="store_false")
-
     return p.parse_args()
 
 
@@ -285,7 +279,7 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
-    # torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("high")
 
     hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
     if hp.exists():

@@ -59,8 +59,6 @@ BATCH_SIZE=32
 FDA_BETA=0.01
 LAMBDA_UDA=0.1
 
-COMPILE="--compile"
-
 run_python() {
     singularity exec --nv "${CONTAINER}" python "$@"
 }
@@ -98,7 +96,6 @@ if [[ "${PHASE}" == "1" ]]; then
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
             --subset_size "${SUBSET_SIZE}" \
-            ${COMPILE} \
             2>&1 | tee "${OUTPUT_DIR}/afm_phase1_${src}__to__${tgt}.log"
         echo ""
     done
@@ -145,7 +142,6 @@ elif [[ "${PHASE}" == "2" ]]; then
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
             --subset_size "${SUBSET_SIZE}" \
-            ${COMPILE} \
             2>&1 | tee "${OUTPUT_DIR}/afm_phase2_${src}__to__${tgt}__${method}.log"
         echo ""
     done
