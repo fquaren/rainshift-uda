@@ -20,6 +20,7 @@ set -euo pipefail
 
 CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/rainshift_npy"
+CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
 RESULTS_DIR="/scratch/fquareng/rainshift_uda/results"
 
 run_python() {
@@ -29,12 +30,12 @@ run_python() {
 # Iterate through evaluated directories and plot
 for dir in "${RESULTS_DIR}/unet"/*; do
     if [ -d "${dir}" ]; then
-        run_python plotting.py --result_dir "${dir}" --data_root "${DATA_ROOT}" --n_samples 5
+        run_python "${CODE_ROOT}/plotting.py" --result_dir "${dir}" --data_root "${DATA_ROOT}" --n_samples 5
     fi
 done
 
 for dir in "${RESULTS_DIR}/afm"/*; do
     if [ -d "${dir}" ]; then
-        run_python plotting.py --result_dir "${dir}" --data_root "${DATA_ROOT}" --n_samples 5
+        run_python "${CODE_ROOT}/plotting.py" --result_dir "${dir}" --data_root "${DATA_ROOT}" --n_samples 5
     fi
 done
