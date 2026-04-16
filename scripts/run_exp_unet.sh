@@ -50,18 +50,18 @@ PHASE="${PHASE:-1}"
 
 REGIONS=(
     "europe_west"
-    "blacksea"
-    "horn-of-africa"
+    # "blacksea"
+    # "horn-of-africa"
     "melanesia"
 )
 
-METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn")
+METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn") # 
 
 EPOCHS=25
 PATIENCE=-1
 NUM_WORKERS=8
-SUBSET_SIZE=1000
-BATCH_SIZE=256
+SUBSET_SIZE=2000
+BATCH_SIZE=128
 
 FDA_BETA=0.01
 LAMBDA_UDA=0.1

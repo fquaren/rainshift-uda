@@ -43,8 +43,8 @@ echo "Selected PHASE: ${PHASE}"
 
 REGIONS=(
     "europe_west"
-    "blacksea"
-    "horn-of-africa"
+    # "blacksea"
+    # "horn-of-africa"
     "melanesia"
 )
 
@@ -53,7 +53,7 @@ METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn")
 EPOCHS=25
 PATIENCE=-1
 NUM_WORKERS=8
-SUBSET_SIZE=1000
+SUBSET_SIZE=2000
 BATCH_SIZE=32
 
 FDA_BETA=0.01
@@ -108,7 +108,7 @@ elif [[ "${PHASE}" == "2" ]]; then
             [[ "$src" == "$tgt" ]] && continue
             HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
             if [[ ! -f "${HP_FILE}" ]]; then
-                echo "WARNING: Missing base HPs for ${src} -> ${tgt}, skipping."
+                echo "WARNING: Missing base HPs for ${src} -> ${tgt}, using default."
                 continue
             fi
             for method in "${METHODS[@]}"; do

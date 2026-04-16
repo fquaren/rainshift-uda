@@ -31,21 +31,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from data.dataset import ClimateSRDatasetNPY, inverse_transform, load_domain_stats
-from models.unet import DualEncoderUNet
 from models.afm import AFMModel
-
+from models.unet import DualEncoderUNet
 
 # ---------------------------------------------------------------------------
 #  Metrics
 # ---------------------------------------------------------------------------
 
-
 def compute_metrics(pred, true):
     d = pred - true
     return {
-        "rmse_mm": float(np.sqrt(np.mean(d**2))),
+        "rmse_mm": float(np.sqrt(np.mean(d ** 2))),
         "mae_mm": float(np.mean(np.abs(d))),
         "bias_mm": float(np.mean(d)),
         "n_samples": int(pred.shape[0]),
@@ -70,7 +69,6 @@ def compute_crps(ensemble, truth):
 #  Model loading
 # ---------------------------------------------------------------------------
 
-
 def _infer_model_type(exp_dir_name):
     """Guess model type from directory name."""
     return "afm" if exp_dir_name.startswith("afm_") else "unet"
@@ -93,13 +91,13 @@ def load_model(model_type, checkpoint, device, base_features=64):
 #  Evaluation
 # ---------------------------------------------------------------------------
 
-
 @torch.no_grad()
-def evaluate_model(model, model_type, loader, device, stats, n_ensemble=0, sample_steps=20):
+def evaluate_model(model, model_type, loader, device, stats,
+                   n_ensemble=0, sample_steps=20):
     var = "precipitation"
     all_pred, all_true, all_ens = [], [], []
 
-    for batch in loader:
+    for batch in tqdm(loader, desc="Evaluating"):
         x, s, y = (t.to(device, non_blocking=True) for t in batch)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             if model_type == "unet":
@@ -113,9 +111,10 @@ def evaluate_model(model, model_type, loader, device, stats, n_ensemble=0, sampl
         if model_type == "afm" and n_ensemble > 0:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 samples = model.sample(x, s, n_samples=n_ensemble, steps=sample_steps)
-            ens_np = np.stack(
-                [inverse_transform(samples[:, i].float().cpu().numpy(), var, stats) for i in range(n_ensemble)], axis=1
-            )
+            ens_np = np.stack([
+                inverse_transform(samples[:, i].float().cpu().numpy(), var, stats)
+                for i in range(n_ensemble)
+            ], axis=1)
             all_ens.append(ens_np)
 
     pred = np.concatenate(all_pred)
@@ -141,10 +140,8 @@ def save_results(metrics, pred, true, out_dir, n_save=5):
         idx = np.argsort(mse)
         np.savez_compressed(
             out_dir / "predictions.npz",
-            best_pred=pred[idx[:n_save]],
-            best_true=true[idx[:n_save]],
-            worst_pred=pred[idx[-n_save:]],
-            worst_true=true[idx[-n_save:]],
+            best_pred=pred[idx[:n_save]], best_true=true[idx[:n_save]],
+            worst_pred=pred[idx[-n_save:]], worst_true=true[idx[-n_save:]],
         )
 
 
@@ -162,7 +159,6 @@ def append_csv(csv_path, row):
 #  Parse experiment directory name -> (source, target, method)
 # ---------------------------------------------------------------------------
 
-
 def parse_exp_name(name):
     """
     Parse 'europe_west__to__melanesia__coral' or
@@ -179,39 +175,28 @@ def parse_exp_name(name):
 #  Single evaluation
 # ---------------------------------------------------------------------------
 
-
 def cmd_single(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tgt_stats = load_domain_stats(args.target_path)
     loader = DataLoader(
         ClimateSRDatasetNPY(args.target_path, "test", stats=tgt_stats),
-        args.batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-    )
+        args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     model = load_model(args.model, args.checkpoint, device, args.base_features)
 
     metrics, pred, true = evaluate_model(
-        model, args.model, loader, device, tgt_stats, args.n_ensemble, args.sample_steps
-    )
+        model, args.model, loader, device, tgt_stats,
+        args.n_ensemble, args.sample_steps)
 
     tag = Path(args.checkpoint).parent.stem
     res_dir = Path(args.output_dir) / "results" / tag
     save_results(metrics, pred, true, res_dir, args.save_samples)
 
     src, tgt, method = parse_exp_name(tag)
-    append_csv(
-        Path(args.output_dir) / "results" / "results.csv",
-        {
-            "model": args.model,
-            "source": src,
-            "target": tgt,
-            "method": method,
-            **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in metrics.items()},
-        },
-    )
+    append_csv(Path(args.output_dir) / "results" / "results.csv", {
+        "model": args.model, "source": src, "target": tgt, "method": method,
+        **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in metrics.items()},
+    })
 
     for k, v in metrics.items():
         if isinstance(v, float):
@@ -221,7 +206,6 @@ def cmd_single(args):
 # ---------------------------------------------------------------------------
 #  Batch evaluation
 # ---------------------------------------------------------------------------
-
 
 def cmd_batch(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -257,29 +241,19 @@ def cmd_batch(args):
         tgt_stats = load_domain_stats(str(tgt_path))
         loader = DataLoader(
             ClimateSRDatasetNPY(str(tgt_path), "test", stats=tgt_stats),
-            args.batch_size,
-            shuffle=False,
-            num_workers=2,
-            pin_memory=True,
-        )
+            args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
         model = load_model(model_type, str(ckpt), device, args.base_features)
         metrics, pred, true = evaluate_model(
-            model, model_type, loader, device, tgt_stats, args.n_ensemble, args.sample_steps
-        )
+            model, model_type, loader, device, tgt_stats,
+            args.n_ensemble, args.sample_steps)
 
         save_results(metrics, pred, true, res_dir, args.save_samples)
 
-        append_csv(
-            csv_path,
-            {
-                "model": model_type,
-                "source": src,
-                "target": tgt,
-                "method": method,
-                **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in metrics.items()},
-            },
-        )
+        append_csv(csv_path, {
+            "model": model_type, "source": src, "target": tgt, "method": method,
+            **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in metrics.items()},
+        })
 
         for k, v in metrics.items():
             if isinstance(v, float):
@@ -294,7 +268,6 @@ def cmd_batch(args):
 # ---------------------------------------------------------------------------
 #  CLI
 # ---------------------------------------------------------------------------
-
 
 def main():
     p = argparse.ArgumentParser()

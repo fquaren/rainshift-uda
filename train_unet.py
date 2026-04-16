@@ -72,7 +72,7 @@ def build_uda(method, device):
     if method == "spectral":
         return {"loss_fn": spectral_density_loss}, []
     if method == "dann":
-        disc = DomainDiscriminator(in_dim=1024, hidden=256).to(device)
+        disc = DomainDiscriminator(in_dim=1024, hidden_dim=256).to(device)
         return {"disc": disc}, list(disc.parameters())
     return {}, []
 
@@ -112,29 +112,34 @@ def train_one_epoch(
         x_s, s_s, y_s = (t.to(device, non_blocking=True) for t in src_batch)
         x_t, s_t, _ = (t.to(device, non_blocking=True) for t in tgt_batch)
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            if method == "fda":
-                x_s = fda_transfer(x_s, x_t, beta=fda_beta)
+        if method == "fda":
+            x_s = fda_transfer(x_s, x_t, beta=fda_beta)
 
-            if use_feat:
-                pred_s, feats_s = model(x_s, s_s, extract_features=True)
-            else:
-                pred_s = model(x_s, s_s)
+        if use_feat:
+            pred_s, feats_s = model(x_s, s_s, extract_features=True)
+        else:
+            pred_s = model(x_s, s_s)
 
-            task_loss = criterion(pred_s, y_s)
-            uda_loss = torch.tensor(0.0, device=device)
+        task_loss = criterion(pred_s, y_s)
+        uda_loss = torch.tensor(0.0, device=device)
 
-            if method in ("coral", "mmd"):
-                _, feats_t = model(x_t, s_t, extract_features=True)
-                uda_loss = uda_comp["loss_fn"](feats_s["bottleneck"], feats_t["bottleneck"])
-            elif method == "dann":
-                _, feats_t = model(x_t, s_t, extract_features=True)
-                uda_loss = dann_loss(uda_comp["disc"], feats_s["bottleneck"], feats_t["bottleneck"], alpha)
-            elif method == "spectral":
-                pred_t = model(x_t, s_t)
-                uda_loss = uda_comp["loss_fn"](pred_s, pred_t)
+        if method in ("coral", "mmd"):
+            _, feats_t = model(x_t, s_t, extract_features=True)
+            uda_loss = uda_comp["loss_fn"](feats_s["bottleneck"], feats_t["bottleneck"])
+        elif method == "dann":
+            _, feats_t = model(x_t, s_t, extract_features=True)
+            uda_loss = dann_loss(uda_comp["disc"], feats_s["bottleneck"], feats_t["bottleneck"], alpha)
+        elif method == "spectral":
+            pred_t = model(x_t, s_t)
+            uda_loss = uda_comp["loss_fn"](pred_s, pred_t)
 
-            loss = task_loss + lambda_uda * uda_loss
+        # Dynamic weighting based on the relative magnitude of task vs UDA loss
+        if uda_loss.item() > 1e-8:
+            dynamic_weight = (task_loss.detach() / uda_loss.detach()) * lambda_uda
+        else:
+            dynamic_weight = torch.tensor(0.0, device=device)
+
+        loss = task_loss + (dynamic_weight * uda_loss)
 
         optimiser.zero_grad(set_to_none=True)
         loss.backward()
@@ -265,8 +270,8 @@ def parse_args():
     p.add_argument("--fda_beta", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-5)
+    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--weight_decay", type=float, default=1e-6)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--subset_size", type=int, default=None)
@@ -279,7 +284,8 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("high")
+    # Enforce strict IEEE float32 precision for matrix multiplications
+    torch.set_float32_matmul_precision("highest")
 
     hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
     if hp.exists():

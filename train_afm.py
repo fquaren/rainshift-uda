@@ -60,6 +60,16 @@ def build_uda(method, device):
     return {}, []
 
 
+def build_optimizer(model, base_lr, uda_params):
+    encoder_params = list(model.encoder.parameters())
+    flow_params = list(model.flow_net.parameters())
+    
+    return torch.optim.AdamW([
+        {"params": encoder_params, "lr": base_lr * 0.1, "weight_decay": 1e-3},
+        {"params": flow_params, "lr": base_lr, "weight_decay": 1e-5},
+        {"params": uda_params, "lr": base_lr * 0.1, "weight_decay": 1e-4}
+    ])
+
 def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method, lam, beta, device, epoch, total):
     model.train()
     sf, se, su, n = 0.0, 0.0, 0.0, 0
@@ -77,27 +87,33 @@ def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method, lam, beta, dev
         xs, ss, ys = (t.to(device, non_blocking=True) for t in sb)
         xt, st, _ = (t.to(device, non_blocking=True) for t in tb)
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            if method == "fda":
-                xs = fda_transfer(xs, xt, beta=beta)
+        # Removed automatic mixed precision to compute everything in float32
+        if method == "fda":
+            xs = fda_transfer(xs, xt, beta=beta)
 
-            out = model(xs, ss, x_target=ys, extract_features=(use_f or method == "spectral"))
-            task = out["total_loss"]
-            uda = torch.tensor(0.0, device=device)
+        out = model(xs, ss, x_target=ys, extract_features=(use_f or method == "spectral"))
+        task = out["total_loss"]
+        uda = torch.tensor(0.0, device=device)
 
-            if method in ("coral", "mmd"):
-                tgt_out = model(xt, st, extract_features=True)
-                _, tf = tgt_out
-                uda = uda_comp["loss_fn"](out["features"]["bottleneck"], tf["bottleneck"])
-            elif method == "dann":
-                _, tf = model(xt, st, extract_features=True)
-                uda = dann_loss(uda_comp["disc"], out["features"]["bottleneck"], tf["bottleneck"], alpha)
-            elif method == "spectral":
-                sp = model.encoder(xs, ss)
-                tp = model.encoder(xt, st)
-                uda = uda_comp["loss_fn"](sp, tp)
+        if method in ("coral", "mmd"):
+            tgt_out = model(xt, st, extract_features=True)
+            _, tf = tgt_out
+            uda = uda_comp["loss_fn"](out["features"]["bottleneck"], tf["bottleneck"])
+        elif method == "dann":
+            _, tf = model(xt, st, extract_features=True)
+            uda = dann_loss(uda_comp["disc"], out["features"]["bottleneck"], tf["bottleneck"], alpha)
+        elif method == "spectral":
+            sp = model.encoder(xs, ss)
+            tp = model.encoder(xt, st)
+            uda = uda_comp["loss_fn"](sp, tp)
 
-            loss = task + lam * uda
+        # Dynamic weighting based on the relative magnitude of task vs UDA loss
+        if uda.item() > 1e-8:
+            dyn_lam = (task.detach() / uda.detach()) * lam
+        else:
+            dyn_lam = torch.tensor(0.0, device=device)
+
+        loss = task + dyn_lam * uda
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -118,9 +134,10 @@ def evaluate(model, loader, device, stats, var="precipitation", n_ens=0, steps=2
     crit = nn.MSELoss()
     for b in loader:
         x, s, y = (t.to(device, non_blocking=True) for t in b)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            mu = model.deterministic_predict(x, s)
-            sl += crit(mu, y).item()
+        
+        mu = model.deterministic_predict(x, s)
+        sl += crit(mu, y).item()
+        
         p = inverse_transform(mu.float().cpu().numpy(), var, stats)
         t = inverse_transform(y.float().cpu().numpy(), var, stats)
         sm += float(np.abs(p - t).mean())
@@ -143,7 +160,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
     model = AFMModel(9, 2, 1, args.base_features, encoder_loss_weight=_ew).to(device)
 
     uc, ep = build_uda(args.uda_method, device)
-    opt = torch.optim.AdamW(list(model.parameters()) + ep, lr=_lr, weight_decay=_wd)
+    opt = build_optimizer(model, _lr, ep)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
 
     tag = f"afm_{_tag(args.source_path, args.target_path)}____{args.uda_method}"
@@ -244,8 +261,8 @@ def parse_args():
     p.add_argument("--fda_beta", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-5)
+    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--weight_decay", type=float, default=1e-6)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--subset_size", type=int, default=None)
@@ -260,7 +277,9 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
-    # torch.set_float32_matmul_precision("high")
+    
+    # Enforce strict IEEE float32 precision for matrix multiplications
+    torch.set_float32_matmul_precision("highest")
 
     hp = _base_hp_path(args.output_dir, args.source_path, args.target_path)
     if hp.exists():
