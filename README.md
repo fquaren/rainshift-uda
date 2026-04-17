@@ -1,4 +1,4 @@
-# WeatherAdaptSR
+# rainshift-uda
 
 Unsupervised domain adaptation for precipitation super-resolution on the [RainShift](https://arxiv.org/abs/2507.04930) benchmark.
 
