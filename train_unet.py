@@ -46,15 +46,16 @@ def _base_hp_path(out_dir, src, tgt):
 
 def build_loaders(args, src_stats, tgt_stats, batch_size=None):
     bs = batch_size or args.batch_size
-    nw = min(args.num_workers, 2)
+    nw = args.num_workers
     dl_kw = dict(num_workers=nw, pin_memory=True, persistent_workers=nw > 0, prefetch_factor=2 if nw > 0 else None)
 
-    mk = lambda p, s, st: ClimateSRDatasetNPY(p, s, stats=st, subset_size=args.subset_size)
+    def mk(p, split, st, aug=False):
+        return ClimateSRDatasetNPY(p, split, stats=st, subset_size=args.subset_size, augment=aug)
 
     return (
-        DataLoader(mk(args.source_path, "train", src_stats), bs, shuffle=True, drop_last=True, **dl_kw),
+        DataLoader(mk(args.source_path, "train", src_stats, aug=True), bs, shuffle=True, drop_last=True, **dl_kw),
         DataLoader(mk(args.source_path, "validation", src_stats), bs, shuffle=False, **dl_kw),
-        DataLoader(mk(args.target_path, "train", tgt_stats), bs, shuffle=True, drop_last=True, **dl_kw),
+        DataLoader(mk(args.target_path, "train", tgt_stats, aug=True), bs, shuffle=True, drop_last=True, **dl_kw),
         DataLoader(mk(args.target_path, "test", tgt_stats), bs, shuffle=False, **dl_kw),
     )
 
@@ -189,7 +190,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
     tgt_stats = load_domain_stats(args.target_path)
     src_tr, src_val, tgt_tr, tgt_te = build_loaders(args, src_stats, tgt_stats, _bs)
 
-    model = DualEncoderUNet(dynamic_channels=9, static_channels=2, out_channels=1, base_features=64).to(device)
+    model = DualEncoderUNet(dynamic_channels=9, static_channels=2, out_channels=1, base_features=32).to(device)
 
     uda_comp, extra_params = build_uda(args.uda_method, device)
     opt = torch.optim.AdamW(list(model.parameters()) + extra_params, lr=_lr, weight_decay=_wd)
@@ -270,8 +271,8 @@ def parse_args():
     p.add_argument("--fda_beta", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-5)
-    p.add_argument("--weight_decay", type=float, default=1e-6)
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-3)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--subset_size", type=int, default=None)

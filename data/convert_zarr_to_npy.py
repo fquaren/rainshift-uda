@@ -1,5 +1,6 @@
 """
 Convert RainShift zarr data to .npy for fast in-memory loading.
+Strictly uses xarray for CF-metadata decoding to prevent int16 leakage.
 """
 
 import argparse
@@ -8,7 +9,6 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 import xarray as xr
-import zarr
 from numpy.lib.format import open_memmap
 
 _LOG_VARS = {"tp", "cp", "precipitation", "z"}
@@ -21,11 +21,11 @@ OUTPUT_VAR = "precipitation"
 STATIC_VARS = ["lsm", "z"]
 
 
-def transform_var(data: np.ndarray, var_name: str) -> np.ndarray:
+def apply_physical_transforms(data: np.ndarray, var_name: str) -> np.ndarray:
+    """Applies scaling and log transforms AFTER interpolation."""
     if var_name in _UNIT_SCALE:
         data = data * _UNIT_SCALE[var_name]
         
-    # --- THIS LINE DESTROYS ALL NaNs BEFORE THEY REACH THE MATH ---
     data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
     if var_name in _LOG_VARS:
@@ -55,26 +55,30 @@ def convert_region(zarr_root: Path, out_dir: Path, region: str):
     print(f"\n{'=' * 60}")
     print(f"Converting: {region}")
 
-    # Static variables
     ds_static = xr.open_dataset(str(zarr_path / "static_variables.nc")).load()
-    static_list = [transform_var(ds_static[var].values, var) for var in STATIC_VARS]
+    static_list = []
+    for var in STATIC_VARS:
+        raw_static = ds_static[var].values
+        static_list.append(apply_physical_transforms(raw_static, var))
+        
     static = np.stack(static_list, axis=0) 
     target_h, target_w = static.shape[1], static.shape[2]
     np.save(out_path / "static.npy", static)
 
     for split in ("train", "test"):
         prefix = "test_data" if split == "test" else "train_data"
-        z_in = zarr.open(str(zarr_path / f"{prefix}_in.zarr"), mode="r")
-        z_out = zarr.open(str(zarr_path / f"{prefix}_out.zarr"), mode="r")
+        
+        # USE XARRAY to ensure _FillValue, scale_factor, and add_offset are decoded
+        ds_in = xr.open_zarr(str(zarr_path / f"{prefix}_in.zarr"), consolidated=True)
+        ds_out = xr.open_zarr(str(zarr_path / f"{prefix}_out.zarr"), consolidated=True)
 
         first_var = INPUT_VARS[0]
-        n = z_in[first_var].shape[0]
-        in_h, in_w = z_in[first_var].shape[1], z_in[first_var].shape[2]
+        n = ds_in[first_var].shape[0]
+        in_h, in_w = ds_in[first_var].shape[1], ds_in[first_var].shape[2]
 
         x_out_path = out_path / f"{split}_x.npy"
         y_out_path = out_path / f"{split}_y.npy"
         
-        # Initialize memmap arrays directly on disk
         x_memmap = open_memmap(x_out_path, mode='w+', dtype=np.float32, shape=(n, len(INPUT_VARS), target_h, target_w))
         y_memmap = open_memmap(y_out_path, mode='w+', dtype=np.float32, shape=(n, 1, target_h, target_w))
 
@@ -91,33 +95,45 @@ def convert_region(zarr_root: Path, out_dir: Path, region: str):
             
             x_channels = []
             for var in INPUT_VARS:
-                raw = z_in[var][i:end].astype(np.float32)
-                x_channels.append(transform_var(raw, var))
+                # Load decoded floats, convert NaNs to 0 temporarily for interpolation
+                raw = ds_in[var].isel(time=slice(i, end)).values.astype(np.float32)
+                raw = np.nan_to_num(raw, nan=0.0)
+                x_channels.append(raw)
+                
             x_chunk = np.stack(x_channels, axis=1)
 
+            # Interpolate in linear physical space FIRST
             if in_h != target_h or in_w != target_w:
                 x_chunk = upsample_batch(x_chunk, target_h, target_w)
+                
+            # Apply log transforms AFTER interpolation
+            for c, var in enumerate(INPUT_VARS):
+                x_chunk[:, c] = apply_physical_transforms(x_chunk[:, c], var)
             
             x_memmap[i:end] = x_chunk
 
-            y_raw = z_out[OUTPUT_VAR][i:end].astype(np.float32)
-            y_chunk = transform_var(y_raw, OUTPUT_VAR)[:, np.newaxis, :, :]
+            y_raw = ds_out[OUTPUT_VAR].isel(time=slice(i, end)).values.astype(np.float32)
+            y_raw = np.nan_to_num(y_raw, nan=0.0)
+            
+            if in_h != target_h or in_w != target_w:
+                # If target also needs upsampling
+                y_raw = upsample_batch(y_raw[:, np.newaxis, :, :], target_h, target_w).squeeze(1)
+                
+            y_chunk = apply_physical_transforms(y_raw, OUTPUT_VAR)[:, np.newaxis, :, :]
             y_memmap[i:end] = y_chunk
 
             if split == "train":
                 for c, var in enumerate(INPUT_VARS):
                     if var not in _PASSTHROUGH_VARS:
                         vals = x_chunk[:, c].astype(np.float64)
-                        valid_mask = ~np.isnan(vals)
-                        count_x[c] += np.sum(valid_mask)
-                        sum_x[c] += np.nansum(vals)
-                        sum_sq_x[c] += np.nansum(vals ** 2)
+                        count_x[c] += vals.size
+                        sum_x[c] += np.sum(vals)
+                        sum_sq_x[c] += np.sum(vals ** 2)
                 
                 y_vals = y_chunk.astype(np.float64)
-                valid_mask_y = ~np.isnan(y_vals)
-                count_y += np.sum(valid_mask_y)
-                sum_y += np.nansum(y_vals)
-                sum_sq_y += np.nansum(y_vals ** 2)
+                count_y += y_vals.size
+                sum_y += np.sum(y_vals)
+                sum_sq_y += np.sum(y_vals ** 2)
 
         x_memmap.flush()
         y_memmap.flush()
@@ -126,44 +142,20 @@ def convert_region(zarr_root: Path, out_dir: Path, region: str):
             stats = {}
             for c, var in enumerate(INPUT_VARS):
                 if var not in _PASSTHROUGH_VARS:
-                    if count_x[c] > 0:
-                        mean = sum_x[c] / count_x[c]
-                        var_val = (sum_sq_x[c] / count_x[c]) - (mean ** 2)
-                        std = float(np.sqrt(max(var_val, 0.0)))
-                    else:
-                        mean, std = 0.0, 0.0
-                    
-                    if std == 0.0:
-                        std = 1.0
-                    stats[var] = [float(mean), std]
+                    mean = sum_x[c] / count_x[c]
+                    var_val = (sum_sq_x[c] / count_x[c]) - (mean ** 2)
+                    std = float(np.sqrt(max(var_val, 0.0)))
+                    stats[var] = [float(mean), max(std, 1.0)]
             
-            if count_y > 0:
-                mean_y = sum_y / count_y
-                var_y = (sum_sq_y / count_y) - (mean_y ** 2)
-                std_y = float(np.sqrt(max(var_y, 0.0)))
-            else:
-                mean_y, std_y = 0.0, 0.0
-                
-            if std_y == 0.0:
-                std_y = 1.0
-            stats[OUTPUT_VAR] = [float(mean_y), std_y]
+            mean_y = sum_y / count_y
+            var_y = (sum_sq_y / count_y) - (mean_y ** 2)
+            stats[OUTPUT_VAR] = [float(mean_y), float(max(np.sqrt(max(var_y, 0.0)), 1.0))]
 
             for c, var in enumerate(STATIC_VARS):
                 if var not in _PASSTHROUGH_VARS:
                     mean = float(np.nanmean(static[c]))
                     std = float(np.nanstd(static[c]))
-                    if std == 0.0 or np.isnan(std):
-                        std = 1.0
-                    if np.isnan(mean):
-                        mean = 0.0
-                    stats[var] = [mean, std]
-
-            # --- DEBUG VERIFICATION PRINT ---
-            print("\n!!! DEBUG CHECK !!!")
-            print(f"Total processed valid pixels for precipitation: {count_y}")
-            print(f"Calculated Mean: {mean_y} | Calculated Std: {std_y}")
-            print("If you do not see this message in your cluster logs, you are running an old file!")
-            print("!!! ----------- !!!\n")
+                    stats[var] = [mean if not np.isnan(mean) else 0.0, max(std, 1.0) if not np.isnan(std) else 1.0]
 
             with open(out_path / "stats.json", "w") as f:
                 json.dump(stats, f, indent=2)

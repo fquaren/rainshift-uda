@@ -30,8 +30,8 @@
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task 12
-#SBATCH --mem 400G
+#SBATCH --cpus-per-task 32
+#SBATCH --mem 500G
 #SBATCH --time 72:00:00
 
 set -euo pipefail
@@ -46,6 +46,10 @@ DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/rainshift_npy
 OUTPUT_DIR="/scratch/fquareng/rainshift_uda/unet"
 DATA_FORMAT="npy"
 
+# ADD THESE LINES: Ensure output directories exist before logging
+mkdir -p "${OUTPUT_DIR}/base_hp"
+mkdir -p "${OUTPUT_DIR}/best_hp"
+
 PHASE="${PHASE:-1}"
 
 REGIONS=(
@@ -59,8 +63,8 @@ METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn") #
 
 EPOCHS=25
 PATIENCE=-1
-NUM_WORKERS=8
-SUBSET_SIZE=2000
+NUM_WORKERS=32
+SUBSET_SIZE=20000
 BATCH_SIZE=128
 
 FDA_BETA=0.01
@@ -109,9 +113,11 @@ if [[ "${PHASE}" == "1" ]]; then
             --batch_size  "${BATCH_SIZE}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
-            ${SUBSET_FLAG} \
             2>&1 | tee "${OUTPUT_DIR}/phase1_${src}__to__${tgt}.log"
     done
+
+# ${SUBSET_FLAG} \
+    
 
 # ===========================================================================
 #  PHASE 2: UDA application (Fixed HPs)
@@ -159,9 +165,9 @@ elif [[ "${PHASE}" == "2" ]]; then
             --epochs      "${EPOCHS}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
-            ${SUBSET_FLAG} \
             2>&1 | tee "${OUTPUT_DIR}/phase2_${src}__to__${tgt}__${method}.log"
     done
+    # ${SUBSET_FLAG} \ 
 
 else
     echo "ERROR: PHASE must be 1 or 2 (got: ${PHASE})"

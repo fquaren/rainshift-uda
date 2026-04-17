@@ -53,7 +53,7 @@ METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn")
 EPOCHS=25
 PATIENCE=-1
 NUM_WORKERS=8
-SUBSET_SIZE=2000
+SUBSET_SIZE=10000
 BATCH_SIZE=32
 
 FDA_BETA=0.01

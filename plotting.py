@@ -64,6 +64,10 @@ def plot_sample(x, s, y_true, y_pred, stats, sample_idx, out_dir):
     vmin = 0.1
     vmax = max(pred_field.max(), true_field.max(), 1.0)
     
+    # Clip arrays to prevent matplotlib LogNorm crashes on exactly 0.0 or inf
+    pred_field = np.clip(pred_field, a_min=vmin, a_max=None)
+    true_field = np.clip(true_field, a_min=vmin, a_max=None)
+    
     ax_true = axes[11]
     im_true = ax_true.imshow(true_field, cmap="Blues", norm=LogNorm(vmin=vmin, vmax=vmax), origin="lower")
     ax_true.set_title("Target: precipitation")
@@ -92,14 +96,17 @@ def main():
     args = p.parse_args()
 
     res_dir = Path(args.result_dir)
-    cfg_path = res_dir / "config.json"
+    
+    # Dynamically resolve path: e.g., /scratch/.../results/unet/exp_name -> /scratch/.../unet/exp_name
+    exp_name = res_dir.name
+    model_type = res_dir.parent.name
+    exp_root = res_dir.parent.parent.parent 
+    
+    exp_dir = exp_root / model_type / exp_name
+    cfg_path = exp_dir / "config.json"
+    
     if not cfg_path.exists():
-        # Fallback to experiment dir if evaluating from results/
-        exp_name = res_dir.name
-        exp_dir = Path("./experiments/unet") / exp_name
-        if not exp_dir.exists():
-            exp_dir = Path("./experiments/afm") / exp_name
-        cfg_path = exp_dir / "config.json"
+        raise FileNotFoundError(f"Config not found at {cfg_path}")
         
     cfg = json.loads(cfg_path.read_text())
     
@@ -113,13 +120,13 @@ def main():
         batch_size=1, shuffle=False
     )
     
-    model_type = _infer_model_type(res_dir.name)
-    ckpt_path = exp_dir / "best.pt" if 'exp_dir' in locals() else res_dir / "best.pt"
+    # Load adabn weights if they exist, otherwise standard best.pt
+    ckpt_path = exp_dir / "best_adabn.pt" if (exp_dir / "best_adabn.pt").exists() else exp_dir / "best.pt"
     
     model = load_model(model_type, ckpt_path, device, cfg.get("base_features", 64))
     
     out_dir = res_dir / "pdf_plots"
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(exist_ok=True, parents=True)
     
     print(f"Plotting {args.n_samples} samples for {res_dir.name}...")
     with torch.no_grad():
@@ -134,6 +141,9 @@ def main():
                     pred = model(x, s)
                 else:
                     pred = model.deterministic_predict(x, s)
+            
+            # Hard clamp logits to prevent exponential overflow in inverse_transform
+            pred = torch.clamp(pred, min=-50.0, max=50.0)
                     
             x_np = x.squeeze(0).cpu().numpy()
             s_np = s.squeeze(0).cpu().numpy()

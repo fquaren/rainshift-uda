@@ -18,6 +18,11 @@
 #SBATCH --time 12:00:00
 set -euo pipefail
 
+
+export SINGULARITY_BINDPATH="/work,/scratch,/users"
+export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/lib/libucp.so.0:/opt/hpcx/ucx/lib/libucs.so.0"
+
+
 CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/rainshift_npy"
 CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
