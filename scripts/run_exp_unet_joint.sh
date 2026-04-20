@@ -97,7 +97,6 @@ if [[ "${PHASE}" == "1" ]]; then
             continue
         fi
 
-        # Added --joint_training flag assuming train_unet.py handles dataset concatenation
         run_python "${CODE_ROOT}/train_unet.py" \
             --source_path "${DATA_ROOT}/${src}" \
             --target_path "${DATA_ROOT}/${tgt}" \

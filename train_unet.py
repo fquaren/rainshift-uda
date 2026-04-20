@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
 
 from data.dataset import ClimateSRDatasetNPY, inverse_transform, load_domain_stats
@@ -52,13 +52,20 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
     def mk(p, split, st, aug=False):
         return ClimateSRDatasetNPY(p, split, stats=st, subset_size=args.subset_size, augment=aug)
 
+    src_train = mk(args.source_path, "train", src_stats, aug=True)
+    
+    if args.joint_training:
+        tgt_train = mk(args.target_path, "train", tgt_stats, aug=True)
+        train_dataset = ConcatDataset([src_train, tgt_train])
+    else:
+        train_dataset = src_train
+
     return (
-        DataLoader(mk(args.source_path, "train", src_stats, aug=True), bs, shuffle=True, drop_last=True, **dl_kw),
+        DataLoader(train_dataset, bs, shuffle=True, drop_last=True, **dl_kw),
         DataLoader(mk(args.source_path, "validation", src_stats), bs, shuffle=False, **dl_kw),
         DataLoader(mk(args.target_path, "train", tgt_stats, aug=True), bs, shuffle=True, drop_last=True, **dl_kw),
         DataLoader(mk(args.target_path, "test", tgt_stats), bs, shuffle=False, **dl_kw),
     )
-
 
 # ---------------------------------------------------------------------------
 #  UDA setup
@@ -277,6 +284,7 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--subset_size", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--joint_training", action="store_true", help="Train on concatenated source and target domains")
     return p.parse_args()
 
 
