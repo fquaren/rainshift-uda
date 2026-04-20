@@ -63,12 +63,15 @@ def build_uda(method, device):
 def build_optimizer(model, base_lr, uda_params):
     encoder_params = list(model.encoder.parameters())
     flow_params = list(model.flow_net.parameters())
-    
-    return torch.optim.AdamW([
-        {"params": encoder_params, "lr": base_lr * 0.1, "weight_decay": 1e-3},
-        {"params": flow_params, "lr": base_lr, "weight_decay": 1e-5},
-        {"params": uda_params, "lr": base_lr * 0.1, "weight_decay": 1e-4}
-    ])
+
+    return torch.optim.AdamW(
+        [
+            {"params": encoder_params, "lr": base_lr * 0.1, "weight_decay": 1e-3},
+            {"params": flow_params, "lr": base_lr, "weight_decay": 1e-5},
+            {"params": uda_params, "lr": base_lr * 0.1, "weight_decay": 1e-4},
+        ]
+    )
+
 
 def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method, lam, beta, device, epoch, total):
     model.train()
@@ -134,10 +137,10 @@ def evaluate(model, loader, device, stats, var="precipitation", n_ens=0, steps=2
     crit = nn.MSELoss()
     for b in loader:
         x, s, y = (t.to(device, non_blocking=True) for t in b)
-        
+
         mu = model.deterministic_predict(x, s)
         sl += crit(mu, y).item()
-        
+
         p = inverse_transform(mu.float().cpu().numpy(), var, stats)
         t = inverse_transform(y.float().cpu().numpy(), var, stats)
         sm += float(np.abs(p - t).mean())
@@ -277,7 +280,7 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
-    
+
     # Enforce strict IEEE float32 precision for matrix multiplications
     torch.set_float32_matmul_precision("highest")
 

@@ -52,8 +52,15 @@ mkdir -p "${OUTPUT_DIR}/best_hp"
 
 PHASE="${PHASE:-1}"
 
-REGIONS=(
+SOURCE_REGIONS=(
     "europe_west"
+    # "blacksea"
+    # "horn-of-africa"
+    # "melanesia"
+)
+
+TARGET_REGIONS=(
+    # "europe_west"
     # "blacksea"
     # "horn-of-africa"
     "melanesia"
@@ -81,8 +88,8 @@ run_python() {
 # ===========================================================================
 if [[ "${PHASE}" == "1" ]]; then
     PAIRS=()
-    for src in "${REGIONS[@]}"; do
-        for tgt in "${REGIONS[@]}"; do
+    for src in "${SOURCE_REGIONS[@]}"; do
+        for tgt in "${TARGET_REGIONS[@]}"; do
             [[ "$src" == "$tgt" ]] && continue
             PAIRS+=("${src}|${tgt}")
         done
@@ -124,8 +131,8 @@ if [[ "${PHASE}" == "1" ]]; then
 # ===========================================================================
 elif [[ "${PHASE}" == "2" ]]; then
     RUNS=()
-    for src in "${REGIONS[@]}"; do
-        for tgt in "${REGIONS[@]}"; do
+    for src in "${SOURCE_REGIONS[@]}"; do
+        for tgt in "${TARGET_REGIONS[@]}"; do
             [[ "$src" == "$tgt" ]] && continue
 
             HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"

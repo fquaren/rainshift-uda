@@ -24,6 +24,7 @@ from typing import Optional
 # Feature-level losses
 # ================================================================
 
+
 def coral_loss(src_feat: torch.Tensor, tgt_feat: torch.Tensor) -> torch.Tensor:
     """
     Deep CORAL: align second-order statistics of source and target features.
@@ -85,6 +86,7 @@ def mmd_loss(
 # ================================================================
 # Adversarial domain adaptation (DANN)
 # ================================================================
+
 
 class _GradientReversal(torch.autograd.Function):
     @staticmethod
@@ -153,8 +155,9 @@ def dann_loss(
     src_labels = torch.zeros_like(src_logits)
     tgt_labels = torch.ones_like(tgt_logits)
 
-    loss = F.binary_cross_entropy_with_logits(src_logits, src_labels) + \
-           F.binary_cross_entropy_with_logits(tgt_logits, tgt_labels)
+    loss = F.binary_cross_entropy_with_logits(src_logits, src_labels) + F.binary_cross_entropy_with_logits(
+        tgt_logits, tgt_labels
+    )
 
     return loss * 0.5
 
@@ -171,6 +174,7 @@ def dann_grl_schedule(epoch: int, n_epochs: int) -> float:
 # ================================================================
 # Output-level losses
 # ================================================================
+
 
 def _radial_psd(x: torch.Tensor) -> torch.Tensor:
     """
@@ -205,7 +209,8 @@ def _radial_psd(x: torch.Tensor) -> torch.Tensor:
 
 
 def spectral_density_loss(
-    pred_src: torch.Tensor, pred_tgt: torch.Tensor,
+    pred_src: torch.Tensor,
+    pred_tgt: torch.Tensor,
 ) -> torch.Tensor:
     """
     Match radially averaged PSD between source and target predictions.
@@ -228,6 +233,7 @@ def spectral_density_loss(
 # ================================================================
 # Input-level transform
 # ================================================================
+
 
 @torch.no_grad()
 def fda_transfer(
@@ -261,8 +267,7 @@ def fda_transfer(
     h = max(int(H * beta), 1)
     w = max(int(W * beta), 1)
 
-    src_amp[:, :, cy - h:cy + h, cx - w:cx + w] = \
-        tgt_amp[:, :, cy - h:cy + h, cx - w:cx + w]
+    src_amp[:, :, cy - h : cy + h, cx - w : cx + w] = tgt_amp[:, :, cy - h : cy + h, cx - w : cx + w]
 
     src_amp = torch.fft.ifftshift(src_amp, dim=(-2, -1))
     result = src_amp * torch.exp(1j * src_phase)
@@ -272,6 +277,7 @@ def fda_transfer(
 # ================================================================
 # Test-time adaptation
 # ================================================================
+
 
 @torch.no_grad()
 def apply_adabn(
@@ -306,6 +312,7 @@ def apply_adabn(
 # ================================================================
 # Post-hoc: Quantile mapping
 # ================================================================
+
 
 def fit_quantile_mapping(
     source_data: np.ndarray,

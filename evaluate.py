@@ -8,6 +8,7 @@ Modes:
 Metrics (physical space, mm):
   Deterministic: RMSE, MAE, bias
   Probabilistic: CRPS, spread (AFM only, when --n_ensemble > 0)
+  Standardized:  mse_std (exact optimizer loss space)
 
 Optional test-time input transforms (--input_transform):
   none       no transform (default)
@@ -17,6 +18,8 @@ Optional test-time input transforms (--input_transform):
   ot         joint-distribution Sinkhorn OT on all channels
 
 All transforms require --src_path to fit on source training data.
+The script evaluates the model on both the source domain (no transform)
+and the target domain (with transform, if specified), saving metrics for both.
 
 Usage:
   # JDOT
@@ -24,10 +27,6 @@ Usage:
       --checkpoint experiments/europe_west__to__melanesia__none/best.pt \
       --src_path /data/rainshift_npy/europe_west \
       --target_path /data/rainshift_npy/melanesia
-
-  # Paper baseline (QM on tp)
-  python evaluate.py single --input_transform qm_tp \
-      --checkpoint ... --src_path ... --target_path ...
 """
 
 import argparse
@@ -161,11 +160,16 @@ def _load_or_fit_transform(src_path, tgt_path, args, device):
 
 
 @torch.no_grad()
-def evaluate_model(model, model_type, loader, device, stats, n_ensemble=0, sample_steps=20, transform=None):
+def evaluate_model(
+    model, model_type, loader, device, stats, n_ensemble=0, sample_steps=20, transform=None, desc="Evaluating"
+):
     var = "precipitation"
     all_pred, all_true, all_ens = [], [], []
 
-    for batch in tqdm(loader, desc="Evaluating"):
+    sum_loss = 0.0
+    n_elements = 0
+
+    for batch in tqdm(loader, desc=desc):
         x, s, y = (t.to(device, non_blocking=True) for t in batch)
 
         if transform is not None:
@@ -173,6 +177,10 @@ def evaluate_model(model, model_type, loader, device, stats, n_ensemble=0, sampl
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model(x, s) if model_type == "unet" else model.deterministic_predict(x, s)
+
+        # Accumulate exact MSE in standardized space
+        sum_loss += torch.sum((pred - y) ** 2).item()
+        n_elements += pred.numel()
 
         all_pred.append(inverse_transform(pred.float().cpu().numpy(), var, stats))
         all_true.append(inverse_transform(y.float().cpu().numpy(), var, stats))
@@ -187,7 +195,9 @@ def evaluate_model(model, model_type, loader, device, stats, n_ensemble=0, sampl
 
     pred = np.concatenate(all_pred)
     true = np.concatenate(all_true)
+
     metrics = compute_metrics(pred, true)
+    metrics["mse_std"] = float(sum_loss / max(n_elements, 1))
 
     if all_ens:
         ens = np.concatenate(all_ens)
@@ -197,20 +207,42 @@ def evaluate_model(model, model_type, loader, device, stats, n_ensemble=0, sampl
     return metrics, pred, true
 
 
-def save_results(metrics, pred, true, out_dir, n_save=5):
+def save_results(metrics, src_pred, src_true, tgt_pred, tgt_true, out_dir, n_save=5):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-    if n_save > 0 and pred.shape[0] >= n_save:
-        mse = np.mean((pred - true) ** 2, axis=(1, 2, 3))
-        idx = np.argsort(mse)
-        np.savez_compressed(
-            out_dir / "predictions.npz",
-            best_pred=pred[idx[:n_save]],
-            best_true=true[idx[:n_save]],
-            worst_pred=pred[idx[-n_save:]],
-            worst_true=true[idx[-n_save:]],
-        )
+
+    if n_save > 0:
+        out_dict = {}
+
+        # Save Source Predictions
+        if src_pred.shape[0] >= n_save:
+            s_mse = np.mean((src_pred - src_true) ** 2, axis=(1, 2, 3))
+            s_idx = np.argsort(s_mse)
+            out_dict.update(
+                {
+                    "src_best_pred": src_pred[s_idx[:n_save]],
+                    "src_best_true": src_true[s_idx[:n_save]],
+                    "src_worst_pred": src_pred[s_idx[-n_save:]],
+                    "src_worst_true": src_true[s_idx[-n_save:]],
+                }
+            )
+
+        # Save Target Predictions
+        if tgt_pred.shape[0] >= n_save:
+            t_mse = np.mean((tgt_pred - tgt_true) ** 2, axis=(1, 2, 3))
+            t_idx = np.argsort(t_mse)
+            out_dict.update(
+                {
+                    "tgt_best_pred": tgt_pred[t_idx[:n_save]],
+                    "tgt_best_true": tgt_true[t_idx[:n_save]],
+                    "tgt_worst_pred": tgt_pred[t_idx[-n_save:]],
+                    "tgt_worst_true": tgt_true[t_idx[-n_save:]],
+                }
+            )
+
+        if out_dict:
+            np.savez_compressed(out_dir / "predictions.npz", **out_dict)
 
 
 def append_csv(csv_path, row):
@@ -237,8 +269,20 @@ def parse_exp_name(name):
 
 def cmd_single(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Source Setup
+    src_stats = load_domain_stats(args.src_path)
+    src_loader = DataLoader(
+        ClimateSRDatasetNPY(args.src_path, "test", stats=src_stats),
+        args.batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    # Target Setup
     tgt_stats = load_domain_stats(args.target_path)
-    loader = DataLoader(
+    tgt_loader = DataLoader(
         ClimateSRDatasetNPY(args.target_path, "test", stats=tgt_stats),
         args.batch_size,
         shuffle=False,
@@ -250,17 +294,43 @@ def cmd_single(args):
 
     transform = None
     if args.input_transform != "none":
-        assert args.src_path, "--src_path required with --input_transform != none"
         transform = _load_or_fit_transform(args.src_path, args.target_path, args, device)
 
-    metrics, pred, true = evaluate_model(
-        model, args.model, loader, device, tgt_stats, args.n_ensemble, args.sample_steps, transform=transform
+    # 1. Evaluate Source (No Transform)
+    src_metrics, src_pred, src_true = evaluate_model(
+        model,
+        args.model,
+        src_loader,
+        device,
+        src_stats,
+        args.n_ensemble,
+        args.sample_steps,
+        transform=None,
+        desc="Evaluating Source",
     )
 
+    # 2. Evaluate Target (With Transform)
+    tgt_metrics, tgt_pred, tgt_true = evaluate_model(
+        model,
+        args.model,
+        tgt_loader,
+        device,
+        tgt_stats,
+        args.n_ensemble,
+        args.sample_steps,
+        transform=transform,
+        desc="Evaluating Target",
+    )
+
+    # Combine Metrics
+    combined_metrics = {f"src_{k}": v for k, v in src_metrics.items()}
+    combined_metrics.update({f"tgt_{k}": v for k, v in tgt_metrics.items()})
+
     tag_base = Path(args.checkpoint).parent.stem
-    tag = f"{tag_base}__{args.input_transform}" if args.input_transform != "none" else tag_base
+    tag = f"{tag_base}____{args.input_transform}" if args.input_transform != "none" else tag_base
     res_dir = Path(args.output_dir) / "results" / tag
-    save_results(metrics, pred, true, res_dir, args.save_samples)
+
+    save_results(combined_metrics, src_pred, src_true, tgt_pred, tgt_true, res_dir, args.save_samples)
 
     src, tgt, method = parse_exp_name(tag_base)
     append_csv(
@@ -271,11 +341,11 @@ def cmd_single(args):
             "target": tgt,
             "method": method,
             "transform": args.input_transform,
-            **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in metrics.items()},
+            **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in combined_metrics.items()},
         },
     )
 
-    for k, v in metrics.items():
+    for k, v in combined_metrics.items():
         if isinstance(v, float):
             print(f"  {k}: {v:.4f}")
 
@@ -303,8 +373,10 @@ def cmd_batch(args):
             continue
 
         tgt_path = data_root / tgt
-        if not (tgt_path / "stats.json").exists():
-            print(f"  Skipping {exp_name} (missing stats)")
+        src_path = data_root / src
+
+        if not (tgt_path / "stats.json").exists() or not (src_path / "stats.json").exists():
+            print(f"  Skipping {exp_name} (missing domain stats)")
             continue
 
         tag = f"{exp_name}__{args.input_transform}" if args.input_transform != "none" else exp_name
@@ -314,9 +386,20 @@ def cmd_batch(args):
             continue
 
         print(f"  Evaluating {tag} ...")
+
+        # Load Data
         tgt_stats = load_domain_stats(str(tgt_path))
-        loader = DataLoader(
+        tgt_loader = DataLoader(
             ClimateSRDatasetNPY(str(tgt_path), "test", stats=tgt_stats),
+            args.batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+        )
+
+        src_stats = load_domain_stats(str(src_path))
+        src_loader = DataLoader(
+            ClimateSRDatasetNPY(str(src_path), "test", stats=src_stats),
             args.batch_size,
             shuffle=False,
             num_workers=2,
@@ -325,18 +408,42 @@ def cmd_batch(args):
 
         transform = None
         if args.input_transform != "none":
-            src_path = data_root / src
-            if not (src_path / "stats.json").exists():
-                print(f"    Missing source at {src_path}, skipping.")
-                continue
             transform = _load_or_fit_transform(str(src_path), str(tgt_path), args, device)
 
         model = load_model(model_type, str(ckpt), device, args.base_features)
-        metrics, pred, true = evaluate_model(
-            model, model_type, loader, device, tgt_stats, args.n_ensemble, args.sample_steps, transform=transform
+
+        # 1. Evaluate Source
+        src_metrics, src_pred, src_true = evaluate_model(
+            model,
+            model_type,
+            src_loader,
+            device,
+            src_stats,
+            args.n_ensemble,
+            args.sample_steps,
+            transform=None,
+            desc="Evaluating Source",
         )
 
-        save_results(metrics, pred, true, res_dir, args.save_samples)
+        # 2. Evaluate Target
+        tgt_metrics, tgt_pred, tgt_true = evaluate_model(
+            model,
+            model_type,
+            tgt_loader,
+            device,
+            tgt_stats,
+            args.n_ensemble,
+            args.sample_steps,
+            transform=transform,
+            desc="Evaluating Target",
+        )
+
+        # Combine Metrics
+        combined_metrics = {f"src_{k}": v for k, v in src_metrics.items()}
+        combined_metrics.update({f"tgt_{k}": v for k, v in tgt_metrics.items()})
+
+        save_results(combined_metrics, src_pred, src_true, tgt_pred, tgt_true, res_dir, args.save_samples)
+
         append_csv(
             csv_path,
             {
@@ -345,11 +452,11 @@ def cmd_batch(args):
                 "target": tgt,
                 "method": method,
                 "transform": args.input_transform,
-                **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in metrics.items()},
+                **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in combined_metrics.items()},
             },
         )
 
-        for k, v in metrics.items():
+        for k, v in combined_metrics.items():
             if isinstance(v, float):
                 print(f"    {k}: {v:.4f}")
 
@@ -397,7 +504,7 @@ def main():
     s.add_argument("--model", required=True, choices=["unet", "afm"])
     s.add_argument("--checkpoint", required=True)
     s.add_argument("--target_path", required=True)
-    s.add_argument("--src_path", default=None, help="source dataset dir (required for any input_transform)")
+    s.add_argument("--src_path", required=True, help="source dataset dir (now required to compute source metrics)")
     s.add_argument("--output_dir", default="./experiments")
     _add_common_args(s)
 

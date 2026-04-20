@@ -41,8 +41,20 @@ DATA_FORMAT="npy"
 PHASE="${PHASE:-1}"
 echo "Selected PHASE: ${PHASE}"
 
-REGIONS=(
+# ADD THESE LINES: Ensure output directories exist before logging
+mkdir -p "${OUTPUT_DIR}/base_hp"
+mkdir -p "${OUTPUT_DIR}/best_hp"
+
+
+SOURCE_REGIONS=(
     "europe_west"
+    # "blacksea"
+    # "horn-of-africa"
+    # "melanesia"
+)
+
+TARGET_REGIONS=(
+    # "europe_west"
     # "blacksea"
     # "horn-of-africa"
     "melanesia"
@@ -65,8 +77,8 @@ run_python() {
 
 if [[ "${PHASE}" == "1" ]]; then
     PAIRS=()
-    for src in "${REGIONS[@]}"; do
-        for tgt in "${REGIONS[@]}"; do
+    for src in "${SOURCE_REGIONS[@]}"; do
+        for tgt in "${TARGET_REGIONS[@]}"; do
             [[ "$src" == "$tgt" ]] && continue
             PAIRS+=("${src}|${tgt}")
         done
@@ -95,16 +107,16 @@ if [[ "${PHASE}" == "1" ]]; then
             --batch_size  "${BATCH_SIZE}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
-            --subset_size "${SUBSET_SIZE}" \
             2>&1 | tee "${OUTPUT_DIR}/afm_phase1_${src}__to__${tgt}.log"
         echo ""
     done
     echo "=== AFM PHASE 1 complete ==="
+    #--subset_size "${SUBSET_SIZE}" \
 
 elif [[ "${PHASE}" == "2" ]]; then
     RUNS=()
-    for src in "${REGIONS[@]}"; do
-        for tgt in "${REGIONS[@]}"; do
+    for src in "${SOURCE_REGIONS[@]}"; do
+        for tgt in "${TARGET_REGIONS[@]}"; do
             [[ "$src" == "$tgt" ]] && continue
             HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
             if [[ ! -f "${HP_FILE}" ]]; then
@@ -141,7 +153,6 @@ elif [[ "${PHASE}" == "2" ]]; then
             --epochs      "${EPOCHS}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
-            --subset_size "${SUBSET_SIZE}" \
             2>&1 | tee "${OUTPUT_DIR}/afm_phase2_${src}__to__${tgt}__${method}.log"
         echo ""
     done
@@ -149,3 +160,5 @@ elif [[ "${PHASE}" == "2" ]]; then
 else
     echo "ERROR: PHASE must be 1 or 2"; exit 1
 fi
+
+# --subset_size "${SUBSET_SIZE}" \

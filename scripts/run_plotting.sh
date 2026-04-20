@@ -33,14 +33,22 @@ run_python() {
 }
 
 # Iterate through evaluated directories and plot
-for dir in "${RESULTS_DIR}/unet"/*; do
-    if [ -d "${dir}" ]; then
-        run_python "${CODE_ROOT}/plotting.py" --result_dir "${dir}" --data_root "${DATA_ROOT}" --n_samples 5
+for category_dir in "${RESULTS_DIR}/unet"/*; do
+    if [ -d "${category_dir}" ]; then
+        for exp_dir in "${category_dir}"/*; do
+            if [ -d "${exp_dir}" ]; then
+                run_python "${CODE_ROOT}/plotting.py" --result_dir "${exp_dir}" --data_root "${DATA_ROOT}" --n_samples 5
+            fi
+        done
     fi
 done
 
-for dir in "${RESULTS_DIR}/afm"/*; do
-    if [ -d "${dir}" ]; then
-        run_python "${CODE_ROOT}/plotting.py" --result_dir "${dir}" --data_root "${DATA_ROOT}" --n_samples 5
+for category_dir in "${RESULTS_DIR}/afm"/*; do
+    if [ -d "${category_dir}" ]; then
+        for exp_dir in "${category_dir}"/*; do
+            if [ -d "${exp_dir}" ]; then
+                run_python "${CODE_ROOT}/plotting.py" --result_dir "${exp_dir}" --data_root "${DATA_ROOT}" --n_samples 5
+            fi
+        done
     fi
 done

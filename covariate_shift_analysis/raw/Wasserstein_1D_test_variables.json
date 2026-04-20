@@ -1,0 +1,18 @@
+{
+  "variables": [
+    "cape",
+    "cp",
+    "sp",
+    "tclw",
+    "tcw",
+    "tisr",
+    "tp",
+    "u",
+    "v",
+    "precipitation"
+  ],
+  "domains": [
+    "europe_west",
+    "melanesia"
+  ]
+}

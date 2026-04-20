@@ -1,6 +1,6 @@
 """
-Generate physical spatial plots for 5 samples of a trained model.
-Retrieves inputs, static fields, and targets directly from the test dataset.
+Generate physical spatial plots for samples of a trained model.
+Retrieves inputs, static fields, and targets directly from both source and target datasets.
 """
 
 import argparse
@@ -20,10 +20,12 @@ from models.unet import DualEncoderUNet
 DEFAULT_INPUT_VARS = ["cape", "cp", "sp", "tclw", "tcw", "tisr", "tp", "u", "v"]
 DEFAULT_STATIC_VARS = ["lsm", "z"]
 
+
 def _infer_model_type(exp_dir_name):
     return "afm" if "afm" in exp_dir_name else "unet"
 
-def load_model(model_type, checkpoint, device, base_features=64):
+
+def load_model(model_type, checkpoint, device, base_features=32):
     ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
     clean = {k.removeprefix("_orig_mod."): v for k, v in ckpt.items()}
     if model_type == "unet":
@@ -33,60 +35,100 @@ def load_model(model_type, checkpoint, device, base_features=64):
     model.load_state_dict(clean)
     return model.to(device).eval()
 
-def plot_sample(x, s, y_true, y_pred, stats, sample_idx, out_dir):
-    fig, axes = plt.subplots(4, 4, figsize=(20, 20))
-    axes = axes.flatten()
-    
-    # 1. Plot Dynamic Inputs
+
+def plot_sample(
+    x_src, s_src, y_src, y_pred_src, x_tgt, s_tgt, y_tgt, y_pred_tgt, src_stats, tgt_stats, sample_idx, out_dir
+):
+    # 4 rows, 9 columns to fit all variables across both domains
+    fig, axes = plt.subplots(4, 9, figsize=(32, 16))
+    used_axes = []
+
+    # 1. Plot Dynamic Inputs (Row 0: Source, Row 1: Target)
     for i, var_name in enumerate(DEFAULT_INPUT_VARS):
-        field = inverse_transform(x[i], var_name, stats)
-        ax = axes[i]
-        im = ax.imshow(field, cmap="viridis", origin="lower")
-        ax.set_title(f"Input: {var_name}")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.axis("off")
-        
-    # 2. Plot Static Inputs
-    offset = len(DEFAULT_INPUT_VARS)
+        # Source
+        ax_src = axes[0, i]
+        field_src = inverse_transform(x_src[i], var_name, src_stats)
+        im_src = ax_src.imshow(field_src, cmap="viridis", origin="upper")
+        ax_src.set_title(f"SRC: {var_name}")
+        fig.colorbar(im_src, ax=ax_src, fraction=0.046, pad=0.04)
+        used_axes.append(ax_src)
+
+        # Target
+        ax_tgt = axes[1, i]
+        field_tgt = inverse_transform(x_tgt[i], var_name, tgt_stats)
+        im_tgt = ax_tgt.imshow(field_tgt, cmap="viridis", origin="upper")
+        ax_tgt.set_title(f"TGT: {var_name}")
+        fig.colorbar(im_tgt, ax=ax_tgt, fraction=0.046, pad=0.04)
+        used_axes.append(ax_tgt)
+
+    # 2. Plot Static Inputs (Row 2)
     for i, var_name in enumerate(DEFAULT_STATIC_VARS):
-        field = inverse_transform(s[i], var_name, stats)
-        ax = axes[offset + i]
         cmap = "terrain" if var_name == "z" else "ocean"
-        im = ax.imshow(field, cmap=cmap, origin="lower")
-        ax.set_title(f"Static: {var_name}")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.axis("off")
-        
-    # 3. Plot Target and Prediction
-    pred_field = inverse_transform(y_pred[0], "precipitation", stats)
-    true_field = inverse_transform(y_true[0], "precipitation", stats)
-    
+
+        # Source
+        ax_src = axes[2, i]
+        field_src = inverse_transform(s_src[i], var_name, src_stats)
+        im_src = ax_src.imshow(field_src, cmap=cmap, origin="upper")
+        ax_src.set_title(f"SRC Static: {var_name}")
+        fig.colorbar(im_src, ax=ax_src, fraction=0.046, pad=0.04)
+        used_axes.append(ax_src)
+
+        # Target
+        ax_tgt = axes[2, i + 2]
+        field_tgt = inverse_transform(s_tgt[i], var_name, tgt_stats)
+        im_tgt = ax_tgt.imshow(field_tgt, cmap=cmap, origin="upper")
+        ax_tgt.set_title(f"TGT Static: {var_name}")
+        fig.colorbar(im_tgt, ax=ax_tgt, fraction=0.046, pad=0.04)
+        used_axes.append(ax_tgt)
+
+    # 3. Plot Targets and Predictions (Row 3)
+    src_true_field = inverse_transform(y_src[0], "precipitation", src_stats)
+    src_pred_field = inverse_transform(y_pred_src[0], "precipitation", src_stats)
+    tgt_true_field = inverse_transform(y_tgt[0], "precipitation", tgt_stats)
+    tgt_pred_field = inverse_transform(y_pred_tgt[0], "precipitation", tgt_stats)
+
     vmin = 0.1
-    vmax = max(pred_field.max(), true_field.max(), 1.0)
-    
-    # Clip arrays to prevent matplotlib LogNorm crashes on exactly 0.0 or inf
-    pred_field = np.clip(pred_field, a_min=vmin, a_max=None)
-    true_field = np.clip(true_field, a_min=vmin, a_max=None)
-    
-    ax_true = axes[11]
-    im_true = ax_true.imshow(true_field, cmap="Blues", norm=LogNorm(vmin=vmin, vmax=vmax), origin="lower")
-    ax_true.set_title("Target: precipitation")
-    fig.colorbar(im_true, ax=ax_true, fraction=0.046, pad=0.04)
-    ax_true.axis("off")
-    
-    ax_pred = axes[12]
-    im_pred = ax_pred.imshow(pred_field, cmap="Blues", norm=LogNorm(vmin=vmin, vmax=vmax), origin="lower")
-    ax_pred.set_title("Prediction: precipitation")
-    fig.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
-    ax_pred.axis("off")
-    
-    # Disable unused axes
-    for j in range(13, 16):
-        axes[j].axis("off")
-        
+    vmax = max(src_true_field.max(), src_pred_field.max(), tgt_true_field.max(), tgt_pred_field.max(), 1.0)
+
+    # Clip arrays to prevent matplotlib LogNorm crashes
+    src_true_field = np.clip(src_true_field, a_min=vmin, a_max=None)
+    src_pred_field = np.clip(src_pred_field, a_min=vmin, a_max=None)
+    tgt_true_field = np.clip(tgt_true_field, a_min=vmin, a_max=None)
+    tgt_pred_field = np.clip(tgt_pred_field, a_min=vmin, a_max=None)
+
+    ax_src_true = axes[3, 0]
+    im_src_true = ax_src_true.imshow(src_true_field, cmap="Blues", norm=LogNorm(vmin=vmin, vmax=vmax), origin="upper")
+    ax_src_true.set_title("SRC Target: precip")
+    fig.colorbar(im_src_true, ax=ax_src_true, fraction=0.046, pad=0.04)
+    used_axes.append(ax_src_true)
+
+    ax_src_pred = axes[3, 1]
+    im_src_pred = ax_src_pred.imshow(src_pred_field, cmap="Blues", norm=LogNorm(vmin=vmin, vmax=vmax), origin="upper")
+    ax_src_pred.set_title("SRC Prediction: precip")
+    fig.colorbar(im_src_pred, ax=ax_src_pred, fraction=0.046, pad=0.04)
+    used_axes.append(ax_src_pred)
+
+    ax_tgt_true = axes[3, 2]
+    im_tgt_true = ax_tgt_true.imshow(tgt_true_field, cmap="Blues", norm=LogNorm(vmin=vmin, vmax=vmax), origin="upper")
+    ax_tgt_true.set_title("TGT Target: precip")
+    fig.colorbar(im_tgt_true, ax=ax_tgt_true, fraction=0.046, pad=0.04)
+    used_axes.append(ax_tgt_true)
+
+    ax_tgt_pred = axes[3, 3]
+    im_tgt_pred = ax_tgt_pred.imshow(tgt_pred_field, cmap="Blues", norm=LogNorm(vmin=vmin, vmax=vmax), origin="upper")
+    ax_tgt_pred.set_title("TGT Prediction: precip")
+    fig.colorbar(im_tgt_pred, ax=ax_tgt_pred, fraction=0.046, pad=0.04)
+    used_axes.append(ax_tgt_pred)
+
+    # Disable all unused axes systematically
+    for ax in axes.flatten():
+        if ax not in used_axes:
+            ax.axis("off")
+
     plt.tight_layout()
     plt.savefig(out_dir / f"sample_{sample_idx:03d}.pdf", dpi=150, bbox_inches="tight")
     plt.close(fig)
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -96,61 +138,82 @@ def main():
     args = p.parse_args()
 
     res_dir = Path(args.result_dir)
-    
-    # Dynamically resolve path: e.g., /scratch/.../results/unet/exp_name -> /scratch/.../unet/exp_name
+
     exp_name = res_dir.name
-    model_type = res_dir.parent.name
-    exp_root = res_dir.parent.parent.parent 
-    
-    exp_dir = exp_root / model_type / exp_name
+    transform_type = res_dir.parent.name
+    model_type = res_dir.parent.parent.name
+    exp_root = res_dir.parent.parent.parent.parent
+
+    # Recover base model directory
+    if transform_type != "none" and exp_name.endswith(f"__{transform_type}"):
+        base_model_name = exp_name[: -len(f"__{transform_type}")]
+    else:
+        base_model_name = exp_name
+
+    exp_dir = exp_root / model_type / base_model_name
     cfg_path = exp_dir / "config.json"
-    
+
     if not cfg_path.exists():
-        raise FileNotFoundError(f"Config not found at {cfg_path}")
-        
+        raise FileNotFoundError(f"Config not found at {cfg_path}. Parsed base model: {base_model_name}")
+
     cfg = json.loads(cfg_path.read_text())
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Setup Target Dataloader
     tgt_domain = Path(cfg["target_path"]).name
     tgt_path = Path(args.data_root) / tgt_domain
-    
-    stats = load_domain_stats(str(tgt_path))
-    loader = DataLoader(
-        ClimateSRDatasetNPY(str(tgt_path), "test", stats=stats),
-        batch_size=1, shuffle=False
-    )
-    
-    # Load adabn weights if they exist, otherwise standard best.pt
+    tgt_stats = load_domain_stats(str(tgt_path))
+    tgt_loader = DataLoader(ClimateSRDatasetNPY(str(tgt_path), "test", stats=tgt_stats), batch_size=1, shuffle=False)
+
+    # Setup Source Dataloader
+    src_domain = Path(cfg["source_path"]).name
+    src_path = Path(args.data_root) / src_domain
+    src_stats = load_domain_stats(str(src_path))
+    src_loader = DataLoader(ClimateSRDatasetNPY(str(src_path), "test", stats=src_stats), batch_size=1, shuffle=False)
+
+    # Load appropriate checkpoint
     ckpt_path = exp_dir / "best_adabn.pt" if (exp_dir / "best_adabn.pt").exists() else exp_dir / "best.pt"
-    
-    model = load_model(model_type, ckpt_path, device, cfg.get("base_features", 64))
-    
+    model = load_model(model_type, ckpt_path, device, cfg.get("base_features", 32))
+
     out_dir = res_dir / "pdf_plots"
     out_dir.mkdir(exist_ok=True, parents=True)
-    
+
     print(f"Plotting {args.n_samples} samples for {res_dir.name}...")
     with torch.no_grad():
-        for idx, batch in enumerate(loader):
+        for idx, (src_batch, tgt_batch) in enumerate(zip(src_loader, tgt_loader)):
             if idx >= args.n_samples:
                 break
-                
-            x, s, y = (t.to(device) for t in batch)
-            
+
+            x_src, s_src, y_src = (t.to(device) for t in src_batch)
+            x_tgt, s_tgt, y_tgt = (t.to(device) for t in tgt_batch)
+
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                # Prediction is done on both source and target domains
                 if model_type == "unet":
-                    pred = model(x, s)
+                    pred_src = model(x_src, s_src)
+                    pred_tgt = model(x_tgt, s_tgt)
                 else:
-                    pred = model.deterministic_predict(x, s)
-            
-            # Hard clamp logits to prevent exponential overflow in inverse_transform
-            pred = torch.clamp(pred, min=-50.0, max=50.0)
-                    
-            x_np = x.squeeze(0).cpu().numpy()
-            s_np = s.squeeze(0).cpu().numpy()
-            y_np = y.squeeze(0).cpu().numpy()
-            p_np = pred.squeeze(0).float().cpu().numpy()
-            
-            plot_sample(x_np, s_np, y_np, p_np, stats, idx, out_dir)
+                    pred_src = model.deterministic_predict(x_src, s_src)
+                    pred_tgt = model.deterministic_predict(x_tgt, s_tgt)
+
+            pred_src = torch.clamp(pred_src, min=-50.0, max=50.0)
+            pred_tgt = torch.clamp(pred_tgt, min=-50.0, max=50.0)
+
+            plot_sample(
+                x_src.squeeze(0).cpu().numpy(),
+                s_src.squeeze(0).cpu().numpy(),
+                y_src.squeeze(0).cpu().numpy(),
+                pred_src.squeeze(0).float().cpu().numpy(),
+                x_tgt.squeeze(0).cpu().numpy(),
+                s_tgt.squeeze(0).cpu().numpy(),
+                y_tgt.squeeze(0).cpu().numpy(),
+                pred_tgt.squeeze(0).float().cpu().numpy(),
+                src_stats,
+                tgt_stats,
+                idx,
+                out_dir,
+            )
+
 
 if __name__ == "__main__":
     main()
