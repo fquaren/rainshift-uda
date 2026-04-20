@@ -41,7 +41,6 @@ DATA_FORMAT="npy"
 PHASE="${PHASE:-1}"
 echo "Selected PHASE: ${PHASE}"
 
-# ADD THESE LINES: Ensure output directories exist before logging
 mkdir -p "${OUTPUT_DIR}/base_hp"
 mkdir -p "${OUTPUT_DIR}/best_hp"
 
@@ -60,12 +59,11 @@ TARGET_REGIONS=(
     "melanesia"
 )
 
-METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn")
+METHODS=("fda" "mmd"  "adabn") # "coral", "spectral", "dann"
 
 EPOCHS=25
 PATIENCE=-1
 NUM_WORKERS=8
-SUBSET_SIZE=10000
 BATCH_SIZE=32
 
 FDA_BETA=0.01
@@ -111,7 +109,6 @@ if [[ "${PHASE}" == "1" ]]; then
         echo ""
     done
     echo "=== AFM PHASE 1 complete ==="
-    #--subset_size "${SUBSET_SIZE}" \
 
 elif [[ "${PHASE}" == "2" ]]; then
     RUNS=()
@@ -160,5 +157,3 @@ elif [[ "${PHASE}" == "2" ]]; then
 else
     echo "ERROR: PHASE must be 1 or 2"; exit 1
 fi
-
-# --subset_size "${SUBSET_SIZE}" \

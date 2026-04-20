@@ -68,20 +68,17 @@ TARGET_REGIONS=(
 )
 
 
-METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn")
+METHODS=("fda" "mmd"  "adabn") # "coral", "spectral", "dann"
 
 EPOCHS=25
 PATIENCE=-1
 NUM_WORKERS=8
-SUBSET_SIZE=1000
 BATCH_SIZE=256
-
-OPTUNA_TIMEOUT=172800
 
 FDA_BETA=0.01
 LAMBDA_UDA=0.1
 
-# COMPILE="--compile" 
+COMPILE="--compile" 
 # --------------------------------------------------------------------------
 
 run_python() {
@@ -112,9 +109,6 @@ if [[ "${PHASE}" == "1" ]]; then
             continue
         fi
 
-        SUBSET_FLAG=""
-        [[ -n "${SUBSET_SIZE}" ]] && SUBSET_FLAG="--subset_size ${SUBSET_SIZE}"
-
         run_python "${CODE_ROOT}/train_unet.py" \
             --source_path "${DATA_ROOT}/${src}" \
             --target_path "${DATA_ROOT}/${tgt}" \
@@ -127,8 +121,6 @@ if [[ "${PHASE}" == "1" ]]; then
             --num_workers "${NUM_WORKERS}" \
             2>&1 | tee "${OUTPUT_DIR}/phase1_${src}__to__${tgt}.log"
     done
-
-    # ${SUBSET_FLAG} \
 
 # ===========================================================================
 #  PHASE 2: UDA application (Fixed HPs, no Optuna)
@@ -163,9 +155,6 @@ elif [[ "${PHASE}" == "2" ]]; then
             continue
         fi
 
-        SUBSET_FLAG=""
-        [[ -n "${SUBSET_SIZE}" ]] && SUBSET_FLAG="--subset_size ${SUBSET_SIZE}"
-
         run_python "${CODE_ROOT}/train_unet.py" \
             --source_path "${DATA_ROOT}/${src}" \
             --target_path "${DATA_ROOT}/${tgt}" \
@@ -179,8 +168,6 @@ elif [[ "${PHASE}" == "2" ]]; then
             --num_workers "${NUM_WORKERS}" \
             2>&1 | tee "${OUTPUT_DIR}/phase2_${src}__to__${tgt}__${method}.log"
     done
-
-    # ${SUBSET_FLAG} \
 
 else
     echo "ERROR: PHASE must be 1 or 2 (got: ${PHASE})"
