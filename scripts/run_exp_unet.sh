@@ -97,11 +97,11 @@ if [[ "${PHASE}" == "1" ]]; then
         done
     done
 
-    echo "=== PHASE 1: Base HP search (vanilla) ==="
+    echo "=== PHASE 1: Vanilla UNet (no UDA) ==="
     
     for i in "${!PAIRS[@]}"; do
         IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
-        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} -> ${tgt} | vanilla HP search ---"
+        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} -> ${tgt} ---"
 
         HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
         if [[ -f "${HP_FILE}" ]]; then

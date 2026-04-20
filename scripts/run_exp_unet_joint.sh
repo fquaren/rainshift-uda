@@ -85,7 +85,7 @@ if [[ "${PHASE}" == "1" ]]; then
         done
     done
 
-    echo "=== PHASE 1: Base HP search (joint training) ==="
+    echo "=== PHASE 1: Vanilla UNet (no UDA), joint training S+T ==="
     
     for i in "${!PAIRS[@]}"; do
         IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
