@@ -2,11 +2,11 @@
 # ===========================================================================
 #  RainShift UDA — Two-phase experiment launcher
 #
-#  PHASE 1: Baseline training on vanilla model.
+#  PHASE 1: Optuna search for base HPs (lr, batch_size, wd) on vanilla model.
 #           One job per (source, target) pair.
 #           Results saved to {OUTPUT_DIR}/base_hp/{src}__to__{tgt}.json
 #
-#  PHASE 2: Standard training for UDA methods.
+#  PHASE 2: Standard training for UDA methods. (Method A: No UDA HP tuning).
 #           One job per (source, target, method) triple.
 #           Loads base HPs from phase 1 automatically.
 #
@@ -30,8 +30,8 @@
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task 32
-#SBATCH --mem 500G
+#SBATCH --cpus-per-task 12
+#SBATCH --mem 400G
 #SBATCH --time 72:00:00
 
 set -euo pipefail
@@ -41,16 +41,17 @@ export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/li
 
 # --- Configuration --------------------------------------------------------
 CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
-CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
+CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/WeatherAdaptSR"
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/rainshift_npy"
 OUTPUT_DIR="/scratch/fquareng/rainshift_uda/unet"
 DATA_FORMAT="npy"
 
-# ADD THESE LINES: Ensure output directories exist before logging
+PHASE="${PHASE:-1}"
+echo "Selected PHASE: ${PHASE}"
+
 mkdir -p "${OUTPUT_DIR}/base_hp"
 mkdir -p "${OUTPUT_DIR}/best_hp"
 
-PHASE="${PHASE:-1}"
 
 SOURCE_REGIONS=(
     "europe_west"
@@ -66,17 +67,21 @@ TARGET_REGIONS=(
     "melanesia"
 )
 
-METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn") # 
+
+METHODS=("coral" "mmd" "spectral" "fda" "dann" "adabn")
 
 EPOCHS=25
 PATIENCE=-1
-NUM_WORKERS=32
-SUBSET_SIZE=20000
-BATCH_SIZE=128
+NUM_WORKERS=8
+SUBSET_SIZE=1000
+BATCH_SIZE=256
+
+OPTUNA_TIMEOUT=172800
 
 FDA_BETA=0.01
 LAMBDA_UDA=0.1
 
+# COMPILE="--compile" 
 # --------------------------------------------------------------------------
 
 run_python() {
@@ -84,7 +89,7 @@ run_python() {
 }
 
 # ===========================================================================
-#  PHASE 1: Baseline training (vanilla, one per domain pair)
+#  PHASE 1: Base HP search (vanilla, one per domain pair)
 # ===========================================================================
 if [[ "${PHASE}" == "1" ]]; then
     PAIRS=()
@@ -95,11 +100,11 @@ if [[ "${PHASE}" == "1" ]]; then
         done
     done
 
-    echo "=== PHASE 1: Baseline training (vanilla) ==="
+    echo "=== PHASE 1: Base HP search (vanilla) ==="
     
     for i in "${!PAIRS[@]}"; do
         IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
-        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} -> ${tgt} | vanilla training ---"
+        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} -> ${tgt} | vanilla HP search ---"
 
         HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
         if [[ -f "${HP_FILE}" ]]; then
@@ -123,11 +128,10 @@ if [[ "${PHASE}" == "1" ]]; then
             2>&1 | tee "${OUTPUT_DIR}/phase1_${src}__to__${tgt}.log"
     done
 
-# ${SUBSET_FLAG} \
-    
+    # ${SUBSET_FLAG} \
 
 # ===========================================================================
-#  PHASE 2: UDA application (Fixed HPs)
+#  PHASE 2: UDA application (Fixed HPs, no Optuna)
 # ===========================================================================
 elif [[ "${PHASE}" == "2" ]]; then
     RUNS=()
@@ -137,7 +141,8 @@ elif [[ "${PHASE}" == "2" ]]; then
 
             HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
             if [[ ! -f "${HP_FILE}" ]]; then
-                echo "WARNING: Missing base HPs for ${src} -> ${tgt}, defaulting to argparse values."
+                echo "WARNING: Missing base HPs for ${src} -> ${tgt}, skipping."
+                continue
             fi
 
             for method in "${METHODS[@]}"; do
@@ -174,7 +179,8 @@ elif [[ "${PHASE}" == "2" ]]; then
             --num_workers "${NUM_WORKERS}" \
             2>&1 | tee "${OUTPUT_DIR}/phase2_${src}__to__${tgt}__${method}.log"
     done
-    # ${SUBSET_FLAG} \ 
+
+    # ${SUBSET_FLAG} \
 
 else
     echo "ERROR: PHASE must be 1 or 2 (got: ${PHASE})"
