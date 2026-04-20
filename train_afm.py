@@ -39,12 +39,26 @@ def build_loaders(args, ss, ts, bs=None):
     nw = min(args.num_workers, 2)
     kw = dict(num_workers=nw, pin_memory=True, persistent_workers=nw > 0, prefetch_factor=2 if nw > 0 else None)
     mk = lambda p, sp, st: ClimateSRDatasetNPY(p, sp, stats=st, subset_size=args.subset_size)
-    return (
-        DataLoader(mk(args.source_path, "train", ss), bs, shuffle=True, drop_last=True, **kw),
-        DataLoader(mk(args.source_path, "validation", ss), bs, shuffle=False, **kw),
-        DataLoader(mk(args.target_path, "train", ts), bs, shuffle=True, drop_last=True, **kw),
-        DataLoader(mk(args.target_path, "test", ts), bs, shuffle=False, **kw),
-    )
+
+    if args.joint_training:
+        src_tr = mk(args.source_path, "train", ss)
+        tgt_tr = mk(args.target_path, "train", ts)
+        train_ds = ConcatDataset([src_tr, tgt_tr])
+        return (
+            DataLoader(train_ds, bs, shuffle=True, drop_last=True, **kw),
+            DataLoader(mk(args.source_path, "validation", ss), bs, shuffle=False, **kw),
+            DataLoader(mk(args.target_path, "train", ts), bs, shuffle=True, drop_last=True, **kw),
+            DataLoader(mk(args.target_path, "test", ts), bs, shuffle=False, **kw),
+        )
+    else:
+
+        return (
+            DataLoader(mk(args.source_path, "train", ss), bs, shuffle=True, drop_last=True, **kw),
+            DataLoader(mk(args.source_path, "validation", ss), bs, shuffle=False, **kw),
+            DataLoader(mk(args.target_path, "train", ts), bs, shuffle=True, drop_last=True, **kw),
+            DataLoader(mk(args.target_path, "test", ts), bs, shuffle=False, **kw),
+        )
+
 
 
 def build_uda(method, device):
@@ -272,6 +286,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--base_features", type=int, default=64)
     p.add_argument("--encoder_loss_weight", type=float, default=0.1)
+    p.add_argument("--joint_training", action="store_true", help="Train on concatenated source and target domains")
     return p.parse_args()
 
 
