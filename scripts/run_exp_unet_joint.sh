@@ -35,7 +35,7 @@ export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/li
 
 # --- Configuration --------------------------------------------------------
 CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
-CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/WeatherAdaptSR"
+CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/rainshift_npy"
 OUTPUT_DIR="/scratch/fquareng/rainshift_uda/unet_joint"
 DATA_FORMAT="npy"
@@ -89,7 +89,7 @@ if [[ "${PHASE}" == "1" ]]; then
     
     for i in "${!PAIRS[@]}"; do
         IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
-        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} + ${tgt} | joint HP search ---"
+        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} + ${tgt} ---"
 
         HP_FILE="${OUTPUT_DIR}/base_hp/${src}__and__${tgt}.json"
         if [[ -f "${HP_FILE}" ]]; then
@@ -102,11 +102,12 @@ if [[ "${PHASE}" == "1" ]]; then
             --target_path "${DATA_ROOT}/${tgt}" \
             --output_dir  "${OUTPUT_DIR}" \
             --data_format "${DATA_FORMAT}" \
-            --joint_training \
             --uda_method  none \
             --epochs      "${EPOCHS}" \
             --batch_size  "${BATCH_SIZE}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
+            --joint_training \
             2>&1 | tee "${OUTPUT_DIR}/phase1_joint_${src}__and__${tgt}.log"
     done
+fi

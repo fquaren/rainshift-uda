@@ -110,3 +110,4 @@ if [[ "${PHASE}" == "1" ]]; then
         echo ""
     done
     echo "=== AFM PHASE 1 complete ==="
+fi
