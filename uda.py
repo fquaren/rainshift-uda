@@ -7,17 +7,18 @@ Output-level methods expect (B, 1, H, W) predictions.
 
 Methods are grouped by where they act:
     Input-level:   fda_transfer
-    Feature-level: coral_loss, mmd_loss, dann_loss + DomainDiscriminator
+    Feature-level: coral_loss, mmd_loss, mmd_multiscale_loss, dann_loss + DomainDiscriminator
     Output-level:  spectral_density_loss
     Test-time:     apply_adabn
     Post-hoc:      fit_quantile_mapping, apply_quantile_mapping
 """
 
+from typing import Dict, Iterable, Optional
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Optional
 
 
 # ================================================================
@@ -55,7 +56,8 @@ def mmd_loss(
     bandwidths: Optional[list] = None,
 ) -> torch.Tensor:
     """
-    Multi-kernel Maximum Mean Discrepancy with Gaussian RBF kernels.
+    Multi-kernel Maximum Mean Discrepancy with Gaussian RBF kernels, on
+    single-level GAP-pooled features.
 
     Gretton et al., JMLR 2012; Long et al., ICML 2015 (DAN).
     """
@@ -81,6 +83,78 @@ def mmd_loss(
         loss = loss + k_ss.mean() + k_tt.mean() - 2.0 * k_st.mean()
 
     return loss / len(bandwidths)
+
+
+def mmd_multiscale_loss(
+    src_feats: Dict[str, torch.Tensor],
+    tgt_feats: Dict[str, torch.Tensor],
+    levels: Iterable[str] = ("enc2", "enc3", "enc4", "bottleneck"),
+    bandwidths: Optional[list] = None,
+    median_heuristic: bool = True,
+) -> torch.Tensor:
+    """
+    Multi-scale MMD: average single-scale MMD losses across several encoder
+    levels. Aligning features at multiple depths probes both shallow and
+    semantic shift, which is the original motivation of DAN/JAN-style
+    alignment (Long et al., ICML 2015/2017).
+
+    Args:
+        src_feats, tgt_feats: dicts keyed by layer name, each value (B, C, H, W).
+        levels: which keys to include. Silently drops keys absent from the dicts.
+        bandwidths: RBF bandwidths passed through to mmd_loss when
+            ``median_heuristic`` is False.
+        median_heuristic: if True (default) the bandwidth at each level is
+            derived from the median pairwise distance of the stacked source and
+            target features at that level (Gretton et al., JMLR 2012).
+            Multi-bandwidth kernels spanning 2^-2..2^2 around the median are
+            used, which is the standard DAN configuration.
+    """
+    active_levels = [lvl for lvl in levels if lvl in src_feats and lvl in tgt_feats]
+    if not active_levels:
+        raise KeyError(
+            f"No requested MMD levels are present in feature dicts. "
+            f"Requested {list(levels)}, available {list(src_feats)}."
+        )
+
+    losses = []
+    for lvl in active_levels:
+        if median_heuristic:
+            bw = _median_heuristic_bandwidth(src_feats[lvl], tgt_feats[lvl])
+            bws = [bw * (2.0**k) for k in (-2, -1, 0, 1, 2)]
+        else:
+            bws = bandwidths
+        losses.append(mmd_loss(src_feats[lvl], tgt_feats[lvl], bandwidths=bws))
+
+    return torch.stack(losses).mean()
+
+
+@torch.no_grad()
+def _median_heuristic_bandwidth(
+    src_feat: torch.Tensor,
+    tgt_feat: torch.Tensor,
+    max_samples: int = 512,
+) -> float:
+    """
+    Median of pairwise Euclidean distances between GAP-pooled features from
+    the concatenated source and target batch. Bandwidth is computed with
+    torch.no_grad so it enters the RBF kernel as a scalar constant and does
+    not receive gradient. Capped at max_samples per domain to avoid O(n^2)
+    memory on large batches.
+    """
+    src = F.adaptive_avg_pool2d(src_feat, 1).flatten(1)
+    tgt = F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1)
+
+    if src.size(0) > max_samples:
+        src = src[:max_samples]
+    if tgt.size(0) > max_samples:
+        tgt = tgt[:max_samples]
+
+    z = torch.cat([src, tgt], dim=0)
+    d = torch.cdist(z, z, p=2.0)
+    # take upper triangle excluding the zero diagonal
+    iu = torch.triu_indices(d.size(0), d.size(1), offset=1)
+    med = d[iu[0], iu[1]].median().clamp(min=1e-6).item()
+    return med
 
 
 # ================================================================
@@ -169,6 +243,33 @@ def dann_grl_schedule(epoch: int, n_epochs: int) -> float:
     """
     p = epoch / n_epochs
     return 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
+
+
+def lambda_uda_schedule(
+    epoch: int,
+    n_epochs: int,
+    lambda_max: float,
+    kind: str = "sigmoid",
+) -> float:
+    """
+    Schedule for the UDA loss weight. Matches the DANN GRL ramp when
+    kind == 'sigmoid', a linear warm-up when 'linear', or a constant when
+    'fixed'.
+
+    Args:
+        epoch: 1-based epoch index.
+        n_epochs: total number of epochs.
+        lambda_max: asymptotic (fixed) weight.
+        kind: 'fixed', 'linear', or 'sigmoid'.
+    """
+    if kind == "fixed":
+        return float(lambda_max)
+    p = max(0.0, min(1.0, epoch / max(n_epochs, 1)))
+    if kind == "linear":
+        return float(lambda_max * p)
+    if kind == "sigmoid":
+        return float(lambda_max * (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0))
+    raise ValueError(f"Unknown schedule kind: {kind!r}")
 
 
 # ================================================================

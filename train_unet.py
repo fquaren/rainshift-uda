@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 
 from data.dataset import ClimateSRDatasetNPY, inverse_transform, load_domain_stats
@@ -23,12 +23,14 @@ from uda import (
     dann_grl_schedule,
     dann_loss,
     fda_transfer,
+    lambda_uda_schedule,
     mmd_loss,
+    mmd_multiscale_loss,
     spectral_density_loss,
 )
 
-_NEEDS_TARGET_FORWARD = {"coral", "mmd", "spectral", "dann"}
-_NEEDS_FEATURES = {"coral", "mmd", "dann"}
+_NEEDS_TARGET_FORWARD = {"coral", "mmd", "mmd_ms", "spectral", "dann"}
+_NEEDS_FEATURES = {"coral", "mmd", "mmd_ms", "dann"}
 
 
 def _tag(src, tgt):
@@ -53,7 +55,7 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
         return ClimateSRDatasetNPY(p, split, stats=st, subset_size=args.subset_size, augment=aug)
 
     src_train = mk(args.source_path, "train", src_stats, aug=True)
-    
+
     if args.joint_training:
         tgt_train = mk(args.target_path, "train", tgt_stats, aug=True)
         train_dataset = ConcatDataset([src_train, tgt_train])
@@ -67,16 +69,19 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
         DataLoader(mk(args.target_path, "test", tgt_stats), bs, shuffle=False, **dl_kw),
     )
 
+
 # ---------------------------------------------------------------------------
 #  UDA setup
 # ---------------------------------------------------------------------------
 
 
-def build_uda(method, device):
+def build_uda(method, device, mmd_levels):
     if method == "coral":
         return {"loss_fn": coral_loss}, []
     if method == "mmd":
         return {"loss_fn": mmd_loss}, []
+    if method == "mmd_ms":
+        return {"loss_fn": mmd_multiscale_loss, "levels": mmd_levels}, []
     if method == "spectral":
         return {"loss_fn": spectral_density_loss}, []
     if method == "dann":
@@ -98,7 +103,7 @@ def train_one_epoch(
     criterion,
     uda_comp,
     method,
-    lambda_uda,
+    lambda_eff,
     fda_beta,
     device,
     epoch,
@@ -131,9 +136,15 @@ def train_one_epoch(
         task_loss = criterion(pred_s, y_s)
         uda_loss = torch.tensor(0.0, device=device)
 
-        if method in ("coral", "mmd"):
+        if method == "coral":
             _, feats_t = model(x_t, s_t, extract_features=True)
             uda_loss = uda_comp["loss_fn"](feats_s["bottleneck"], feats_t["bottleneck"])
+        elif method == "mmd":
+            _, feats_t = model(x_t, s_t, extract_features=True)
+            uda_loss = uda_comp["loss_fn"](feats_s["bottleneck"], feats_t["bottleneck"])
+        elif method == "mmd_ms":
+            _, feats_t = model(x_t, s_t, extract_features=True)
+            uda_loss = uda_comp["loss_fn"](feats_s, feats_t, levels=uda_comp["levels"])
         elif method == "dann":
             _, feats_t = model(x_t, s_t, extract_features=True)
             uda_loss = dann_loss(uda_comp["disc"], feats_s["bottleneck"], feats_t["bottleneck"], alpha)
@@ -141,13 +152,9 @@ def train_one_epoch(
             pred_t = model(x_t, s_t)
             uda_loss = uda_comp["loss_fn"](pred_s, pred_t)
 
-        # Dynamic weighting based on the relative magnitude of task vs UDA loss
-        if uda_loss.item() > 1e-8:
-            dynamic_weight = (task_loss.detach() / uda_loss.detach()) * lambda_uda
-        else:
-            dynamic_weight = torch.tensor(0.0, device=device)
-
-        loss = task_loss + (dynamic_weight * uda_loss)
+        # Standard fixed-or-scheduled weighting: the per-epoch lambda is
+        # computed once in run_training and passed in here as a scalar.
+        loss = task_loss + lambda_eff * uda_loss
 
         optimiser.zero_grad(set_to_none=True)
         loss.backward()
@@ -199,7 +206,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
 
     model = DualEncoderUNet(dynamic_channels=9, static_channels=2, out_channels=1, base_features=32).to(device)
 
-    uda_comp, extra_params = build_uda(args.uda_method, device)
+    uda_comp, extra_params = build_uda(args.uda_method, device, args.mmd_levels)
     opt = torch.optim.AdamW(list(model.parameters()) + extra_params, lr=_lr, weight_decay=_wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     criterion = nn.MSELoss()
@@ -211,8 +218,25 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
     best, wait = float("inf"), 0
     for epoch in tqdm(range(1, args.epochs + 1), desc=f"Training {tag}", unit="epoch"):
         t0 = time.time()
+
+        # Standard schedule: fixed by default, optional linear/sigmoid ramp.
+        # When uda_method is 'none', 'fda', or 'adabn' there is no auxiliary
+        # loss term and lambda_eff is ignored inside the inner loop anyway.
+        lambda_eff = lambda_uda_schedule(epoch, args.epochs, _lam, kind=args.lambda_schedule)
+
         tr = train_one_epoch(
-            model, src_tr, tgt_tr, opt, criterion, uda_comp, args.uda_method, _lam, _beta, device, epoch, args.epochs
+            model,
+            src_tr,
+            tgt_tr,
+            opt,
+            criterion,
+            uda_comp,
+            args.uda_method,
+            lambda_eff,
+            _beta,
+            device,
+            epoch,
+            args.epochs,
         )
         sched.step()
         val = evaluate(model, src_val, criterion, device, src_stats)
@@ -220,7 +244,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
 
         print(
             f"[{epoch:3d}/{args.epochs}] {time.time()-t0:5.1f}s  "
-            f"task={tr['task']:.4f}  uda={tr['uda']:.4f}  "
+            f"task={tr['task']:.4f}  uda={tr['uda']:.4f}  lam={lambda_eff:.4f}  "
             f"val={val['loss']:.4f}  tgt_mae={tgt['mae_mm']:.3f}mm"
         )
 
@@ -273,8 +297,31 @@ def parse_args():
     p.add_argument("--target_path", required=True)
     p.add_argument("--output_dir", default="./experiments")
     p.add_argument("--data_format", type=str, default="npy")
-    p.add_argument("--uda_method", default="none", choices=["none", "coral", "mmd", "spectral", "fda", "dann", "adabn"])
-    p.add_argument("--lambda_uda", type=float, default=0.1)
+    p.add_argument(
+        "--uda_method",
+        default="none",
+        choices=["none", "coral", "mmd", "mmd_ms", "spectral", "fda", "dann", "adabn"],
+    )
+    p.add_argument(
+        "--lambda_uda",
+        type=float,
+        default=0.1,
+        help="Asymptotic UDA loss weight (constant when " "--lambda_schedule fixed).",
+    )
+    p.add_argument(
+        "--lambda_schedule",
+        default="fixed",
+        choices=["fixed", "linear", "sigmoid"],
+        help="How lambda_uda evolves across epochs. 'fixed' is the "
+        "reproducible default; 'sigmoid' mirrors the DANN GRL "
+        "ramp.",
+    )
+    p.add_argument(
+        "--mmd_levels",
+        nargs="+",
+        default=["enc2", "enc3", "enc4", "bottleneck"],
+        help="Feature levels for multi-scale MMD (uda_method=mmd_ms).",
+    )
     p.add_argument("--fda_beta", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=256)
