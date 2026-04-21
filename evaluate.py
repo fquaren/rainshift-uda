@@ -473,7 +473,7 @@ def cmd_batch(args):
 
 def _add_common_args(p):
     p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--base_features", type=int, default=64)
+    p.add_argument("--base_features", type=int, default=32)
     p.add_argument("--n_ensemble", type=int, default=0)
     p.add_argument("--sample_steps", type=int, default=20)
     p.add_argument("--save_samples", type=int, default=5)

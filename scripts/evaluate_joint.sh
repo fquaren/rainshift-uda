@@ -42,7 +42,7 @@ CACHE_DIR="${RESULTS_DIR}/transforms"
 W1_MATRIX="${CODE_ROOT}/covariate_shift_analysis/normalized/Wasserstein_1D_test.npy"
 W1_META="${CODE_ROOT}/covariate_shift_analysis/normalized/Wasserstein_1D_test_variables.json"
 
-TRANSFORMS=("none") # "qm_precip") # "qm_tp" "qm_all" "ot")
+TRANSFORMS=("none" "qm_precip") # "qm_tp" "qm_all" "ot")
 
 # AFM probabilistic settings
 N_ENSEMBLE=16
@@ -64,7 +64,8 @@ for tf in "${TRANSFORMS[@]}"; do
         --input_transform "${tf}" \
         --transform_cache_dir "${CACHE_DIR}" \
         --save_samples 10 \
-        --force
+        --force \
+        --joint
     echo ""
 done
 
@@ -121,4 +122,4 @@ done
 #     done
 # done
 
-echo "=== Evaluation & NGG complete ==="
+# echo "=== Evaluation & NGG complete ==="
