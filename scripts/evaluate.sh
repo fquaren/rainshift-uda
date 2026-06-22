@@ -42,7 +42,7 @@ CACHE_DIR="${RESULTS_DIR}/transforms"
 W1_MATRIX="${CODE_ROOT}/covariate_shift_analysis/normalized/Wasserstein_1D_test.npy"
 W1_META="${CODE_ROOT}/covariate_shift_analysis/normalized/Wasserstein_1D_test_variables.json"
 
-TRANSFORMS=("none") # "qm_precip") # "qm_tp" "qm_all" "ot")
+TRANSFORMS=("none" "oracle") # "qm_precip") # "qm_tp" "qm_all" "ot")
 
 # AFM probabilistic settings
 N_ENSEMBLE=16
@@ -54,13 +54,29 @@ run_python() {
 
 # -------------------------------------------------------------------
 #  UNet: deterministic evaluation across all transforms
+# # -------------------------------------------------------------------
+# for tf in "${TRANSFORMS[@]}"; do
+#     echo "=== UNet | transform: ${tf} ==="
+#     run_python "${CODE_ROOT}/evaluate.py" batch \
+#         --exp_root "${OUTPUT_DIR}/unet" \
+#         --data_root "${DATA_ROOT}" \
+#         --output_dir "${RESULTS_DIR}/unet/${tf}" \
+#         --input_transform "${tf}" \
+#         --transform_cache_dir "${CACHE_DIR}" \
+#         --save_samples 10 \
+#         --force
+#     echo ""
+# done
+
+# -------------------------------------------------------------------
+#  AFM deterministic: across all transforms
 # -------------------------------------------------------------------
 for tf in "${TRANSFORMS[@]}"; do
-    echo "=== UNet | transform: ${tf} ==="
+    echo "=== AFM (deterministic) | transform: ${tf} ==="
     run_python "${CODE_ROOT}/evaluate.py" batch \
-        --exp_root "${OUTPUT_DIR}/unet_joint" \
+        --exp_root "${OUTPUT_DIR}/afm" \
         --data_root "${DATA_ROOT}" \
-        --output_dir "${RESULTS_DIR}/unet_joint/${tf}" \
+        --output_dir "${RESULTS_DIR}/afm/${tf}" \
         --input_transform "${tf}" \
         --transform_cache_dir "${CACHE_DIR}" \
         --save_samples 10 \
@@ -69,56 +85,39 @@ for tf in "${TRANSFORMS[@]}"; do
 done
 
 # # -------------------------------------------------------------------
-# #  AFM deterministic: across all transforms
-# # -------------------------------------------------------------------
-# for tf in "${TRANSFORMS[@]}"; do
-#     echo "=== AFM (deterministic) | transform: ${tf} ==="
-#     run_python "${CODE_ROOT}/evaluate.py" batch \
-#         --exp_root "${OUTPUT_DIR}/afm" \
-#         --data_root "${DATA_ROOT}" \
-#         --output_dir "${RESULTS_DIR}/afm/${tf}" \
-#         --input_transform "${tf}" \
-#         --transform_cache_dir "${CACHE_DIR}" \
-#         --save_samples 10 \
-#         --force
-#     echo ""
-# done
-
-# # -------------------------------------------------------------------
 # #  AFM probabilistic: only none + best transform (avoid 5×16-member cost)
 # #  Run the full set on "none" and "ot" to compare; add others if needed.
 # # -------------------------------------------------------------------
-# for tf in "none" "ot"; do
-#     echo "=== AFM (probabilistic, ${N_ENSEMBLE} members) | transform: ${tf} ==="
-#     run_python "${CODE_ROOT}/evaluate.py" batch \
-#         --exp_root "${OUTPUT_DIR}/afm" \
-#         --data_root "${DATA_ROOT}" \
-#         --output_dir "${RESULTS_DIR}/afm_prob/${tf}" \
-#         --input_transform "${tf}" \
-#         --transform_cache_dir "${CACHE_DIR}" \
-#         --n_ensemble "${N_ENSEMBLE}" \
-#         --sample_steps "${SAMPLE_STEPS}" \
-#         --save_samples 5 \
-#         --force
-#     echo ""
-# done
+for tf in "none" "ot"; do
+    echo "=== AFM (probabilistic, ${N_ENSEMBLE} members) | transform: ${tf} ==="
+    run_python "${CODE_ROOT}/evaluate.py" batch \
+        --exp_root "${OUTPUT_DIR}/afm" \
+        --data_root "${DATA_ROOT}" \
+        --output_dir "${RESULTS_DIR}/afm_prob/${tf}" \
+        --input_transform "${tf}" \
+        --transform_cache_dir "${CACHE_DIR}" \
+        --n_ensemble "${N_ENSEMBLE}" \
+        --sample_steps "${SAMPLE_STEPS}" \
+        --save_samples 5 \
+        --force
+    echo ""
+done
 
-# # -------------------------------------------------------------------
-# #  NGG Computation
-# # -------------------------------------------------------------------
-# echo "=== Computing NGG ==="
-# for model in "unet"; do # "afm"
-#     for tf in "${TRANSFORMS[@]}"; do
-#         echo "--- NGG | model: ${model} | transform: ${tf} ---"
-#         run_python "${CODE_ROOT}/compute_ngg.py" \
-#             --w1_matrix "${W1_MATRIX}" \
-#             --w1_variables "${W1_META}" \
-#             --results_csv "${RESULTS_DIR}/${model}/${tf}/results.csv" \
-#             --model "${model}" \
-#             --transform "${tf}" \
-#             --error_metric "mse_std" \
-#             --output_dir "${RESULTS_DIR}/ngg/${model}_${tf}"
-#     done
-# done
+# -------------------------------------------------------------------
+#  NGG Computation
+# -------------------------------------------------------------------
+echo "=== Computing NGG ==="
+for model in "unet"; do # "afm"
+    for tf in "${TRANSFORMS[@]}"; do
+        echo "--- NGG | model: ${model} | transform: ${tf} ---"
+        run_python "${CODE_ROOT}/compute_ngg_all.py" \
+            --w1_matrix "${W1_MATRIX}" \
+            --w1_variables "${W1_META}" \
+            --results_csv "${RESULTS_DIR}/${model}/${tf}/results.csv" \
+            --model "${model}" \
+            --error_metric "mse_std" \
+            --output_root "${RESULTS_DIR}/ngg/${model}_${tf}"
+    done
+done
 
 echo "=== Evaluation & NGG complete ==="

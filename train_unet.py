@@ -75,7 +75,7 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
 # ---------------------------------------------------------------------------
 
 
-def build_uda(method, device, mmd_levels):
+def build_uda(method, mmd_levels, device):
     if method == "coral":
         return {"loss_fn": coral_loss}, []
     if method == "mmd":
@@ -206,7 +206,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
 
     model = DualEncoderUNet(dynamic_channels=9, static_channels=2, out_channels=1, base_features=32).to(device)
 
-    uda_comp, extra_params = build_uda(args.uda_method, device, args.mmd_levels)
+    uda_comp, extra_params = build_uda(args.uda_method, args.mmd_levels, device)
     opt = torch.optim.AdamW(list(model.parameters()) + extra_params, lr=_lr, weight_decay=_wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     criterion = nn.MSELoss()

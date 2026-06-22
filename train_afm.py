@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 from data.dataset import ClimateSRDatasetNPY, inverse_transform, load_domain_stats
 from models.afm import AFMModel
@@ -18,12 +18,14 @@ from uda import (
     dann_grl_schedule,
     dann_loss,
     fda_transfer,
+    lambda_uda_schedule,
     mmd_loss,
+    mmd_multiscale_loss,
     spectral_density_loss,
 )
 
-_NEEDS_TARGET_FORWARD = {"coral", "mmd", "spectral", "dann"}
-_NEEDS_FEATURES = {"coral", "mmd", "dann"}
+_NEEDS_TARGET_FORWARD = {"coral", "mmd", "mmd_ms", "spectral", "dann"}
+_NEEDS_FEATURES = {"coral", "mmd", "mmd_ms", "dann"}
 
 
 def _tag(s, t):
@@ -50,22 +52,22 @@ def build_loaders(args, ss, ts, bs=None):
             DataLoader(mk(args.target_path, "train", ts), bs, shuffle=True, drop_last=True, **kw),
             DataLoader(mk(args.target_path, "test", ts), bs, shuffle=False, **kw),
         )
-    else:
 
-        return (
-            DataLoader(mk(args.source_path, "train", ss), bs, shuffle=True, drop_last=True, **kw),
-            DataLoader(mk(args.source_path, "validation", ss), bs, shuffle=False, **kw),
-            DataLoader(mk(args.target_path, "train", ts), bs, shuffle=True, drop_last=True, **kw),
-            DataLoader(mk(args.target_path, "test", ts), bs, shuffle=False, **kw),
-        )
-
+    return (
+        DataLoader(mk(args.source_path, "train", ss), bs, shuffle=True, drop_last=True, **kw),
+        DataLoader(mk(args.source_path, "validation", ss), bs, shuffle=False, **kw),
+        DataLoader(mk(args.target_path, "train", ts), bs, shuffle=True, drop_last=True, **kw),
+        DataLoader(mk(args.target_path, "test", ts), bs, shuffle=False, **kw),
+    )
 
 
-def build_uda(method, device):
+def build_uda(method, mmd_levels, device):
     if method == "coral":
         return {"loss_fn": coral_loss}, []
     if method == "mmd":
         return {"loss_fn": mmd_loss}, []
+    if method == "mmd_ms":
+        return {"loss_fn": mmd_multiscale_loss, "levels": mmd_levels}, []
     if method == "spectral":
         return {"loss_fn": spectral_density_loss}, []
     if method == "dann":
@@ -87,7 +89,7 @@ def build_optimizer(model, base_lr, uda_params):
     )
 
 
-def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method, lam, beta, device, epoch, total):
+def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method, lam_eff, beta, device, epoch, total):
     model.train()
     sf, se, su, n = 0.0, 0.0, 0.0, 0
     use_f = method in _NEEDS_FEATURES
@@ -112,10 +114,15 @@ def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method, lam, beta, dev
         task = out["total_loss"]
         uda = torch.tensor(0.0, device=device)
 
-        if method in ("coral", "mmd"):
-            tgt_out = model(xt, st, extract_features=True)
-            _, tf = tgt_out
+        if method == "coral":
+            _, tf = model(xt, st, extract_features=True)
             uda = uda_comp["loss_fn"](out["features"]["bottleneck"], tf["bottleneck"])
+        elif method == "mmd":
+            _, tf = model(xt, st, extract_features=True)
+            uda = uda_comp["loss_fn"](out["features"]["bottleneck"], tf["bottleneck"])
+        elif method == "mmd_ms":
+            _, tf = model(xt, st, extract_features=True)
+            uda = uda_comp["loss_fn"](out["features"], tf, levels=uda_comp["levels"])
         elif method == "dann":
             _, tf = model(xt, st, extract_features=True)
             uda = dann_loss(uda_comp["disc"], out["features"]["bottleneck"], tf["bottleneck"], alpha)
@@ -124,13 +131,9 @@ def train_one_epoch(model, src_ld, tgt_ld, opt, uda_comp, method, lam, beta, dev
             tp = model.encoder(xt, st)
             uda = uda_comp["loss_fn"](sp, tp)
 
-        # Dynamic weighting based on the relative magnitude of task vs UDA loss
-        if uda.item() > 1e-8:
-            dyn_lam = (task.detach() / uda.detach()) * lam
-        else:
-            dyn_lam = torch.tensor(0.0, device=device)
-
-        loss = task + dyn_lam * uda
+        # Standard fixed-or-scheduled weighting. lam_eff is computed once per
+        # epoch in run_training and passed in as a scalar.
+        loss = task + lam_eff * uda
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -176,7 +179,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
 
     model = AFMModel(9, 2, 1, args.base_features, encoder_loss_weight=_ew).to(device)
 
-    uc, ep = build_uda(args.uda_method, device)
+    uc, ep = build_uda(args.uda_method, args.mmd_levels, device)
     opt = build_optimizer(model, _lr, ep)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
 
@@ -187,7 +190,13 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
     best, wait = float("inf"), 0
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        tr = train_one_epoch(model, src_tr, tgt_tr, opt, uc, args.uda_method, _lam, _beta, device, epoch, args.epochs)
+        # Per-epoch lambda; ignored when the method has no auxiliary loss
+        # (none / fda / adabn) because uda stays at zero in those branches.
+        lam_eff = lambda_uda_schedule(epoch, args.epochs, _lam, kind=args.lambda_schedule)
+
+        tr = train_one_epoch(
+            model, src_tr, tgt_tr, opt, uc, args.uda_method, lam_eff, _beta, device, epoch, args.epochs,
+        )
         sched.step()
         val = evaluate(model, src_val, device, ss)
         tgt = evaluate(model, tgt_te, device, ts)
@@ -195,7 +204,8 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
         print(
             f"[{epoch:3d}/{args.epochs}] {time.time()-t0:5.1f}s  "
             f"flow={tr['flow']:.4f} enc={tr['enc']:.4f} uda={tr['uda']:.4f} "
-            f"sigma_z={tr['sigma_z']:.4f} val={val['loss']:.4f} tgt_mae={tgt['mae_mm']:.3f}mm"
+            f"lam={lam_eff:.4f} sigma_z={tr['sigma_z']:.4f} "
+            f"val={val['loss']:.4f} tgt_mae={tgt['mae_mm']:.3f}mm"
         )
 
         if val["loss"] < best:
@@ -273,8 +283,22 @@ def parse_args():
     p.add_argument("--target_path", required=True)
     p.add_argument("--output_dir", default="./experiments")
     p.add_argument("--data_format", type=str, default="npy")
-    p.add_argument("--uda_method", default="none", choices=["none", "coral", "mmd", "spectral", "fda", "dann", "adabn"])
-    p.add_argument("--lambda_uda", type=float, default=0.1)
+    p.add_argument(
+        "--uda_method",
+        default="none",
+        choices=["none", "coral", "mmd", "mmd_ms", "spectral", "fda", "dann", "adabn"],
+    )
+    p.add_argument("--lambda_uda", type=float, default=0.1,
+                   help="Asymptotic UDA loss weight (constant when --lambda_schedule fixed).")
+    p.add_argument("--lambda_schedule", default="fixed",
+                   choices=["fixed", "linear", "sigmoid"],
+                   help="How lambda_uda evolves across epochs. 'fixed' matches "
+                        "the weighted-sum default of the UDA literature; "
+                        "'sigmoid' mirrors the DANN GRL ramp.")
+    p.add_argument("--mmd_levels", nargs="+",
+                   default=["enc2", "enc3", "enc4", "bottleneck"],
+                   help="Feature levels for multi-scale MMD (uda_method=mmd_ms). "
+                        "Must be keys in the encoder's extract_features dict.")
     p.add_argument("--fda_beta", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=32)

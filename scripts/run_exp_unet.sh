@@ -68,7 +68,7 @@ TARGET_REGIONS=(
 )
 
 
-METHODS=("fda" "mmd"  "adabn") # "coral", "spectral", "dann"
+METHODS=("mmd_ms") # "coral", "spectral", "dann", "fda", "adabn"
 
 EPOCHS=25
 PATIENCE=-1
