@@ -120,7 +120,7 @@ def mmd_multiscale_loss(
     for lvl in active_levels:
         if median_heuristic:
             bw = _median_heuristic_bandwidth(src_feats[lvl], tgt_feats[lvl])
-            bws = [bw * (2.0**k) for k in (-2, -1, 0, 1, 2)]
+            bws = [bw * (2.0 ** k) for k in (-2, -1, 0, 1, 2)]
         else:
             bws = bandwidths
         losses.append(mmd_loss(src_feats[lvl], tgt_feats[lvl], bandwidths=bws))
@@ -130,9 +130,7 @@ def mmd_multiscale_loss(
 
 @torch.no_grad()
 def _median_heuristic_bandwidth(
-    src_feat: torch.Tensor,
-    tgt_feat: torch.Tensor,
-    max_samples: int = 512,
+    src_feat: torch.Tensor, tgt_feat: torch.Tensor, max_samples: int = 512,
 ) -> float:
     """
     Median of pairwise Euclidean distances between GAP-pooled features from
@@ -246,10 +244,7 @@ def dann_grl_schedule(epoch: int, n_epochs: int) -> float:
 
 
 def lambda_uda_schedule(
-    epoch: int,
-    n_epochs: int,
-    lambda_max: float,
-    kind: str = "sigmoid",
+    epoch: int, n_epochs: int, lambda_max: float, kind: str = "sigmoid",
 ) -> float:
     """
     Schedule for the UDA loss weight. Matches the DANN GRL ramp when

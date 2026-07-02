@@ -75,7 +75,7 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
 # ---------------------------------------------------------------------------
 
 
-def build_uda(method, mmd_levels, device):
+def build_uda(method, device, mmd_levels):
     if method == "coral":
         return {"loss_fn": coral_loss}, []
     if method == "mmd":
@@ -206,7 +206,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
 
     model = DualEncoderUNet(dynamic_channels=9, static_channels=2, out_channels=1, base_features=32).to(device)
 
-    uda_comp, extra_params = build_uda(args.uda_method, args.mmd_levels, device)
+    uda_comp, extra_params = build_uda(args.uda_method, device, args.mmd_levels)
     opt = torch.optim.AdamW(list(model.parameters()) + extra_params, lr=_lr, weight_decay=_wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     criterion = nn.MSELoss()
@@ -225,17 +225,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
         lambda_eff = lambda_uda_schedule(epoch, args.epochs, _lam, kind=args.lambda_schedule)
 
         tr = train_one_epoch(
-            model,
-            src_tr,
-            tgt_tr,
-            opt,
-            criterion,
-            uda_comp,
-            args.uda_method,
-            lambda_eff,
-            _beta,
-            device,
-            epoch,
+            model, src_tr, tgt_tr, opt, criterion, uda_comp, args.uda_method, lambda_eff, _beta, device, epoch,
             args.epochs,
         )
         sched.step()
@@ -302,26 +292,17 @@ def parse_args():
         default="none",
         choices=["none", "coral", "mmd", "mmd_ms", "spectral", "fda", "dann", "adabn"],
     )
-    p.add_argument(
-        "--lambda_uda",
-        type=float,
-        default=0.1,
-        help="Asymptotic UDA loss weight (constant when " "--lambda_schedule fixed).",
-    )
-    p.add_argument(
-        "--lambda_schedule",
-        default="fixed",
-        choices=["fixed", "linear", "sigmoid"],
-        help="How lambda_uda evolves across epochs. 'fixed' is the "
-        "reproducible default; 'sigmoid' mirrors the DANN GRL "
-        "ramp.",
-    )
-    p.add_argument(
-        "--mmd_levels",
-        nargs="+",
-        default=["enc2", "enc3", "enc4", "bottleneck"],
-        help="Feature levels for multi-scale MMD (uda_method=mmd_ms).",
-    )
+    p.add_argument("--lambda_uda", type=float, default=0.1,
+                   help="Asymptotic UDA loss weight (constant when "
+                        "--lambda_schedule fixed).")
+    p.add_argument("--lambda_schedule", default="fixed",
+                   choices=["fixed", "linear", "sigmoid"],
+                   help="How lambda_uda evolves across epochs. 'fixed' is the "
+                        "reproducible default; 'sigmoid' mirrors the DANN GRL "
+                        "ramp.")
+    p.add_argument("--mmd_levels", nargs="+",
+                   default=["enc2", "enc3", "enc4", "bottleneck"],
+                   help="Feature levels for multi-scale MMD (uda_method=mmd_ms).")
     p.add_argument("--fda_beta", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=256)
