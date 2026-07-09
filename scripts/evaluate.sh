@@ -33,8 +33,8 @@ export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/li
 
 CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
 CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
-OUTPUT_DIR="/scratch/fquareng/rainshift_uda"
-RESULTS_DIR="/scratch/fquareng/rainshift_uda/results"
+OUTPUT_DIR="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda"
+RESULTS_DIR="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda/results"
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/rainshift_npy"
 CACHE_DIR="${RESULTS_DIR}/transforms"
 
@@ -54,19 +54,19 @@ run_python() {
 
 # -------------------------------------------------------------------
 #  UNet: deterministic evaluation across all transforms
-# # -------------------------------------------------------------------
-# for tf in "${TRANSFORMS[@]}"; do
-#     echo "=== UNet | transform: ${tf} ==="
-#     run_python "${CODE_ROOT}/evaluate.py" batch \
-#         --exp_root "${OUTPUT_DIR}/unet" \
-#         --data_root "${DATA_ROOT}" \
-#         --output_dir "${RESULTS_DIR}/unet/${tf}" \
-#         --input_transform "${tf}" \
-#         --transform_cache_dir "${CACHE_DIR}" \
-#         --save_samples 10 \
-#         --force
-#     echo ""
-# done
+# -------------------------------------------------------------------
+for tf in "${TRANSFORMS[@]}"; do
+    echo "=== UNet | transform: ${tf} ==="
+    run_python "${CODE_ROOT}/evaluate.py" batch \
+        --exp_root "${OUTPUT_DIR}/unet" \
+        --data_root "${DATA_ROOT}" \
+        --output_dir "${RESULTS_DIR}/unet/${tf}" \
+        --input_transform "${tf}" \
+        --transform_cache_dir "${CACHE_DIR}" \
+        --save_samples 10 \
+        --force
+    echo ""
+done
 
 # -------------------------------------------------------------------
 #  AFM deterministic: across all transforms
@@ -104,6 +104,23 @@ for tf in "none" "ot"; do
 done
 
 # -------------------------------------------------------------------
+#  Regenerate the W1 cube with the corrected compute_shift.py (exact
+#  empirical W1, shared per-domain sampling). --emit_aggregates also writes
+#  the mean_inputs / max_inputs scalar matrices. The cube feeds compute_ngg,
+#  which aggregates to mean_inputs internally (covariate shift, NOT the tp
+#  label-shift channel).
+# -------------------------------------------------------------------
+echo "=== Regenerating W1 shift cube (normalized, test) ==="
+run_python "${CODE_ROOT}/compute_shift.py" \
+    --data_root "${DATA_ROOT}" \
+    --domains europe_west horn-of-africa melanesia \
+    --mode normalized \
+    --split test \
+    --emit_aggregates \
+    --output_dir "${CODE_ROOT}/covariate_shift_analysis"
+echo ""
+
+# -------------------------------------------------------------------
 #  NGG Computation
 # -------------------------------------------------------------------
 echo "=== Computing NGG ==="
@@ -116,6 +133,7 @@ for model in "unet"; do # "afm"
             --results_csv "${RESULTS_DIR}/${model}/${tf}/results.csv" \
             --model "${model}" \
             --error_metric "mse_std" \
+            --w1_agg "mean_inputs" \
             --output_root "${RESULTS_DIR}/ngg/${model}_${tf}"
     done
 done

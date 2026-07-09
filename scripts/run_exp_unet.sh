@@ -30,8 +30,8 @@
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task 12
-#SBATCH --mem 400G
+#SBATCH --cpus-per-task 4
+#SBATCH --mem 0
 #SBATCH --time 72:00:00
 
 set -euo pipefail
@@ -42,8 +42,8 @@ export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/li
 # --- Configuration --------------------------------------------------------
 CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
 CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
-DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/rainshift_npy"
-OUTPUT_DIR="/scratch/fquareng/rainshift_uda/unet"
+DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift"
+OUTPUT_DIR="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda/unet"
 DATA_FORMAT="npy"
 
 PHASE="${PHASE:-1}"
@@ -68,12 +68,14 @@ TARGET_REGIONS=(
 )
 
 
-METHODS=("dann", "mmd", "coral", "spectral", "fda", "adabn")
+# Bash arrays are whitespace-delimited: NO commas, or each element keeps a
+# trailing comma and argparse --uda_method choices rejects it.
+METHODS=("dann" "mmd" "mmd_ms" "coral" "spectral" "fda" "adabn")
 
 EPOCHS=25
 PATIENCE=-1
-NUM_WORKERS=8
-BATCH_SIZE=256
+NUM_WORKERS=4
+BATCH_SIZE=512
 
 FDA_BETA=0.01
 LAMBDA_UDA=0.1
@@ -168,7 +170,66 @@ elif [[ "${PHASE}" == "2" ]]; then
             2>&1 | tee "${OUTPUT_DIR}/phase2_${src}__to__${tgt}__${method}.log"
     done
 
+# ===========================================================================
+#  PHASE oracle: joint source+target training (upper bound on transfer).
+#  Produces the addressable-budget denominator E_T(h_joint). Runs
+#  --uda_method none --joint_training. Written to a SEPARATE output dir so it
+#  does not collide with the Phase 1 source-only 'none' checkpoints (which
+#  also use uda_method=none). Evaluate this checkpoint on both source and
+#  target test sets to obtain E_S(h_joint) and E_T(h_joint).
+# ===========================================================================
+elif [[ "${PHASE}" == "oracle" ]]; then
+    ORACLE_DIR="${OUTPUT_DIR}_oracle"
+    mkdir -p "${ORACLE_DIR}/base_hp"
+
+    PAIRS=()
+    for src in "${SOURCE_REGIONS[@]}"; do
+        for tgt in "${TARGET_REGIONS[@]}"; do
+            [[ "$src" == "$tgt" ]] && continue
+            PAIRS+=("${src}|${tgt}")
+        done
+    done
+
+    echo "=== PHASE oracle: joint source+target training ==="
+    echo "Domain pairs: ${#PAIRS[@]}   output: ${ORACLE_DIR}"
+
+    for i in "${!PAIRS[@]}"; do
+        IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
+        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} + ${tgt} (joint) ---"
+
+        # Oracle completion marker: the source-only base HPs are reused as the
+        # base-HP source, but the oracle checkpoint lives under ORACLE_DIR.
+        DONE_MARKER="${ORACLE_DIR}/${src}__to__${tgt}__none/best.pt"
+        if [[ -f "${DONE_MARKER}" ]]; then
+            echo "  Oracle checkpoint exists, skipping."
+            continue
+        fi
+
+        # Reuse the Phase 1 base HPs for this pair if present, so lr/bs/wd
+        # match the source-only baseline (fair oracle comparison).
+        HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
+        if [[ -f "${HP_FILE}" ]]; then
+            cp "${HP_FILE}" "${ORACLE_DIR}/base_hp/${src}__to__${tgt}.json"
+        else
+            echo "  WARNING: no base HPs for ${src}->${tgt}; oracle uses argparse defaults."
+        fi
+
+        run_python "${CODE_ROOT}/train_unet.py" \
+            --source_path "${DATA_ROOT}/${src}" \
+            --target_path "${DATA_ROOT}/${tgt}" \
+            --output_dir  "${ORACLE_DIR}" \
+            --data_format "${DATA_FORMAT}" \
+            --uda_method  none \
+            --joint_training \
+            --epochs      "${EPOCHS}" \
+            --batch_size  "${BATCH_SIZE}" \
+            --patience    "${PATIENCE}" \
+            --num_workers "${NUM_WORKERS}" \
+            2>&1 | tee "${ORACLE_DIR}/oracle_${src}__to__${tgt}.log"
+    done
+    echo "=== PHASE oracle complete ==="
+
 else
-    echo "ERROR: PHASE must be 1 or 2 (got: ${PHASE})"
+    echo "ERROR: PHASE must be 1, 2, or oracle (got: ${PHASE})"
     exit 1
 fi

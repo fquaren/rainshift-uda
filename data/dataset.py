@@ -53,7 +53,7 @@ class ClimateSRDatasetNPY(Dataset):
         {data_path}/test_x.npy
         {data_path}/test_y.npy
         {data_path}/static.npy     (C_static, H, W)
-        {data_path}/stats.json     {var: [mean, std]}
+        {data_path}/normalization_stats.json     {var: [mean, std]}
 
     Z-score is applied per-sample in __getitem__ via precomputed tensors.
     Static covariates are normalised once at __init__ (small: 2×200×200).
@@ -61,7 +61,7 @@ class ClimateSRDatasetNPY(Dataset):
     Args:
         data_path: directory containing .npy files for one region
         split: 'train', 'validation', or 'test'
-        stats: normalization stats dict; if None, loads from stats.json
+        stats: normalization stats dict; if None, loads from normalization_stats.json
         input_vars: variable name list (for stats lookup ordering)
         output_var: target variable name
         static_vars: static variable name list
@@ -98,16 +98,19 @@ class ClimateSRDatasetNPY(Dataset):
         if stats is not None:
             self.stats = stats
         else:
-            with open(root / "stats.json") as f:
+            with open(root / "normalization_stats.json") as f:
                 self.stats = json.load(f)
 
-        # --- memory-map arrays (no RAM allocation) ---
+        # --- load arrays fully into RAM once (not mmap) ---
+        # /work is a networked FS; per-sample mmap page-faults over the network are
+        # the dominant cost (~ms/sample random access). Loading the split into RAM
+        # once turns every __getitem__ into a pure in-memory slice.
         file_prefix = "test" if split == "test" else "train"
-        self._x_mmap = np.load(root / f"{file_prefix}_x.npy", mmap_mode="r")
-        self._y_mmap = np.load(root / f"{file_prefix}_y.npy", mmap_mode="r")
+        x_full = np.load(root / f"{file_prefix}_x.npy")   # full read, sequential, fast
+        y_full = np.load(root / f"{file_prefix}_y.npy")
 
         # --- compute sample indices for this split ---
-        n_total = self._x_mmap.shape[0]
+        n_total = x_full.shape[0]
 
         if split in ("train", "validation"):
             indices = np.arange(n_total)
@@ -128,6 +131,13 @@ class ClimateSRDatasetNPY(Dataset):
                 self.indices = np.arange(subset_size)
             else:
                 self.indices = np.arange(n_total)
+
+        # gather only this split's rows into contiguous memory, then renumber
+        # indices to 0..len-1 so __getitem__ is a direct array access
+        self._x = np.ascontiguousarray(x_full[self.indices]).astype(np.float32)
+        self._y = np.ascontiguousarray(y_full[self.indices]).astype(np.float32)
+        del x_full, y_full           # release the full arrays
+        self.indices = np.arange(len(self._x))
 
         # --- precompute z-score tensors for fast per-sample normalisation ---
         # x: (C_in,) mean and std
@@ -159,8 +169,8 @@ class ClimateSRDatasetNPY(Dataset):
         self.static = torch.from_numpy(static).float()
 
         print(
-            f"[NPY-mmap] {split}: {len(self)} samples | "
-            f"x={list(self._x_mmap.shape)} "
+            f"[NPY-RAM] {split}: {len(self)} samples | "
+            f"x={list(self._x.shape)} "
             f"static={list(self.static.shape)}"
         )
 
@@ -169,21 +179,13 @@ class ClimateSRDatasetNPY(Dataset):
 
     def __getitem__(self, idx):
         real_idx = self.indices[idx]
-
-        # read from mmap (triggers OS page-in, ~µs on NVMe)
-        x = torch.from_numpy(self._x_mmap[real_idx].copy()).float()
-        y = torch.from_numpy(self._y_mmap[real_idx].copy()).float()
-
-        # per-sample z-score
+        x = torch.from_numpy(self._x[real_idx]).float()   # in-RAM, no page fault
+        y = torch.from_numpy(self._y[real_idx]).float()
         x = (x - self._x_mean) / self._x_std
         y = (y - self._y_mean) / self._y_std
-
         s = self.static
-
-        # augmentation: random flip + 90° rotation
         if self.augment:
             x, s, y = self._augment(x, s, y)
-
         return x, s, y
 
     @staticmethod
@@ -214,7 +216,7 @@ class ClimateSRDatasetNPY(Dataset):
 
 def load_domain_stats(data_path: str) -> dict:
     """Load pre-computed stats from .npy region directory."""
-    with open(Path(data_path) / "stats.json") as f:
+    with open(Path(data_path) / "normalization_stats.json") as f:
         return json.load(f)
 
 
