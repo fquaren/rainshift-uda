@@ -44,6 +44,10 @@ run_python() {
     singularity exec --nv "${CONTAINER}" python "$@"
 }
 
+# MODE can be either `raw` or `normalized`. 
+# The former computes the Wasserstein-1D distance on the raw data, 
+# while the latter computes it on the normalized data 
+#(i.e., after applying the same normalization as used for training the models).
 for MODE in raw normalized; do
     echo "=== covariate shift | split=${SPLIT} | mode=${MODE} ==="
     run_python "${CODE_ROOT}/covariate_shift_analysis/compute_shift.py" \
@@ -53,9 +57,9 @@ for MODE in raw normalized; do
         --n_samples  "${N_SAMPLES}" \
         --seed       "${SEED}" \
         --output_dir "${OUT_ROOT}" \
+        --domains "europe_west" "horn-of-africa" "melanesia"\
+        --emit_aggregates \
         2>&1 | tee "${OUT_ROOT}/compute_shift_${SPLIT}_${MODE}.log"
 done
-
-#--domains "europe_west" "melanesia" \
 
 echo "=== Done ==="

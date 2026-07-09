@@ -56,19 +56,19 @@ mkdir -p "${OUTPUT_DIR}/best_hp"
 SOURCE_REGIONS=(
     "europe_west"
     # "blacksea"
-    # "horn-of-africa"
-    # "melanesia"
+    "horn-of-africa"
+    "melanesia"
 )
 
 TARGET_REGIONS=(
-    # "europe_west"
+    "europe_west"
     # "blacksea"
-    # "horn-of-africa"
+    "horn-of-africa"
     "melanesia"
 )
 
 
-METHODS=("mmd_ms") # "coral", "spectral", "dann", "fda", "adabn"
+METHODS=("dann", "mmd", "coral", "spectral", "fda", "adabn")
 
 EPOCHS=25
 PATIENCE=-1

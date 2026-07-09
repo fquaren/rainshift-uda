@@ -5,12 +5,20 @@ domains, computed on the .npy datasets produced by
 
 For every (domain_i, domain_j, variable) triple the script computes the
 Wasserstein-1 distance between the two empirical pixel distributions of that
-variable, using GPU sort/quantile. Output has shape ``(V, D, D)`` with V the
-number of variables and D the number of domains:
+variable, using a GPU-vectorised exact empirical estimator. Output has shape
+``(V, D, D)`` with V the number of variables and D the number of domains:
 
     {output_dir}/{mode}/Wasserstein_1D_{split}.npy
     {output_dir}/{mode}/Wasserstein_1D_{split}_{var}.png
     {output_dir}/{mode}/Wasserstein_1D_{split}_variables.json
+
+With ``--emit_aggregates`` the script additionally writes scalar (D, D)
+matrices aggregated over the input channels:
+
+    {output_dir}/{mode}/Wasserstein_1D_{split}_mean_inputs.npy
+    {output_dir}/{mode}/Wasserstein_1D_{split}_max_inputs.npy
+    {output_dir}/{mode}/Wasserstein_1D_{split}_mean_inputs.png
+    {output_dir}/{mode}/Wasserstein_1D_{split}_max_inputs.png
 
 The JSON sidecar records the channel-to-variable map and the domain ordering,
 since both are needed to interpret the matrix and neither is implicit anymore
@@ -24,6 +32,11 @@ target is read from ``{split}_y.npy`` and appended as the last channel of the
 output matrix. Disable with ``--target_var none``. The output shape is
 therefore ``(len(input_vars) + (target_var != None), D, D)``.
 
+The aggregate matrices produced by ``--emit_aggregates`` are computed over the
+input channels only; the target channel (tp/precipitation) is excluded, since
+mean_inputs is intended as a covariate-shift summary W1(mu_S, mu_T), distinct
+from the target/label shift measured on the target channel alone.
+
 Modes and transformations
 -------------------------
 raw
@@ -36,13 +49,32 @@ normalized
     ``ClimateSRDatasetNPY`` at training time exactly: log on precip channels
     is baked into ``.npy`` upstream, and z-score is applied here. The
     precipitation target therefore enters the distance in log-standardised
-    space — the same space the training loss is computed in.
+    space -- the same space the training loss is computed in.
+
+    In normalized mode every channel is expressed in units of its own source
+    standard deviation, which makes distances across channels commensurable
+    and mean_inputs a well-defined average. Note that this treats a fixed
+    fractional-sigma shift as equivalent across channels, which is a summary
+    convention rather than a physical equivalence; max_inputs is reported
+    alongside for cases where a single strongly shifted channel dominates
+    transfer difficulty.
 
 Region selection
 ----------------
 Pass ``--domains name1 name2 ...`` to restrict the computation to a subset.
 With no ``--domains``, every subdirectory of ``--data_root`` that contains a
 ``stats.json`` is used.
+
+Metric
+------
+The 1D Wasserstein-1 distance is computed exactly for arbitrary (possibly
+unequal) sample sizes via the empirical-CDF-difference integral
+``W1 = integral |F_a(x) - F_b(x)| dx``, evaluated on the sorted union of the
+two supports. This is exact up to floating point and does not rely on
+quantile interpolation, which would otherwise underestimate the heavy upper
+tail of precipitation distributions. Verified against
+``scipy.stats.wasserstein_distance`` and the analytical limit W1 = |c| for a
+pure location shift of magnitude c.
 """
 
 import argparse
@@ -67,24 +99,34 @@ DEFAULT_TARGET_VAR = "precipitation"
 
 
 def wasserstein1d_gpu(a: np.ndarray, b: np.ndarray, device: torch.device) -> float:
-    """1D Wasserstein-1 via empirical inverse-CDF matching on GPU."""
+    """
+    Exact 1D Wasserstein-1 distance between two empirical distributions.
+
+    Uses the closed-form one-dimensional expression
+        W1(a, b) = integral_R |F_a(x) - F_b(x)| dx,
+    evaluated on the sorted union of the two supports. Exact for arbitrary
+    (including unequal) sample sizes, with no quantile interpolation. This
+    avoids the upper-tail bias that a fixed-grid inverse-CDF approximation
+    introduces on heavy-tailed, zero-inflated precipitation channels.
+
+    Equivalent to scipy.stats.wasserstein_distance but GPU-vectorised.
+    """
     if a.size == 0 or b.size == 0:
         return float("nan")
-    ta = torch.from_numpy(a).to(device)
-    tb = torch.from_numpy(b).to(device)
 
-    # equal-length: pointwise sort is the Monge coupling
-    if ta.shape[0] == tb.shape[0]:
-        ta, _ = torch.sort(ta)
-        tb, _ = torch.sort(tb)
-        return torch.mean(torch.abs(ta - tb)).item()
+    ta = torch.from_numpy(a).to(device).sort().values
+    tb = torch.from_numpy(b).to(device).sort().values
 
-    # unequal length: align on a common quantile grid
-    n = min(ta.shape[0], tb.shape[0])
-    q = torch.linspace(0.0, 1.0, steps=n, device=device)
-    ta = torch.quantile(ta, q)
-    tb = torch.quantile(tb, q)
-    return torch.mean(torch.abs(ta - tb)).item()
+    # Sorted union of support points defines the integration breakpoints.
+    allv = torch.cat([ta, tb]).sort().values
+    deltas = allv[1:] - allv[:-1]  # interval widths, (M-1,)
+
+    # Empirical CDFs at the left edge of each interval:
+    # searchsorted(..., right=True) counts samples <= x; divide by n for F(x).
+    cdf_a = torch.searchsorted(ta, allv[:-1], right=True).to(deltas.dtype) / ta.numel()
+    cdf_b = torch.searchsorted(tb, allv[:-1], right=True).to(deltas.dtype) / tb.numel()
+
+    return torch.sum(torch.abs(cdf_a - cdf_b) * deltas).item()
 
 
 # --------------------------------------------------------------------------
@@ -92,19 +134,22 @@ def wasserstein1d_gpu(a: np.ndarray, b: np.ndarray, device: torch.device) -> flo
 # --------------------------------------------------------------------------
 
 
-def _load_channel(
-    data_path: Path,
-    filename: str,
-    channel: int,
-    n_samples: int,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Flat float32 pixel values for one channel from {filename}."""
-    fp = data_path / filename
-    x = np.load(fp, mmap_mode="r")  # (N, C, H, W)
+def _sample_indices(data_path: Path, filename: str, n_samples: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Draw a sorted frame-index set for one domain, once, to be reused across
+    all channels of that domain. Sharing the index set makes the per-variable
+    distances commensurable (computed on the same frames), which is required
+    for the mean_inputs / max_inputs aggregates to be coherent.
+    """
+    x = np.load(data_path / filename, mmap_mode="r")  # (N, C, H, W)
     n = x.shape[0]
     k = min(n_samples, n)
-    idx = np.sort(rng.choice(n, size=k, replace=False))
+    return np.sort(rng.choice(n, size=k, replace=False))
+
+
+def _load_channel(data_path: Path, filename: str, channel: int, idx: np.ndarray) -> np.ndarray:
+    """Flat float32 pixel values for one channel from {filename} at frames idx."""
+    x = np.load(data_path / filename, mmap_mode="r")  # (N, C, H, W)
     return np.asarray(x[idx, channel]).ravel().astype(np.float32)
 
 
@@ -113,20 +158,48 @@ def _load_domain_stats(data_path: Path) -> dict:
         return json.load(f)
 
 
-def _zscore(flat: np.ndarray, var: str, stats: dict) -> np.ndarray:
+def _zscore(flat: np.ndarray, var: str, stats: dict, domain: str) -> np.ndarray:
     """
     Z-score with per-domain stats, matching ClimateSRDatasetNPY exactly. The
     log-transform on precip channels (tp, cp, precipitation, z) is baked into
     the .npy files by convert_zarr_to_npy, so no extra transform is applied
     here.
+
+    If the variable is absent from stats.json, fall back to on-the-fly
+    per-domain mean/std and warn: a silently different normalisation between
+    domains would bias the cross-domain distance.
     """
     if var in stats:
         mean, std = stats[var]
     else:
-        # fallback: on-the-fly z-score if the var is missing from stats.json
-        # (e.g. a user-specified extra variable). Keeps the script robust.
         mean, std = float(flat.mean()), float(flat.std())
+        print(
+            f"  Warning: '{var}' missing from stats.json for domain '{domain}'; "
+            f"using on-the-fly mean/std ({mean:.4g}, {std:.4g}). Cross-domain "
+            f"comparison for this variable may be biased if other domains use "
+            f"stats.json values."
+        )
     return ((flat - mean) / (std + 1e-8)).astype(np.float32)
+
+
+# --------------------------------------------------------------------------
+#  Aggregation over input channels
+# --------------------------------------------------------------------------
+
+
+def _aggregate_inputs(mat: np.ndarray, variables: list, input_vars: list) -> dict:
+    """
+    Collapse the (V, D, D) cube to scalar (D, D) matrices over the input
+    channels only (target channel excluded). Returns {'mean_inputs', 'max_inputs'}.
+    """
+    input_idx = [i for i, v in enumerate(variables) if v in input_vars]
+    if not input_idx:
+        raise ValueError(f"No input variables {input_vars} found among cube variables {variables}")
+    sub = mat[input_idx]  # (n_inputs, D, D)
+    return {
+        "mean_inputs": np.nanmean(sub, axis=0),
+        "max_inputs": np.nanmax(sub, axis=0),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -213,30 +286,40 @@ def run(args: argparse.Namespace) -> None:
     # Stats are only needed in "normalized" mode.
     stats_cache = {d: (_load_domain_stats(data_root / d) if args.mode == "normalized" else None) for d in domains}
 
+    # Draw ONE frame-index set per (domain, source-file) once and reuse it
+    # across every channel of that file. This keeps the per-variable distances
+    # commensurable (same frames) so the aggregate matrices are coherent.
+    # Inputs and target live in different files with possibly different frame
+    # counts, so index sets are keyed by (domain, filename).
+    rng = np.random.default_rng(args.seed)
+    filenames = sorted({fname for _, fname, _ in variables})
+    idx_cache = {}
+    for d in domains:
+        for fname in filenames:
+            try:
+                idx_cache[(d, fname)] = _sample_indices(data_root / d, fname, args.n_samples, rng)
+            except FileNotFoundError:
+                idx_cache[(d, fname)] = None  # handled per-channel below
+
     print(
-        f"Computing Wasserstein-1D on {device} " f"(mode={args.mode}, split={args.split}, n_samples={args.n_samples})"
+        f"Computing Wasserstein-1D on {device} "
+        f"(mode={args.mode}, split={args.split}, n_samples={args.n_samples})"
     )
     mat = np.zeros((n_v, n_d, n_d), dtype=np.float64)
-    rng = np.random.default_rng(args.seed)
 
     # Channel-outer loop bounds memory to one channel across all domains at a time.
     for k, (var, fname, ch_in_file) in enumerate(tqdm(variables, desc="Variables")):
         per_domain = {}
         for d in domains:
-            try:
-                flat = _load_channel(
-                    data_root / d,
-                    fname,
-                    ch_in_file,
-                    args.n_samples,
-                    rng,
-                )
-                if args.mode == "normalized":
-                    flat = _zscore(flat, var, stats_cache[d])
-                per_domain[d] = flat
-            except FileNotFoundError:
+            idx = idx_cache[(d, fname)]
+            if idx is None:
                 print(f"  Missing {fname} for {d}: skipping {var}.")
                 per_domain[d] = np.array([], dtype=np.float32)
+                continue
+            flat = _load_channel(data_root / d, fname, ch_in_file, idx)
+            if args.mode == "normalized":
+                flat = _zscore(flat, var, stats_cache[d], d)
+            per_domain[d] = flat
 
         for i in range(n_d):
             for j in range(i + 1, n_d):
@@ -275,6 +358,23 @@ def run(args: argparse.Namespace) -> None:
             )
         print(f"Saved {n_v} heatmaps to {out}/")
 
+    # Optional: scalar covariate-shift aggregates over input channels only.
+    if args.emit_aggregates:
+        aggs = _aggregate_inputs(mat, [v[0] for v in variables], args.input_vars)
+        for name, amat in aggs.items():
+            np.save(out / f"Wasserstein_1D_{args.split}_{name}.npy", amat)
+            if not args.no_plots:
+                plot_matrix(
+                    amat,
+                    f"Wasserstein-1D - {name} ({args.split}, {args.mode})",
+                    domains,
+                    out / f"Wasserstein_1D_{args.split}_{name}.png",
+                )
+        print(
+            f"Saved input-channel aggregates (mean_inputs, max_inputs) to {out}/ "
+            f"(target channel excluded)"
+        )
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -298,7 +398,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--target_var",
         default=DEFAULT_TARGET_VAR,
-        help="target variable read from {split}_y.npy (channel 0); " "pass 'none' to skip",
+        help="target variable read from {split}_y.npy (channel 0); pass 'none' to skip",
     )
     p.add_argument("--split", default="test", choices=["train", "test"])
     p.add_argument(
@@ -311,6 +411,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--n_samples", type=int, default=1000, help="number of 2D frames per domain (all pixels used)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--emit_aggregates",
+        action="store_true",
+        help="also write scalar mean_inputs and max_inputs (D, D) matrices "
+        "aggregated over the input channels only (target excluded), for the "
+        "covariate-shift W1(mu_S, mu_T) interpretation",
+    )
     p.add_argument(
         "--output_dir",
         default=str(Path(__file__).resolve().parent),

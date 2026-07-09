@@ -59,7 +59,7 @@ TARGET_REGIONS=(
     "melanesia"
 )
 
-METHODS=("fda" "mmd" "mmd_ms" "adabn") # "coral", "spectral", "dann"
+METHODS=("dann", "mmd", "coral", "spectral", "fda", "adabn")
 
 EPOCHS=25
 PATIENCE=-1
