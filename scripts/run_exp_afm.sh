@@ -23,7 +23,7 @@
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task 4
+#SBATCH --cpus-per-task 24
 #SBATCH --mem 0
 #SBATCH --time 72:00:00
 
@@ -65,7 +65,7 @@ METHODS=("dann" "mmd" "mmd_ms" "coral" "spectral" "fda" "adabn")
 
 EPOCHS=25
 PATIENCE=-1
-NUM_WORKERS=4
+NUM_WORKERS=24
 BATCH_SIZE=512
 
 FDA_BETA=0.01

@@ -30,7 +30,7 @@
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task 4
+#SBATCH --cpus-per-task 24
 #SBATCH --mem 0
 #SBATCH --time 72:00:00
 
@@ -74,11 +74,15 @@ METHODS=("dann" "mmd" "mmd_ms" "coral" "spectral" "fda" "adabn")
 
 EPOCHS=25
 PATIENCE=-1
-NUM_WORKERS=4
-BATCH_SIZE=512
+NUM_WORKERS=12
+BATCH_SIZE=128
 
 FDA_BETA=0.01
 LAMBDA_UDA=0.1
+# DANN uses a separate, small adversarial weight (the GRL alpha already
+# ramps the reversal 0->1). ~5e-4 per Wang et al. 2026; a large value
+# collapses the discriminator to ln(2). Ignored by non-DANN methods.
+DANN_WEIGHT=5e-4
 
 # --------------------------------------------------------------------------
 
@@ -164,7 +168,9 @@ elif [[ "${PHASE}" == "2" ]]; then
             --uda_method  "${method}" \
             --lambda_uda  "${LAMBDA_UDA}" \
             --fda_beta    "${FDA_BETA}" \
+            --dann_weight "${DANN_WEIGHT}" \
             --epochs      "${EPOCHS}" \
+            --batch_size  "${BATCH_SIZE}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
             2>&1 | tee "${OUTPUT_DIR}/phase2_${src}__to__${tgt}__${method}.log"

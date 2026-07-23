@@ -107,6 +107,15 @@ class AFMModel(nn.Module):
         self.sigma_z.mul_(self.sigma_z_ema).add_(new * (1 - self.sigma_z_ema))
 
     def forward(self, x_dyn, x_stat, x_target=None, extract_features=False):
+        # x_dyn arrives at native input resolution (80x80) when the dataset
+        # yields raw inputs (upsample_on_gpu=True). Bring it to the target grid
+        # (200x200) here, on GPU, before the encoder. Statics are already 200x200.
+        if x_dyn.shape[-1] != x_stat.shape[-1]:
+            x_dyn = F.interpolate(
+                x_dyn, size=x_stat.shape[-2:],
+                mode="bicubic", align_corners=False,
+            )
+            
         if x_target is None:
             return self.encoder(x_dyn, x_stat, extract_features=extract_features)
 

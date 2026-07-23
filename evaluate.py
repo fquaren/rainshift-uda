@@ -40,6 +40,20 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data.dataset import ClimateSRDatasetNPY, inverse_transform, load_domain_stats
+from data.dataset_zarr import ClimateSRDatasetZarr, _compute_and_cache_stats
+
+
+def load_stats(domain_path):
+    """Load normalization_stats.json for a domain, computing+caching from the
+    training Zarr if absent. Matches the trainer's stats loader and the Zarr
+    dataset's stats file (NOT the NPY-era stats.json)."""
+    import json as _json
+    from pathlib import Path as _P
+
+    p = _P(domain_path) / "normalization_stats.json"
+    if p.exists():
+        return _json.loads(p.read_text())
+    return _compute_and_cache_stats(_P(domain_path), None)
 from models.afm import AFMModel
 from models.unet import DualEncoderUNet
 from quantile_map import QuantileMap, fit_qm_from_npy
@@ -168,6 +182,7 @@ def evaluate_model(
 
     sum_loss = 0.0
     n_elements = 0
+    n_nonfinite_batches = 0
 
     for batch in tqdm(loader, desc=desc):
         x, s, y = (t.to(device, non_blocking=True) for t in batch)
@@ -177,6 +192,11 @@ def evaluate_model(
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model(x, s) if model_type == "unet" else model.deterministic_predict(x, s)
+
+        # Flag non-finite predictions (e.g. a checkpoint trained on NaN loss).
+        # Do NOT silently accumulate them into a NaN mse_std.
+        if not torch.isfinite(pred).all():
+            n_nonfinite_batches += 1
 
         # Accumulate exact MSE in standardized space
         sum_loss += torch.sum((pred - y) ** 2).item()
@@ -193,8 +213,23 @@ def evaluate_model(
             )
             all_ens.append(ens_np)
 
+    if not all_pred:
+        raise RuntimeError(
+            f"{desc}: no batches evaluated (empty loader). Cannot compute metrics."
+        )
+
     pred = np.concatenate(all_pred)
     true = np.concatenate(all_true)
+
+    if n_nonfinite_batches > 0:
+        # A non-finite prediction almost always means the checkpoint was
+        # trained on a NaN loss (e.g. unscrubbed non-finite input pixels).
+        # Fail loudly rather than write a silent NaN row to results.csv.
+        raise RuntimeError(
+            f"{desc}: {n_nonfinite_batches} batch(es) produced non-finite "
+            f"predictions. The checkpoint is likely corrupt (trained on NaN "
+            f"loss). Retrain this configuration rather than trusting NaN metrics."
+        )
 
     metrics = compute_metrics(pred, true)
     metrics["mse_std"] = float(sum_loss / max(n_elements, 1))
@@ -375,8 +410,8 @@ def cmd_batch(args):
         tgt_path = data_root / tgt
         src_path = data_root / src
 
-        if not (tgt_path / "stats.json").exists() or not (src_path / "stats.json").exists():
-            print(f"  Skipping {exp_name} (missing domain stats)")
+        if not (tgt_path / "normalization_stats.json").exists() or not (src_path / "normalization_stats.json").exists():
+            print(f"  Skipping {exp_name} (missing normalization_stats.json)")
             continue
 
         tag = f"{exp_name}__{args.input_transform}" if args.input_transform != "none" else exp_name
@@ -387,19 +422,22 @@ def cmd_batch(args):
 
         print(f"  Evaluating {tag} ...")
 
-        # Load Data
-        tgt_stats = load_domain_stats(str(tgt_path))
+        # SOURCE stats normalize BOTH source and target: the model lives in
+        # source-normalized space, so target inputs must be normalized by, and
+        # target predictions inverse-transformed by, source stats. Using target
+        # stats here would give physically wrong mm values (the same bug that
+        # was fixed in the trainers). load_stats reads normalization_stats.json.
+        src_stats = load_stats(str(src_path))
+
         tgt_loader = DataLoader(
-            ClimateSRDatasetNPY(str(tgt_path), "test", stats=tgt_stats),
+            ClimateSRDatasetZarr(str(tgt_path), "test", stats=src_stats),
             args.batch_size,
             shuffle=False,
             num_workers=2,
             pin_memory=True,
         )
-
-        src_stats = load_domain_stats(str(src_path))
         src_loader = DataLoader(
-            ClimateSRDatasetNPY(str(src_path), "test", stats=src_stats),
+            ClimateSRDatasetZarr(str(src_path), "test", stats=src_stats),
             args.batch_size,
             shuffle=False,
             num_workers=2,
@@ -412,7 +450,7 @@ def cmd_batch(args):
 
         model = load_model(model_type, str(ckpt), device, args.base_features)
 
-        # 1. Evaluate Source
+        # 1. Evaluate Source (source stats)
         src_metrics, src_pred, src_true = evaluate_model(
             model,
             model_type,
@@ -425,13 +463,13 @@ def cmd_batch(args):
             desc="Evaluating Source",
         )
 
-        # 2. Evaluate Target
+        # 2. Evaluate Target (SOURCE stats — model outputs live in source space)
         tgt_metrics, tgt_pred, tgt_true = evaluate_model(
             model,
             model_type,
             tgt_loader,
             device,
-            tgt_stats,
+            src_stats,
             args.n_ensemble,
             args.sample_steps,
             transform=transform,

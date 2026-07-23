@@ -43,6 +43,10 @@ import torch
 import torch.nn.functional as F
 import xarray as xr
 from torch.utils.data import IterableDataset, get_worker_info
+import time as _time
+
+def _dlog(msg):
+    print(f"[{_time.strftime('%H:%M:%S')}] [zarr] {msg}", flush=True)
 
 
 DEFAULT_INPUT_VARS = ["cape", "cp", "sp", "tclw", "tcw", "tisr", "tp", "u", "v"]
@@ -121,10 +125,12 @@ class ClimateSRDatasetZarr(IterableDataset):
         split: str,
         stats: dict = None,                     # <-- ADDED: source stats, threaded from build_loaders
         input_vars=None,
-        val_chunks: int = 175,
+        val_chunks: int = 88,   # ~10%, strided across time (was 175 contiguous)
+        split_mode: str = "strided",   # 'strided' (spread across time) or 'contiguous'
+        purge_gap: int = 1,             # train chunks within this many of a val chunk are dropped
         shuffle_buffer_chunks: int = 8,
         subset_chunks: int = None,
-        upsample_on_gpu: bool = False,
+        upsample_on_gpu: bool = True,
         seed: int = 42,
     ):
         super().__init__()
@@ -132,6 +138,8 @@ class ClimateSRDatasetZarr(IterableDataset):
         self.split = split
         self.input_vars = input_vars or DEFAULT_INPUT_VARS
         self.val_chunks = val_chunks
+        self.split_mode = split_mode
+        self.purge_gap = purge_gap
         self.shuffle_buffer_chunks = shuffle_buffer_chunks
         self.subset_chunks = subset_chunks
         self.upsample_on_gpu = upsample_on_gpu
@@ -178,14 +186,50 @@ class ClimateSRDatasetZarr(IterableDataset):
         self.n_chunks = math.ceil(self.n_total / _CHUNK)
         di.close()
 
-        if split == "train":
-            self.chunk_ids = list(range(0, max(self.n_chunks - self.val_chunks, 0)))
-        elif split == "validation":
-            self.chunk_ids = list(range(max(self.n_chunks - self.val_chunks, 0), self.n_chunks))
-        elif split == "test":
+        # --- train/validation split over chunks ------------------------------
+        # 'strided' (default): validation chunks spread UNIFORMLY across the full
+        # time axis (every k-th chunk), so val spans all seasons rather than a
+        # single contiguous temporal tail -- which for seasonally structured
+        # precipitation makes the tail one season and inflates apparent
+        # overfitting. 'contiguous' keeps the old last-N-chunks split.
+        #
+        # purge_gap: train chunks within `purge_gap` of a validation chunk are
+        # dropped (used nowhere) to prevent temporal-autocorrelation leakage
+        # between adjacent train/val chunks (blocked/purged CV). 0 disables.
+        if split == "test":
             self.chunk_ids = list(range(self.n_chunks))
         else:
-            raise ValueError(f"Unknown split '{split}'")
+            all_ids = list(range(self.n_chunks))
+            n_val = min(self.val_chunks, self.n_chunks - 1)
+
+            if self.split_mode == "contiguous":
+                val_ids = set(all_ids[self.n_chunks - n_val:])
+            elif self.split_mode == "strided":
+                if n_val > 0:
+                    stride = self.n_chunks / n_val
+                    offset = self.seed % max(int(stride), 1)
+                    val_ids = set(
+                        min(int(offset + i * stride), self.n_chunks - 1)
+                        for i in range(n_val)
+                    )
+                else:
+                    val_ids = set()
+            else:
+                raise ValueError(f"Unknown split_mode '{self.split_mode}'")
+
+            if split == "validation":
+                self.chunk_ids = sorted(val_ids)
+            elif split == "train":
+                purged = set()
+                for v in val_ids:
+                    for d in range(1, self.purge_gap + 1):
+                        purged.add(v - d)
+                        purged.add(v + d)
+                self.chunk_ids = [
+                    c for c in all_ids if c not in val_ids and c not in purged
+                ]
+            else:
+                raise ValueError(f"Unknown split '{split}'")
 
         if self.subset_chunks is not None:
             self.chunk_ids = self.chunk_ids[: self.subset_chunks]
@@ -193,7 +237,8 @@ class ClimateSRDatasetZarr(IterableDataset):
         if not self.chunk_ids:
             raise ValueError(
                 f"No chunks for split '{split}' (n_chunks={self.n_chunks}, "
-                f"val_chunks={self.val_chunks}). Reduce val_chunks."
+                f"val_chunks={self.val_chunks}, mode={self.split_mode}). "
+                f"Reduce val_chunks."
             )
 
     # -- helpers -----------------------------------------------------------
@@ -208,6 +253,8 @@ class ClimateSRDatasetZarr(IterableDataset):
             self._do = xr.open_zarr(self.out_path)
         return self._di, self._do
 
+    _logged_first_read = False
+
     def _read_chunk(self, chunk_id: int):
         """Read one time-chunk of inputs+target, apply transforms, return
         (x, y) numpy blocks of shape (n, C, 80, 80) and (n, 1, 200, 200)."""
@@ -215,6 +262,8 @@ class ClimateSRDatasetZarr(IterableDataset):
         t1 = min(t0 + _CHUNK, self.n_total)
 
         di, do = self._stores()
+        # if not self._logged_first_read:
+        #     _dlog(f"{self.split}: first chunk {chunk_id} store opened, reading arrays...")
 
         x_layers = []
         for v in self.input_vars:
@@ -226,6 +275,9 @@ class ClimateSRDatasetZarr(IterableDataset):
         m, s = self.stats[TARGET_VAR]
         y_block = do[TARGET_VAR].isel(time=slice(t0, t1)).values.astype(np.float32)  # (n,200,200)
         y = _transform_channel(y_block, TARGET_VAR, m, s)[:, np.newaxis, :, :]  # (n,1,200,200)
+        # if not self._logged_first_read:
+        #     _dlog(f"{self.split}: first chunk read OK (x={x.shape}, y={y.shape})")
+        #     self._logged_first_read = True
 
         return x, y
 
@@ -249,6 +301,9 @@ class ClimateSRDatasetZarr(IterableDataset):
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         ids = self._worker_chunk_ids()
+        _wi = get_worker_info()
+        _wid = _wi.id if _wi else 0
+        # _dlog(f"{self.split} worker {_wid}: {len(ids)} chunks assigned; reading first...")
 
         # Per-epoch chunk-order shuffle (train only). Seed varies by worker and
         # by a per-iterator counter so successive epochs differ.

@@ -114,6 +114,15 @@ class DualEncoderUNet(nn.Module):
                                  'enc2' for multi-scale UDA losses
         """
 
+        # x_dyn arrives at native input resolution (80x80) when the dataset
+        # yields raw inputs (upsample_on_gpu=True). Bring it to the target grid
+        # (200x200) here, on GPU, before the encoder. Statics are already 200x200.
+        if x_dyn.shape[-1] != x_stat.shape[-1]:
+            x_dyn = F.interpolate(
+                x_dyn, size=x_stat.shape[-2:],
+                mode="bicubic", align_corners=False,
+            )
+
         # --- Dynamic encoder ---
         d1 = self.dyn_enc1(x_dyn)           # (B, f, H, W)
         d2 = self.dyn_enc2(self.pool(d1))   # (B, 2f, H/2, W/2)

@@ -20,7 +20,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # ================================================================
 # Feature-level losses
 # ================================================================
@@ -120,7 +119,7 @@ def mmd_multiscale_loss(
     for lvl in active_levels:
         if median_heuristic:
             bw = _median_heuristic_bandwidth(src_feats[lvl], tgt_feats[lvl])
-            bws = [bw * (2.0 ** k) for k in (-2, -1, 0, 1, 2)]
+            bws = [bw * (2.0**k) for k in (-2, -1, 0, 1, 2)]
         else:
             bws = bandwidths
         losses.append(mmd_loss(src_feats[lvl], tgt_feats[lvl], bandwidths=bws))
@@ -130,7 +129,9 @@ def mmd_multiscale_loss(
 
 @torch.no_grad()
 def _median_heuristic_bandwidth(
-    src_feat: torch.Tensor, tgt_feat: torch.Tensor, max_samples: int = 512,
+    src_feat: torch.Tensor,
+    tgt_feat: torch.Tensor,
+    max_samples: int = 512,
 ) -> float:
     """
     Median of pairwise Euclidean distances between GAP-pooled features from
@@ -185,13 +186,14 @@ class DomainDiscriminator(nn.Module):
     Ganin et al., JMLR 2016.
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int = 256):
+    def __init__(self, in_dim: int, hidden_dim: int = 64):
         super().__init__()
+        # Single hidden layer, small hidden_dim (64). Wang et al. 2026
+        # (arXiv:2607.05645) found a shallow classifier gives a more stable
+        # alignment signal for climate downscaling DA; a heavy discriminator
+        # wins outright and collapses the domain loss to ln(2) (chance).
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim, 1),
@@ -244,7 +246,10 @@ def dann_grl_schedule(epoch: int, n_epochs: int) -> float:
 
 
 def lambda_uda_schedule(
-    epoch: int, n_epochs: int, lambda_max: float, kind: str = "sigmoid",
+    epoch: int,
+    n_epochs: int,
+    lambda_max: float,
+    kind: str = "sigmoid",
 ) -> float:
     """
     Schedule for the UDA loss weight. Matches the DANN GRL ramp when
