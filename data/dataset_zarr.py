@@ -77,6 +77,11 @@ def _transform_channel(arr: np.ndarray, var: str, mean: float, std: float) -> np
     # on large-magnitude channels (e.g. z ~ 5e4, where log then (x-mean)/tiny_std
     # loses float32 precision).
     a = arr.astype(np.float64)
+    # Scrub non-finite values (IMERG gaps etc.) in physical space, BEFORE
+    # the log, matching convert_zarr_to_npy and compute_stats.py. Without
+    # this a single NaN/inf pixel makes the loss NaN for the whole batch,
+    # which is the melanesia-as-source failure (task=nan from epoch 1).
+    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
     if var in _UNIT_SCALE:
         a = a * _UNIT_SCALE[var]
     if var in _LOG_VARS:
@@ -96,6 +101,7 @@ def _compute_and_cache_stats(root: Path, input_vars=None) -> dict:
 
     def _stat(a, var):
         a = a.astype(np.float64)
+        a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
         if var in _UNIT_SCALE:
             a = a * _UNIT_SCALE[var]
         if var in _LOG_VARS:

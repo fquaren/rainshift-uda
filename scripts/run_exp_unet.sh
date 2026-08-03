@@ -17,7 +17,7 @@
 # ===========================================================================
 
 #SBATCH --account tbeucler_downscaling
-#SBATCH --mail-type FAIL
+#SBATCH --mail-type ALL
 #SBATCH --mail-user filippo.quarenghi@unil.ch
 
 #SBATCH --chdir /scratch/fquareng/
@@ -70,7 +70,7 @@ TARGET_REGIONS=(
 
 # Bash arrays are whitespace-delimited: NO commas, or each element keeps a
 # trailing comma and argparse --uda_method choices rejects it.
-METHODS=("dann" "mmd" "mmd_ms" "coral" "spectral" "fda" "adabn")
+METHODS=("dann" "mmd" "spectral" "fda" "adabn") # "mmd_ms" "coral" 
 
 EPOCHS=25
 PATIENCE=-1
