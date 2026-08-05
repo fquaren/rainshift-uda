@@ -24,14 +24,15 @@ from uda import (
     dann_grl_schedule,
     dann_loss,
     fda_transfer,
+    jdot_loss,
     lambda_uda_schedule,
     mmd_loss,
     mmd_multiscale_loss,
     spectral_density_loss,
 )
 
-_NEEDS_TARGET_FORWARD = {"coral", "mmd", "mmd_ms", "spectral", "dann"}
-_NEEDS_FEATURES = {"coral", "mmd", "mmd_ms", "dann"}
+_NEEDS_TARGET_FORWARD = {"coral", "mmd", "mmd_ms", "spectral", "dann", "joint_ot"}
+_NEEDS_FEATURES = {"coral", "mmd", "mmd_ms", "dann", "joint_ot"}
 
 
 def _tag(src, tgt):
@@ -76,6 +77,10 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
         DataLoader(mk(args.source_path, "validation"), bs, **dl_kw),
         DataLoader(mk(args.target_path, "train"), bs, **dl_kw),
         DataLoader(mk(args.target_path, "test"), bs, **dl_kw),
+        # Target VALIDATION split. Used only for oracle (joint-training) model
+        # selection, where target labels are legitimately available. Never the
+        # target TEST set: that would be test-set leakage.
+        DataLoader(mk(args.target_path, "validation"), bs, **dl_kw),
     )
 
 
@@ -93,6 +98,9 @@ def build_uda(method, device, mmd_levels):
         return {"loss_fn": mmd_multiscale_loss, "levels": mmd_levels}, []
     if method == "spectral":
         return {"loss_fn": spectral_density_loss}, []
+    if method == "joint_ot":
+        # JDOT is parameter-free: the coupling is solved per batch.
+        return {"loss_fn": jdot_loss}, []
     if method == "dann":
         # in_dim = UNet bottleneck channels (512 for base_features=32).
         # hidden_dim=64 (lightweight) per Wang et al. 2026 for stability.
@@ -120,6 +128,8 @@ def train_one_epoch(
     epoch,
     total_epochs,
     dann_weight=5e-4,
+    jdot_alpha=1.0,
+    jdot_reg=0.1,
 ):
     model.train()
     sum_task, sum_uda, n = 0.0, 0.0, 0
@@ -160,6 +170,15 @@ def train_one_epoch(
         elif method == "dann":
             _, feats_t = model(x_t, s_t, extract_features=True)
             uda_loss = dann_loss(uda_comp["disc"], feats_s["bottleneck"], feats_t["bottleneck"], alpha)
+        elif method == "joint_ot":
+            # Joint alignment needs the target PREDICTION as well as target
+            # features: the label-transfer cost couples source labels to the
+            # model's output at target inputs.
+            pred_t, feats_t = model(x_t, s_t, extract_features=True)
+            uda_loss = uda_comp["loss_fn"](
+                feats_s["bottleneck"], feats_t["bottleneck"], y_s, pred_t,
+                alpha=jdot_alpha, reg=jdot_reg,
+            )
         elif method == "spectral":
             pred_t = model(x_t, s_t)
             uda_loss = uda_comp["loss_fn"](pred_s, pred_t)
@@ -222,9 +241,11 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
 
     src_stats = load_domain_stats(args.source_path)
     tgt_stats = load_domain_stats(args.target_path)
-    src_tr, src_val, tgt_tr, tgt_te = build_loaders(args, src_stats, tgt_stats, _bs)
+    src_tr, src_val, tgt_tr, tgt_te, tgt_val = build_loaders(args, src_stats, tgt_stats, _bs)
 
-    model = DualEncoderUNet(dynamic_channels=9, static_channels=2, out_channels=1, base_features=32).to(device)
+    model = DualEncoderUNet(
+        dynamic_channels=9, static_channels=2, out_channels=1, base_features=32
+    ).to(device)
 
     uda_comp, extra_params = build_uda(args.uda_method, device, args.mmd_levels)
     opt = torch.optim.AdamW(list(model.parameters()) + extra_params, lr=_lr, weight_decay=_wd)
@@ -258,20 +279,44 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
             epoch,
             args.epochs,
             dann_weight=args.dann_weight,
+            jdot_alpha=args.jdot_alpha,
+            jdot_reg=args.jdot_reg,
         )
         sched.step()
         val = evaluate(model, src_val, criterion, device, src_stats)
         # Target outputs live in source-normalized space -> source stats.
         tgt = evaluate(model, tgt_te, criterion, device, src_stats)
 
+        # Model-selection criterion.
+        #
+        # UDA runs: source validation only. Target labels must not influence
+        # selection or the protocol is no longer unsupervised.
+        #
+        # ORACLE (joint) runs: the oracle estimates
+        #     lambda = min_h [ R_S(h) + R_T(h) ]
+        # so selecting on R_S alone returns a model good on the source and
+        # possibly bad on the target. That UNDERSTATES the oracle's target
+        # capability, understates the addressable budget and overstates the
+        # irreducible risk -- a bias pointing towards the conditional-shift
+        # conclusion, i.e. exactly the wrong direction to be sloppy in. The
+        # oracle legitimately holds target labels, so we select on the joint
+        # criterion using the target VALIDATION split (never the test split).
+        if args.joint_training:
+            val_tgt = evaluate(model, tgt_val, criterion, device, src_stats)
+            select = 0.5 * (val["loss"] + val_tgt["loss"])
+            sel_str = f"  sel={select:.4f} (joint: src {val['loss']:.4f} / tgt {val_tgt['loss']:.4f})"
+        else:
+            select = val["loss"]
+            sel_str = ""
+
         print(
             f"[{epoch:3d}/{args.epochs}] {time.time()-t0:5.1f}s  "
             f"task={tr['task']:.4f}  uda={tr['uda']:.4f}  lam={lambda_eff:.4f}  "
-            f"val={val['loss']:.4f}  tgt_mae={tgt['mae_mm']:.3f}mm"
+            f"val={val['loss']:.4f}  tgt_mae={tgt['mae_mm']:.3f}mm" + sel_str
         )
 
-        if val["loss"] < best:
-            best = val["loss"]
+        if select < best:
+            best = select
             wait = 0
             torch.save(model.state_dict(), out / "best.pt")
         else:
@@ -285,9 +330,15 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
         if (out / "best.pt").exists():
             model.load_state_dict(torch.load(out / "best.pt", weights_only=True))
         apply_adabn(model, tgt_tr, device)
-        tgt = evaluate(model, tgt_te, criterion, device, tgt_stats)
+        # Source stats: the model lives in source-normalised space, so target
+        # predictions must be inverse-transformed with source stats to give
+        # physically correct mm (this branch was still using tgt_stats).
+        tgt = evaluate(model, tgt_te, criterion, device, src_stats)
         print(f"  AdaBN -> tgt_mae={tgt['mae_mm']:.3f}mm")
-        best = min(best, tgt["loss"])
+        # NOTE: `best` is deliberately NOT updated from the target metric.
+        # Folding a target-test loss into the selection criterion would leak
+        # target labels into an unsupervised protocol and make best_val_loss
+        # incomparable across methods.
         torch.save(model.state_dict(), out / "best_adabn.pt")
 
     cfg = {**vars(args), "lr": _lr, "bs": _bs, "wd": _wd, "lambda": _lam, "beta": _beta, "best_val_loss": best}
@@ -328,7 +379,7 @@ def parse_args():
     p.add_argument(
         "--uda_method",
         default="none",
-        choices=["none", "coral", "mmd", "mmd_ms", "spectral", "fda", "dann", "adabn"],
+        choices=["none", "coral", "mmd", "mmd_ms", "spectral", "fda", "dann", "adabn", "joint_ot"],
     )
     p.add_argument(
         "--lambda_uda",
@@ -351,6 +402,10 @@ def parse_args():
         help="Feature levels for multi-scale MMD (uda_method=mmd_ms).",
     )
     p.add_argument("--fda_beta", type=float, default=0.01)
+    p.add_argument("--jdot_alpha", type=float, default=1.0,
+                   help="JDOT weight on the feature term relative to the label-transfer term.")
+    p.add_argument("--jdot_reg", type=float, default=0.1,
+                   help="JDOT Sinkhorn entropic regularisation.")
     p.add_argument(
         "--dann_weight",
         type=float,
@@ -372,10 +427,11 @@ def parse_args():
     p.add_argument(
         "--val_chunks",
         type=int,
-        default=175,
+        default=88,
         help="Number of time-chunks (200 samples each) held out for "
-        "validation, taken from the tail of train_data_*.zarr. "
-        "At ~877 chunks total this is ~20%%.",
+        "validation, STRIDED across the full record (not a contiguous tail). "
+        "At ~877 chunks total 88 is ~10%%; with purge_gap=1 this leaves ~70%% "
+        "for training. The old 175 leaves only ~40%% once purging is applied.",
     )
     p.add_argument(
         "--shuffle_buffer_chunks",

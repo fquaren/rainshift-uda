@@ -138,14 +138,28 @@ class AFMModel(nn.Module):
         total = flow_loss + self.encoder_loss_weight * enc_loss
 
         result = {"flow_loss": flow_loss, "encoder_loss": enc_loss,
-                  "total_loss": total, "sigma_z": self.sigma_z.item()}
+                  "total_loss": total, "sigma_z": self.sigma_z.item(),
+                  "mu": mu}  # exposed so output-level losses reuse it
         if extract_features:
             result["features"] = features
         return result
 
+    def _match_dyn(self, x_dyn, x_stat):
+        """Bring x_dyn to the static/target grid. The encoder does this
+        internally, but flow_net concatenates x_dyn with x_t and x_stat, so it
+        must be upsampled here too or torch.cat fails on the spatial dims when
+        the dataset yields native-resolution inputs (upsample_on_gpu=True)."""
+        if x_dyn.shape[-1] != x_stat.shape[-1]:
+            x_dyn = F.interpolate(
+                x_dyn, size=x_stat.shape[-2:], mode="bicubic", align_corners=False
+            )
+        return x_dyn
+
     @torch.no_grad()
     def sample(self, x_dyn, x_stat, n_samples=1, steps=20, method="midpoint"):
+        was_training = self.training
         self.eval()
+        x_dyn = self._match_dyn(x_dyn, x_stat)
         mu = self.encoder(x_dyn, x_stat)
         all_s = []
         for _ in range(n_samples):
@@ -162,9 +176,13 @@ class AFMModel(nn.Module):
                     v2 = self.flow_net(x + v1 * dt / 2, tm, x_dyn, x_stat)
                     x = x + v2 * dt
             all_s.append(x)
+        if was_training:
+            self.train()
         return torch.stack(all_s, dim=1)
 
     @torch.no_grad()
     def deterministic_predict(self, x_dyn, x_stat):
-        self.eval()
+        # Do NOT flip module mode here: this used to leave the model
+        # permanently in eval() after any call, silently freezing BatchNorm
+        # for the rest of training. Callers control mode.
         return self.encoder(x_dyn, x_stat)

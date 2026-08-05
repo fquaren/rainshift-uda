@@ -46,7 +46,13 @@ def coral_loss(src_feat: torch.Tensor, tgt_feat: torch.Tensor) -> torch.Tensor:
     cov_s = (src_c.T @ src_c) / max(n_s - 1, 1)
     cov_t = (tgt_c.T @ tgt_c) / max(n_t - 1, 1)
 
-    return (cov_s - cov_t).pow(2).sum() / (4 * d * d)
+    # Normalisation: the original CORAL paper divides by 4d^2, which was tuned
+    # for unpooled fc7-style activations. With GAP-pooled d=512 features that
+    # divisor (~1e6) drives the loss to ~1e-7 even under a 3-sigma feature
+    # shift, so at any sane lambda the gradient is numerically inert -- this is
+    # why CORAL logged uda=0.0000. We normalise by d instead, which keeps the
+    # loss O(1) and scale-comparable with the other feature losses.
+    return (cov_s - cov_t).pow(2).sum() / d
 
 
 def mmd_loss(
@@ -60,11 +66,20 @@ def mmd_loss(
 
     Gretton et al., JMLR 2012; Long et al., ICML 2015 (DAN).
     """
-    if bandwidths is None:
-        bandwidths = [0.01, 0.1, 1.0, 10.0, 100.0]
-
     src = F.adaptive_avg_pool2d(src_feat, 1).flatten(1)
     tgt = F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1)
+
+    # Bandwidths. A FIXED ladder (the old default [0.01..100]) is wrong here:
+    # GAP-pooled 512-d bottleneck features have median pairwise distance ~70,
+    # so every bandwidth below ~30 gives exp(-gamma d^2) = 0 off-diagonal and
+    # the "MMD" reduces to the constant 2/B coming from the kernel diagonal --
+    # a batch-size artefact carrying no domain signal (this is why single-scale
+    # MMD logged a near-constant 0.0115). We therefore default to the median
+    # heuristic (Gretton et al. 2012) with the standard DAN 2^{-2..2} ladder,
+    # matching what mmd_multiscale_loss already did.
+    if bandwidths is None:
+        bw = _median_heuristic_bandwidth(src_feat, tgt_feat)
+        bandwidths = [bw * (2.0**k) for k in (-2, -1, 0, 1, 2)]
 
     def _pairwise_sq_dist(a, b):
         return torch.cdist(a, b, p=2.0).pow(2)
@@ -443,3 +458,90 @@ def apply_quantile_mapping(
     shape = predictions.shape
     mapped = np.interp(predictions.ravel(), src_quantiles, tgt_quantiles)
     return mapped.reshape(shape)
+
+
+# ================================================================
+# Joint-distribution optimal transport (JDOT / DeepJDOT)
+# ================================================================
+
+
+def _sinkhorn_log(cost: torch.Tensor, reg: float = 0.1, n_iter: int = 50) -> torch.Tensor:
+    """
+    Log-domain Sinkhorn for uniform marginals. Returns the coupling gamma.
+
+    Log-domain (rather than the naive exp/normalise recursion) because the
+    cost matrix here mixes a feature term and a full-field label term whose
+    scale varies by orders of magnitude across pairs; the naive form
+    underflows to zero coupling and silently yields a zero loss.
+    """
+    n, m = cost.shape
+    a = torch.full((n,), -np.log(n), device=cost.device, dtype=cost.dtype)
+    b = torch.full((m,), -np.log(m), device=cost.device, dtype=cost.dtype)
+    f = torch.zeros_like(a)
+    g = torch.zeros_like(b)
+    K = -cost / reg
+    for _ in range(n_iter):
+        f = a - torch.logsumexp(K + g[None, :], dim=1)
+        g = b - torch.logsumexp(K + f[:, None], dim=0)
+    return torch.exp(K + f[:, None] + g[None, :])
+
+
+def jdot_loss(
+    src_feat: torch.Tensor,
+    tgt_feat: torch.Tensor,
+    y_src: torch.Tensor,
+    pred_tgt: torch.Tensor,
+    alpha: float = 1.0,
+    reg: float = 0.1,
+    n_iter: int = 50,
+) -> torch.Tensor:
+    """
+    Minibatch DeepJDOT loss (Courty et al., NeurIPS 2017; Damodaran et al.,
+    ECCV 2018).
+
+    Aligns the JOINT distribution P(x, y) rather than the input or feature
+    marginal. The transport cost between source sample i and target sample j
+    combines a feature-space distance and a *label-transfer* term that asks how
+    well the source label y_i explains the model's prediction at target input
+    j:
+
+        C_ij = alpha * ||g(x_i^s) - g(x_j^t)||^2  +  ||y_i^s - f(x_j^t)||^2
+
+    The coupling gamma is solved with the network fixed (no gradient through
+    the OT solve, the standard alternating scheme), then the loss <gamma, C> is
+    differentiated w.r.t. the network. Gradient therefore reaches the encoder
+    through the feature term and the decoder through the label term.
+
+    This is the only method in the benchmark that does not assume a shared
+    conditional: because the label term couples y^s to f(x^t) through the
+    transport plan, it can in principle accommodate P(y|x) differing between
+    domains, which is the failure mode the diagnostics identify. It is
+    correspondingly the method predicted to have headroom where the marginal
+    methods do not.
+
+    Args:
+        src_feat, tgt_feat: (B, C, H, W) encoder features for the two domains.
+        y_src:    (B, 1, H', W') source ground truth, standardised space.
+        pred_tgt: (B, 1, H', W') model prediction on target inputs.
+        alpha:    weight on the feature term relative to the label term.
+        reg:      Sinkhorn entropic regularisation.
+        n_iter:   Sinkhorn iterations.
+    """
+    gs = F.adaptive_avg_pool2d(src_feat, 1).flatten(1)      # (Bs, C)
+    gt = F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1)      # (Bt, C)
+
+    ys = y_src.flatten(1)                                    # (Bs, D)
+    pt = pred_tgt.flatten(1)                                 # (Bt, D)
+
+    # Mean-normalised squared distances so the two cost terms are on a common
+    # scale regardless of feature width C and field size D.
+    c_feat = torch.cdist(gs, gt, p=2.0).pow(2) / gs.size(1)
+    c_lab = torch.cdist(ys, pt, p=2.0).pow(2) / ys.size(1)
+
+    cost = alpha * c_feat + c_lab
+
+    # Coupling solved with the network held fixed (alternating optimisation).
+    with torch.no_grad():
+        gamma = _sinkhorn_log(cost.detach(), reg=reg, n_iter=n_iter)
+
+    return (gamma * cost).sum()

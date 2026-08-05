@@ -73,7 +73,7 @@ TARGET_REGIONS=(
 METHODS=("dann" "mmd" "spectral" "fda" "adabn") # "mmd_ms" "coral" 
 
 EPOCHS=25
-PATIENCE=-1
+PATIENCE=5
 NUM_WORKERS=12
 BATCH_SIZE=128
 
@@ -91,41 +91,75 @@ run_python() {
 }
 
 # ===========================================================================
-#  PHASE 1: Base HP search (vanilla, one per domain pair)
+#  PHASE 1: source-only baselines — ONE RUN PER SOURCE DOMAIN
+#
+#  A source-only model never sees the target: with --uda_method none the
+#  target loader is built but never drawn from, so europe_west->horn and
+#  europe_west->melanesia train byte-identical weights. The old pair loop
+#  therefore trained each of the 3 models twice (4 of 6 runs were duplicate
+#  compute). We train 3 models and fan the resulting HP file out to the 6
+#  pair names that Phase 2 and evaluate.py look up.
+#
+#  target_path is set to the SOURCE itself rather than to a dummy domain:
+#    - weights are unchanged (target is unused),
+#    - tgt_mae then reports IN-DOMAIN test error, i.e. the diagonal of the
+#      3x3 transfer matrix, which the paper reports anyway,
+#    - the checkpoint dir is unambiguously {src}__to__{src}__none,
+#    - no I/O is wasted streaming a domain that is never used.
+#
+#  PATIENCE_P1 defaults to 5: validation bottoms out at epoch 3-6 on all
+#  three domains, so 25 epochs spends ~80% of the wall clock past the
+#  checkpoint that is actually selected.
+#
+#  RESIDUAL=1 enables the log-space residual head (predict a correction to
+#  the upsampled coarse tp channel). Use it to A/B against the plain head.
 # ===========================================================================
 if [[ "${PHASE}" == "1" ]]; then
-    PAIRS=()
-    for src in "${SOURCE_REGIONS[@]}"; do
-        for tgt in "${TARGET_REGIONS[@]}"; do
-            [[ "$src" == "$tgt" ]] && continue
-            PAIRS+=("${src}|${tgt}")
-        done
-    done
+    PATIENCE_P1="${PATIENCE_P1:-5}"
+    RESIDUAL_FLAG=""
+    [[ -n "${RESIDUAL:-}" ]] && RESIDUAL_FLAG="--residual"
 
-    echo "=== PHASE 1: Vanilla UNet (no UDA) ==="
-    
-    for i in "${!PAIRS[@]}"; do
-        IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
-        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} -> ${tgt} ---"
+    echo "=== PHASE 1: source-only baselines (${#SOURCE_REGIONS[@]} runs) ==="
+    echo "    patience=${PATIENCE_P1}  residual=${RESIDUAL:-0}"
 
-        HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
+    for i in "${!SOURCE_REGIONS[@]}"; do
+        src="${SOURCE_REGIONS[$i]}"
+        echo "--- [$((i+1))/${#SOURCE_REGIONS[@]}] source=${src} ---"
+
+        HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${src}.json"
         if [[ -f "${HP_FILE}" ]]; then
-            echo "  Base HPs already exist: ${HP_FILE}, skipping."
-            continue
+            echo "  Base HPs already exist: ${HP_FILE}, skipping training."
+        else
+            run_python "${CODE_ROOT}/train_unet.py" \
+                --source_path "${DATA_ROOT}/${src}" \
+                --target_path "${DATA_ROOT}/${src}" \
+                --output_dir  "${OUTPUT_DIR}" \
+                --data_format "${DATA_FORMAT}" \
+                --uda_method  none \
+                --epochs      "${EPOCHS}" \
+                --batch_size  "${BATCH_SIZE}" \
+                --patience    "${PATIENCE_P1}" \
+                --num_workers "${NUM_WORKERS}" \
+                ${RESIDUAL_FLAG} \
+                2>&1 | tee "${OUTPUT_DIR}/phase1_${src}.log"
         fi
 
-        run_python "${CODE_ROOT}/train_unet.py" \
-            --source_path "${DATA_ROOT}/${src}" \
-            --target_path "${DATA_ROOT}/${tgt}" \
-            --output_dir  "${OUTPUT_DIR}" \
-            --data_format "${DATA_FORMAT}" \
-            --uda_method  none \
-            --epochs      "${EPOCHS}" \
-            --batch_size  "${BATCH_SIZE}" \
-            --patience    "${PATIENCE}" \
-            --num_workers "${NUM_WORKERS}" \
-            2>&1 | tee "${OUTPUT_DIR}/phase1_${src}__to__${tgt}.log"
+        # Fan the source-keyed HP file out to every pair name. Phase 2's
+        # skip-guard and train_unet's own base-HP lookup both key on
+        # {src}__to__{tgt}.json, so without this Phase 2 finds nothing and
+        # silently skips every run.
+        if [[ -f "${HP_FILE}" ]]; then
+            for tgt in "${TARGET_REGIONS[@]}"; do
+                [[ "$src" == "$tgt" ]] && continue
+                cp -f "${HP_FILE}" "${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
+            done
+            echo "  Fanned base HPs out to $((${#TARGET_REGIONS[@]} - 1)) pair name(s)."
+        else
+            echo "  WARNING: ${HP_FILE} not produced; Phase 2 will skip ${src}."
+        fi
     done
+    echo "=== PHASE 1 complete ==="
+
 
 # ===========================================================================
 #  PHASE 2: UDA application (Fixed HPs, no Optuna)
@@ -231,6 +265,7 @@ elif [[ "${PHASE}" == "oracle" ]]; then
             --batch_size  "${BATCH_SIZE}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
+	    --residual    ""
             2>&1 | tee "${ORACLE_DIR}/oracle_${src}__to__${tgt}.log"
     done
     echo "=== PHASE oracle complete ==="

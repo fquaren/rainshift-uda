@@ -19,14 +19,15 @@ from uda import (
     dann_grl_schedule,
     dann_loss,
     fda_transfer,
+    jdot_loss,
     lambda_uda_schedule,
     mmd_loss,
     mmd_multiscale_loss,
     spectral_density_loss,
 )
 
-_NEEDS_TARGET_FORWARD = {"coral", "mmd", "mmd_ms", "spectral", "dann"}
-_NEEDS_FEATURES = {"coral", "mmd", "mmd_ms", "dann"}
+_NEEDS_TARGET_FORWARD = {"coral", "mmd", "mmd_ms", "spectral", "dann", "joint_ot"}
+_NEEDS_FEATURES = {"coral", "mmd", "mmd_ms", "dann", "joint_ot"}
 
 
 def _tag(s, t):
@@ -66,10 +67,12 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
         DataLoader(mk(args.source_path, "validation"), bs, **dl_kw),
         DataLoader(mk(args.target_path, "train"), bs, **dl_kw),
         DataLoader(mk(args.target_path, "test"), bs, **dl_kw),
+        # Target VALIDATION split: oracle model selection only (see train_unet).
+        DataLoader(mk(args.target_path, "validation"), bs, **dl_kw),
     )
 
 
-def build_uda(method, mmd_levels, device):
+def build_uda(method, mmd_levels, device, base_features=64):
     if method == "coral":
         return {"loss_fn": coral_loss}, []
     if method == "mmd":
@@ -78,12 +81,14 @@ def build_uda(method, mmd_levels, device):
         return {"loss_fn": mmd_multiscale_loss, "levels": mmd_levels}, []
     if method == "spectral":
         return {"loss_fn": spectral_density_loss}, []
+    if method == "joint_ot":
+        # JDOT is parameter-free: the coupling is solved per batch.
+        return {"loss_fn": jdot_loss}, []
     if method == "dann":
-        # in_dim MUST equal the AFM encoder bottleneck channel count. With
-        # base_features=64 this is likely 1024 (unlike the UNet's 512 at
-        # base_features=32) -- VERIFY against models/afm.py before trusting.
-        # hidden_dim=64 (lightweight) per Wang et al. 2026 for stability.
-        d = DomainDiscriminator(1024, 64).to(device)
+        # in_dim MUST equal the encoder bottleneck width. DualEncoderUNet's
+        # bottleneck is 16 * base_features, so derive it rather than hardcoding
+        # (the old literal 1024 silently broke for any base_features != 64).
+        d = DomainDiscriminator(16 * base_features, 64).to(device)
         return {"disc": d}, list(d.parameters())
     return {}, []
 
@@ -102,7 +107,8 @@ def build_optimizer(model, base_lr, uda_params):
 
 
 def train_one_epoch(
-    model, src_ld, tgt_ld, opt, uda_comp, method, lam_eff, beta, device, epoch, total, dann_weight=5e-4
+    model, src_ld, tgt_ld, opt, uda_comp, method, lam_eff, beta, device, epoch, total, dann_weight=5e-4,
+    jdot_alpha=1.0, jdot_reg=0.1,
 ):
     model.train()
     sf, se, su, n = 0.0, 0.0, 0.0, 0
@@ -140,8 +146,20 @@ def train_one_epoch(
         elif method == "dann":
             _, tf = model(xt, st, extract_features=True)
             uda = dann_loss(uda_comp["disc"], out["features"]["bottleneck"], tf["bottleneck"], alpha)
+        elif method == "joint_ot":
+            # Joint alignment needs the target PREDICTION as well as target
+            # features: the label-transfer cost couples source labels to the
+            # model's output at target inputs.
+            tp_pred, tf = model(xt, st, extract_features=True)
+            uda = uda_comp["loss_fn"](
+                out["features"]["bottleneck"], tf["bottleneck"], ys, tp_pred,
+                alpha=jdot_alpha, reg=jdot_reg,
+            )
         elif method == "spectral":
-            sp = model.encoder(xs, ss)
+            # Reuse the source encoder output already computed in `out` rather
+            # than re-running the encoder on xs: a third forward doubles the
+            # cost and updates this batch's BatchNorm running stats twice.
+            sp = out["mu"] if "mu" in out else model.encoder(xs, ss)
             tp = model.encoder(xt, st)
             uda = uda_comp["loss_fn"](sp, tp)
 
@@ -194,11 +212,11 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
 
     ss = load_domain_stats(args.source_path)
     ts = load_domain_stats(args.target_path)
-    src_tr, src_val, tgt_tr, tgt_te = build_loaders(args, ss, ts, _bs)
+    src_tr, src_val, tgt_tr, tgt_te, tgt_val = build_loaders(args, ss, ts, _bs)
 
     model = AFMModel(9, 2, 1, args.base_features, encoder_loss_weight=_ew).to(device)
 
-    uc, ep = build_uda(args.uda_method, args.mmd_levels, device)
+    uc, ep = build_uda(args.uda_method, args.mmd_levels, device, args.base_features)
     opt = build_optimizer(model, _lr, ep)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
 
@@ -226,20 +244,34 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
             epoch,
             args.epochs,
             dann_weight=args.dann_weight,
+            jdot_alpha=args.jdot_alpha, jdot_reg=args.jdot_reg,
         )
         sched.step()
         val = evaluate(model, src_val, device, ss)
         tgt = evaluate(model, tgt_te, device, ss)
 
+        # Oracle runs select on the JOINT criterion (target validation split,
+        # never test); UDA runs select on source validation only so that no
+        # target label influences selection. See train_unet.py for the full
+        # argument -- selecting an oracle on source risk alone biases the
+        # addressable budget downwards.
+        if args.joint_training:
+            val_tgt = evaluate(model, tgt_val, device, ss)
+            select = 0.5 * (val["loss"] + val_tgt["loss"])
+            sel_str = f" sel={select:.4f}(src {val['loss']:.4f}/tgt {val_tgt['loss']:.4f})"
+        else:
+            select = val["loss"]
+            sel_str = ""
+
         print(
             f"[{epoch:3d}/{args.epochs}] {time.time()-t0:5.1f}s  "
             f"flow={tr['flow']:.4f} enc={tr['enc']:.4f} uda={tr['uda']:.4f} "
             f"lam={lam_eff:.4f} sigma_z={tr['sigma_z']:.4f} "
-            f"val={val['loss']:.4f} tgt_mae={tgt['mae_mm']:.3f}mm"
+            f"val={val['loss']:.4f} tgt_mae={tgt['mae_mm']:.3f}mm" + sel_str
         )
 
-        if val["loss"] < best:
-            best = val["loss"]
+        if select < best:
+            best = select
             wait = 0
             torch.save(model.state_dict(), out / "best.pt")
         else:
@@ -319,7 +351,7 @@ def parse_args():
     p.add_argument(
         "--uda_method",
         default="none",
-        choices=["none", "coral", "mmd", "mmd_ms", "spectral", "fda", "dann", "adabn"],
+        choices=["none", "coral", "mmd", "mmd_ms", "spectral", "fda", "dann", "adabn", "joint_ot"],
     )
     p.add_argument(
         "--lambda_uda",
@@ -343,6 +375,10 @@ def parse_args():
         "Must be keys in the encoder's extract_features dict.",
     )
     p.add_argument("--fda_beta", type=float, default=0.01)
+    p.add_argument("--jdot_alpha", type=float, default=1.0,
+                   help="JDOT weight on the feature term relative to the label-transfer term.")
+    p.add_argument("--jdot_reg", type=float, default=0.1,
+                   help="JDOT Sinkhorn entropic regularisation.")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-5)
@@ -363,10 +399,11 @@ def parse_args():
     p.add_argument(
         "--val_chunks",
         type=int,
-        default=175,
+        default=88,
         help="Number of time-chunks (200 samples each) held out for "
-        "validation, taken from the tail of train_data_*.zarr. "
-        "At ~877 chunks total this is ~20%%.",
+        "validation, STRIDED across the full record (not a contiguous tail). "
+        "At ~877 chunks total 88 is ~10%%; with purge_gap=1 this leaves ~70%% "
+        "for training. The old 175 leaves only ~40%% once purging is applied.",
     )
     p.add_argument(
         "--shuffle_buffer_chunks",

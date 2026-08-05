@@ -59,6 +59,7 @@ class DualEncoderUNet(nn.Module):
         super().__init__()
         f = base_features  # shorthand
 
+
         # --- Dynamic encoder (4 levels) ---
         self.dyn_enc1 = DoubleConv(dynamic_channels, f)       # -> f
         self.dyn_enc2 = DoubleConv(f, f * 2)                  # -> 2f
