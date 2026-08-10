@@ -494,7 +494,8 @@ def jdot_loss(
     alpha: float = 1.0,
     reg: float = 0.1,
     n_iter: int = 50,
-) -> torch.Tensor:
+    return_diag: bool = False,
+):
     """
     Minibatch DeepJDOT loss (Courty et al., NeurIPS 2017; Damodaran et al.,
     ECCV 2018).
@@ -544,4 +545,43 @@ def jdot_loss(
     with torch.no_grad():
         gamma = _sinkhorn_log(cost.detach(), reg=reg, n_iter=n_iter)
 
-    return (gamma * cost).sum()
+    loss = (gamma * cost).sum()
+
+    if not return_diag:
+        return loss
+
+    # ---- diagnostics -----------------------------------------------------
+    # A nearly-flat JDOT loss during training has three distinguishable
+    # causes; these numbers separate them.
+    with torch.no_grad():
+        n = gamma.numel()
+        uniform = 1.0 / n
+        # peakedness: max(gamma)/mean(gamma). A well-conditioned transport
+        # plan is strongly peaked (>> 1). Near 1 means Sinkhorn returned the
+        # uniform coupling, i.e. reg swamps the cost and the OT is inert --
+        # <gamma, C> then collapses to the MEAN of the cost matrix, which
+        # barely moves as the model improves. Fix: lower reg.
+        peakedness = float(gamma.max() / gamma.mean())
+        # effective support: exp(entropy) / n. 1.0 = fully uniform.
+        p = gamma.flatten() / gamma.sum()
+        ent = float(-(p * (p + 1e-30).log()).sum())
+        eff_support = float(np.exp(ent) / n)
+        # how far the loss is from the inert limit <uniform, C> = mean(C)
+        inert_loss = float(cost.mean())
+        # term balance: if one term dominates, alpha is mis-set and JDOT
+        # degenerates into feature-only or label-only alignment.
+        cf, cl = float(c_feat.mean()), float(c_lab.mean())
+        diag = {
+            "loss": float(loss),
+            "inert_loss_uniform_coupling": inert_loss,
+            "loss_over_inert": float(loss) / (inert_loss + 1e-12),
+            "gamma_peakedness": peakedness,
+            "gamma_effective_support_frac": eff_support,
+            "cost_feat_mean": cf,
+            "cost_label_mean": cl,
+            "feat_over_label": cf * alpha / (cl + 1e-12),
+            "cost_mean": inert_loss,
+            "cost_std": float(cost.std()),
+            "reg_over_cost_std": reg / (float(cost.std()) + 1e-12),
+        }
+    return loss, diag
