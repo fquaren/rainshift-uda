@@ -70,10 +70,14 @@ TARGET_REGIONS=(
 
 # Bash arrays are whitespace-delimited: NO commas, or each element keeps a
 # trailing comma and argparse --uda_method choices rejects it.
-METHODS=("dann" "mmd" "spectral" "fda" "adabn") # "mmd_ms" "coral" 
+METHODS=("joint_ot") # "dann" "mmd" "spectral" "fda" "adabn")
+# Dropped: "coral" (subsumed by MMD, mean-blind, weakly scaled) and
+# "mmd_ms" (same mechanism as MMD, unstable). joint_ot = DeepJDOT, the
+# only method aligning the JOINT distribution and so the only one that
+# can address conditional shift.
 
 EPOCHS=25
-PATIENCE=5
+PATIENCE="${PATIENCE:--1}"
 NUM_WORKERS=12
 BATCH_SIZE=128
 
@@ -159,7 +163,6 @@ if [[ "${PHASE}" == "1" ]]; then
         fi
     done
     echo "=== PHASE 1 complete ==="
-
 
 # ===========================================================================
 #  PHASE 2: UDA application (Fixed HPs, no Optuna)
@@ -265,7 +268,6 @@ elif [[ "${PHASE}" == "oracle" ]]; then
             --batch_size  "${BATCH_SIZE}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
-	    --residual    ""
             2>&1 | tee "${ORACLE_DIR}/oracle_${src}__to__${tgt}.log"
     done
     echo "=== PHASE oracle complete ==="

@@ -280,13 +280,43 @@ def save_results(metrics, src_pred, src_true, tgt_pred, tgt_true, out_dir, n_sav
             np.savez_compressed(out_dir / "predictions.npz", **out_dict)
 
 
+# A row is uniquely identified by this key. Re-evaluating the same experiment
+# must REPLACE its row, not add a second one.
+_ROW_KEY = ("model", "source", "target", "method", "transform")
+
+
 def append_csv(csv_path, row):
+    """Write `row`, replacing any existing row with the same identity key.
+
+    The previous implementation opened in append mode unconditionally, so every
+    re-run of evaluate.sh duplicated all rows (observed: 6 oracle rows written
+    twice). Duplicates silently corrupt any downstream aggregation that means
+    or counts rows, e.g. compute_ngg_all.
+    """
     csv_path = Path(csv_path)
-    header_needed = not csv_path.exists()
-    with open(csv_path, "a") as f:
-        if header_needed:
-            f.write(",".join(row.keys()) + "\n")
-        f.write(",".join(str(v) for v in row.values()) + "\n")
+    fields = list(row.keys())
+    key = tuple(str(row.get(k, "")) for k in _ROW_KEY)
+
+    kept = []
+    if csv_path.exists():
+        with open(csv_path) as f:
+            lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+        if lines:
+            header = lines[0].split(",")
+            idx = [header.index(k) for k in _ROW_KEY if k in header]
+            for ln in lines[1:]:
+                parts = ln.split(",")
+                if len(idx) == len(_ROW_KEY) and len(parts) == len(header):
+                    if tuple(parts[i] for i in idx) == key:
+                        continue  # drop the stale row for this experiment
+                kept.append(ln)
+            fields = header  # preserve the existing column order
+
+    with open(csv_path, "w") as f:
+        f.write(",".join(fields) + "\n")
+        for ln in kept:
+            f.write(ln + "\n")
+        f.write(",".join(str(row.get(k, "")) for k in fields) + "\n")
 
 
 def parse_exp_name(name):

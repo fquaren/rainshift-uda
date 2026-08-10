@@ -61,10 +61,14 @@ TARGET_REGIONS=(
 
 # Bash arrays are whitespace-delimited: NO commas, or each element keeps a
 # trailing comma and argparse --uda_method choices rejects it.
-METHODS=("dann" "mmd" "mmd_ms" "coral" "spectral" "fda" "adabn")
+METHODS=("joint_ot" "dann" "mmd" "spectral" "fda" "adabn")
+# Dropped: "coral" (subsumed by MMD, mean-blind, weakly scaled) and
+# "mmd_ms" (same mechanism as MMD, unstable). joint_ot = DeepJDOT, the
+# only method aligning the JOINT distribution and so the only one that
+# can address conditional shift.
 
 EPOCHS=25
-PATIENCE=-1
+PATIENCE="${PATIENCE:--1}"
 NUM_WORKERS=24
 BATCH_SIZE=512
 
@@ -75,42 +79,75 @@ run_python() {
     singularity exec --nv "${CONTAINER}" python "$@"
 }
 
+# ===========================================================================
+#  PHASE 1: source-only baselines — ONE RUN PER SOURCE DOMAIN
+#
+#  A source-only model never sees the target: with --uda_method none the
+#  target loader is built but never drawn from, so europe_west->horn and
+#  europe_west->melanesia train byte-identical weights. The old pair loop
+#  therefore trained each of the 3 models twice (4 of 6 runs were duplicate
+#  compute). We train 3 models and fan the resulting HP file out to the 6
+#  pair names that Phase 2 and evaluate.py look up.
+#
+#  target_path is set to the SOURCE itself rather than to a dummy domain:
+#    - weights are unchanged (target is unused),
+#    - tgt_mae then reports IN-DOMAIN test error, i.e. the diagonal of the
+#      3x3 transfer matrix, which the paper reports anyway,
+#    - the checkpoint dir is unambiguously {src}__to__{src}__none,
+#    - no I/O is wasted streaming a domain that is never used.
+#
+#  PATIENCE_P1 defaults to 5: validation bottoms out at epoch 3-6 on all
+#  three domains, so 25 epochs spends ~80% of the wall clock past the
+#  checkpoint that is actually selected.
+#
+#  RESIDUAL=1 enables the log-space residual head (predict a correction to
+#  the upsampled coarse tp channel). Use it to A/B against the plain head.
+# ===========================================================================
 if [[ "${PHASE}" == "1" ]]; then
-    PAIRS=()
-    for src in "${SOURCE_REGIONS[@]}"; do
-        for tgt in "${TARGET_REGIONS[@]}"; do
-            [[ "$src" == "$tgt" ]] && continue
-            PAIRS+=("${src}|${tgt}")
-        done
-    done
+    PATIENCE_P1="${PATIENCE_P1:-5}"
+    RESIDUAL_FLAG=""
+    [[ -n "${RESIDUAL:-}" ]] && RESIDUAL_FLAG="--residual"
 
-    echo "=== AFM PHASE 1: Baseline (no UDA) ==="
-    echo "Domain pairs: ${#PAIRS[@]}"
+    echo "=== PHASE 1: source-only baselines (${#SOURCE_REGIONS[@]} runs) ==="
+    echo "    patience=${PATIENCE_P1}  residual=${RESIDUAL:-0}"
 
-    for i in "${!PAIRS[@]}"; do
-        IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
-        echo "--- [$((i+1))/${#PAIRS[@]}] ${src} -> ${tgt} ---"
+    for i in "${!SOURCE_REGIONS[@]}"; do
+        src="${SOURCE_REGIONS[$i]}"
+        echo "--- [$((i+1))/${#SOURCE_REGIONS[@]}] source=${src} ---"
 
-        HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
+        HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${src}.json"
         if [[ -f "${HP_FILE}" ]]; then
-            echo "  Already done, skipping."
-            continue
+            echo "  Base HPs already exist: ${HP_FILE}, skipping training."
+        else
+            run_python "${CODE_ROOT}/train_afm.py" \
+                --source_path "${DATA_ROOT}/${src}" \
+                --target_path "${DATA_ROOT}/${src}" \
+                --output_dir  "${OUTPUT_DIR}" \
+                --data_format "${DATA_FORMAT}" \
+                --uda_method  none \
+                --epochs      "${EPOCHS}" \
+                --batch_size  "${BATCH_SIZE}" \
+                --patience    "${PATIENCE_P1}" \
+                --num_workers "${NUM_WORKERS}" \
+                ${RESIDUAL_FLAG} \
+                2>&1 | tee "${OUTPUT_DIR}/afm_phase1_${src}.log"
         fi
 
-        run_python "${CODE_ROOT}/train_afm.py" \
-            --source_path "${DATA_ROOT}/${src}" \
-            --target_path "${DATA_ROOT}/${tgt}" \
-            --output_dir  "${OUTPUT_DIR}" \
-            --data_format "${DATA_FORMAT}" \
-            --uda_method  none \
-            --epochs      "${EPOCHS}" \
-            --batch_size  "${BATCH_SIZE}" \
-            --patience    "${PATIENCE}" \
-            --num_workers "${NUM_WORKERS}" \
-            2>&1 | tee "${OUTPUT_DIR}/afm_phase1_${src}__to__${tgt}.log"
-        echo ""
+        # Fan the source-keyed HP file out to every pair name. Phase 2's
+        # skip-guard and train_unet's own base-HP lookup both key on
+        # {src}__to__{tgt}.json, so without this Phase 2 finds nothing and
+        # silently skips every run.
+        if [[ -f "${HP_FILE}" ]]; then
+            for tgt in "${TARGET_REGIONS[@]}"; do
+                [[ "$src" == "$tgt" ]] && continue
+                cp -f "${HP_FILE}" "${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
+            done
+            echo "  Fanned base HPs out to $((${#TARGET_REGIONS[@]} - 1)) pair name(s)."
+        else
+            echo "  WARNING: ${HP_FILE} not produced; Phase 2 will skip ${src}."
+        fi
     done
-    echo "=== AFM PHASE 1 complete ==="
+    echo "=== PHASE 1 complete ==="
 
 elif [[ "${PHASE}" == "2" ]]; then
     RUNS=()

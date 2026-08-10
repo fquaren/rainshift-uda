@@ -42,7 +42,12 @@ CACHE_DIR="${RESULTS_DIR}/transforms"
 W1_MATRIX="${CODE_ROOT}/covariate_shift_analysis/normalized/Wasserstein_1D_test.npy"
 W1_META="${CODE_ROOT}/covariate_shift_analysis/normalized/Wasserstein_1D_test_variables.json"
 
-TRANSFORMS=("none" "oracle") # "qm_precip") # "qm_tp" "qm_all" "ot")
+# NOTE: "oracle" is NOT a valid --input_transform. evaluate.py defines
+# _TRANSFORM_CHOICES = [none, qm_tp, qm_precip, qm_all, ot], so passing
+# "oracle" made argparse abort the whole script on the second iteration.
+# The oracle is a different CHECKPOINT DIRECTORY, not an input transform;
+# it is evaluated separately below.
+TRANSFORMS=("none") # "qm_precip" "qm_tp" "qm_all" "ot")
 
 # AFM probabilistic settings
 N_ENSEMBLE=16
@@ -67,6 +72,28 @@ for tf in "${TRANSFORMS[@]}"; do
         --force
     echo ""
 done
+
+# -------------------------------------------------------------------
+#  ORACLE (joint source+target training) evaluation.
+#  The oracle checkpoints live in a SEPARATE output dir written by
+#  `PHASE=oracle`, so they need their own --exp_root. They are ordinary
+#  checkpoints: no input transform applies. Their target risk is the
+#  addressable-budget denominator.
+# -------------------------------------------------------------------
+if [[ -d "${OUTPUT_DIR}/unet_oracle" ]]; then
+    echo "=== UNet | ORACLE (joint) ==="
+    run_python "${CODE_ROOT}/evaluate.py" batch \
+        --exp_root "${OUTPUT_DIR}/unet_oracle" \
+        --data_root "${DATA_ROOT}" \
+        --output_dir "${RESULTS_DIR}/unet/oracle" \
+        --input_transform none \
+        --transform_cache_dir "${CACHE_DIR}" \
+        --save_samples 10 \
+        --force
+    echo ""
+else
+    echo "WARNING: ${OUTPUT_DIR}/unet_oracle not found; skipping oracle eval."
+fi
 
 # -------------------------------------------------------------------
 #  AFM deterministic: across all transforms
