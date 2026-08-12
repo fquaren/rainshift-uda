@@ -210,7 +210,7 @@ elif [[ "${PHASE}" == "2" ]]; then
             --batch_size  "${BATCH_SIZE}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
-	    --jdot_reg 0.001
+	    --jdot_reg 0.001 \
             2>&1 | tee "${OUTPUT_DIR}/phase2_${src}__to__${tgt}__${method}.log"
     done
 
