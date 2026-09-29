@@ -43,11 +43,17 @@ export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/li
 CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
 CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift"
-OUTPUT_DIR="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda/unet"
+# Seed. Every run of every phase is tagged by it, and each seed gets its OWN
+# output tree, so repeated seeds never overwrite one another's checkpoints,
+# base_hp, best_hp or oracle directories. Launch one job per seed.
+SEED="${SEED:-42}"
+OUTPUT_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda"
+OUTPUT_DIR="${OUTPUT_ROOT}/unet_seed${SEED}"
 DATA_FORMAT="npy"
 
 PHASE="${PHASE:-1}"
-echo "Selected PHASE: ${PHASE}"
+echo "Selected PHASE: ${PHASE}  SEED: ${SEED}"
+echo "Output tree:    ${OUTPUT_DIR}"
 
 mkdir -p "${OUTPUT_DIR}/base_hp"
 mkdir -p "${OUTPUT_DIR}/best_hp"
@@ -114,17 +120,12 @@ run_python() {
 #  PATIENCE_P1 defaults to 5: validation bottoms out at epoch 3-6 on all
 #  three domains, so 25 epochs spends ~80% of the wall clock past the
 #  checkpoint that is actually selected.
-#
-#  RESIDUAL=1 enables the log-space residual head (predict a correction to
-#  the upsampled coarse tp channel). Use it to A/B against the plain head.
 # ===========================================================================
 if [[ "${PHASE}" == "1" ]]; then
     PATIENCE_P1="${PATIENCE_P1:-5}"
-    RESIDUAL_FLAG=""
-    [[ -n "${RESIDUAL:-}" ]] && RESIDUAL_FLAG="--residual"
 
     echo "=== PHASE 1: source-only baselines (${#SOURCE_REGIONS[@]} runs) ==="
-    echo "    patience=${PATIENCE_P1}  residual=${RESIDUAL:-0}"
+    echo "    patience=${PATIENCE_P1}"
 
     for i in "${!SOURCE_REGIONS[@]}"; do
         src="${SOURCE_REGIONS[$i]}"
@@ -144,7 +145,7 @@ if [[ "${PHASE}" == "1" ]]; then
                 --batch_size  "${BATCH_SIZE}" \
                 --patience    "${PATIENCE_P1}" \
                 --num_workers "${NUM_WORKERS}" \
-                ${RESIDUAL_FLAG} \
+            --seed        "${SEED}" \
                 2>&1 | tee "${OUTPUT_DIR}/phase1_${src}.log"
         fi
 
@@ -210,6 +211,7 @@ elif [[ "${PHASE}" == "2" ]]; then
             --batch_size  "${BATCH_SIZE}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
+            --seed        "${SEED}" \
 	    --jdot_reg 0.001 \
             2>&1 | tee "${OUTPUT_DIR}/phase2_${src}__to__${tgt}__${method}.log"
     done
@@ -269,6 +271,7 @@ elif [[ "${PHASE}" == "oracle" ]]; then
             --batch_size  "${BATCH_SIZE}" \
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
+            --seed        "${SEED}" \
             2>&1 | tee "${ORACLE_DIR}/oracle_${src}__to__${tgt}.log"
     done
     echo "=== PHASE oracle complete ==="

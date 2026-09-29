@@ -1,0 +1,51 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm:*)",
+      "Bash(rmdir:*)",
+      "Bash(unlink:*)",
+      "Bash(shred:*)",
+      "Bash(truncate:*)",
+      "Bash(git push:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(scancel:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(pip:*)",
+      "Bash(conda:*)",
+      "Bash(jupyter:*)",
+      "Edit(/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/**)",
+      "Write(/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/**)"
+    ],
+    "ask": [
+      "Bash(sbatch:*)",
+      "Bash(srun:*)",
+      "Bash(salloc:*)",
+      "Bash(singularity:*)",
+      "Bash(apptainer:*)",
+      "Bash(mv:*)",
+      "Bash(cp:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(chmod:*)",
+      "Bash(tar:*)"
+    ],
+    "allow": [
+      "Bash(bash -n:*)",
+      "Bash(squeue:*)",
+      "Bash(sacct:*)",
+      "Bash(sinfo:*)",
+      "Bash(scontrol show:*)",
+      "Bash(tail:*)",
+      "Bash(head:*)",
+      "Bash(ls:*)",
+      "Bash(du:*)",
+      "Bash(df:*)",
+      "Bash(wc:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)"
+    ]
+  }
+}

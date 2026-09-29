@@ -1,0 +1,19 @@
+=== materialising pair-named source-only checkpoints in /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda/unet ===
+  europe_west -> horn-of-africa
+  europe_west -> melanesia
+  horn-of-africa -> europe_west
+  horn-of-africa -> melanesia
+  melanesia -> europe_west
+  melanesia -> horn-of-africa
+
+=== verification ===
+  checkpoint dirs found: 9 (expect 9 = 3 diagonal + 6 off-diagonal)
+  byte-identity of copies:
+    OK  europe_west__to__horn-of-africa
+    OK  europe_west__to__melanesia
+    OK  horn-of-africa__to__europe_west
+    OK  horn-of-africa__to__melanesia
+    OK  melanesia__to__europe_west
+    OK  melanesia__to__horn-of-africa
+
+Done. Now run: sbatch scripts/evaluate.sh

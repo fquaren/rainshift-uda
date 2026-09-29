@@ -99,17 +99,12 @@ run_python() {
 #  PATIENCE_P1 defaults to 5: validation bottoms out at epoch 3-6 on all
 #  three domains, so 25 epochs spends ~80% of the wall clock past the
 #  checkpoint that is actually selected.
-#
-#  RESIDUAL=1 enables the log-space residual head (predict a correction to
-#  the upsampled coarse tp channel). Use it to A/B against the plain head.
 # ===========================================================================
 if [[ "${PHASE}" == "1" ]]; then
     PATIENCE_P1="${PATIENCE_P1:-5}"
-    RESIDUAL_FLAG=""
-    [[ -n "${RESIDUAL:-}" ]] && RESIDUAL_FLAG="--residual"
 
     echo "=== PHASE 1: source-only baselines (${#SOURCE_REGIONS[@]} runs) ==="
-    echo "    patience=${PATIENCE_P1}  residual=${RESIDUAL:-0}"
+    echo "    patience=${PATIENCE_P1}"
 
     for i in "${!SOURCE_REGIONS[@]}"; do
         src="${SOURCE_REGIONS[$i]}"
@@ -129,7 +124,6 @@ if [[ "${PHASE}" == "1" ]]; then
                 --batch_size  "${BATCH_SIZE}" \
                 --patience    "${PATIENCE_P1}" \
                 --num_workers "${NUM_WORKERS}" \
-                ${RESIDUAL_FLAG} \
                 2>&1 | tee "${OUTPUT_DIR}/afm_phase1_${src}.log"
         fi
 

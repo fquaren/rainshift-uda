@@ -15,14 +15,21 @@
 #  each pair name is exact, not an approximation.
 #
 #  Run this AFTER Phase 1 finishes and BEFORE evaluate.sh.
+#
+#  Works on ONE seed's tree, unet_seed${SEED}/, which is where
+#  run_exp_unet.sh writes. SEED is required: the old default wrote into the
+#  unseeded unet/ tree for every seed. An existing pair-named directory is
+#  never overwritten -- identical copies are skipped, anything else aborts.
 # ===========================================================================
 set -euo pipefail
 
+SEED="${SEED:?SEED must be set, e.g. SEED=42}"
 OUTPUT_DIR="${OUTPUT_DIR:-/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda}"
-MODEL_DIR="${OUTPUT_DIR}/unet"
+MODEL_DIR="${OUTPUT_DIR}/unet_seed${SEED}"
 
 DOMAINS=("europe_west" "horn-of-africa" "melanesia")
 
+[[ -d "${MODEL_DIR}" ]] || { echo "ERROR: ${MODEL_DIR} does not exist."; exit 1; }
 echo "=== materialising pair-named source-only checkpoints in ${MODEL_DIR} ==="
 
 missing=0
@@ -33,14 +40,26 @@ for src in "${DOMAINS[@]}"; do
         missing=1
         continue
     fi
+    # The diagonal must be a source-only run, never an oracle.
+    if ! grep -q '"joint_training": false' "${diag}/config.json"; then
+        echo "  ERROR: ${diag}/config.json is not a source-only run."
+        missing=1
+        continue
+    fi
     for tgt in "${DOMAINS[@]}"; do
         [[ "$src" == "$tgt" ]] && continue
         dst="${MODEL_DIR}/${src}__to__${tgt}__none"
+        if [[ -e "${dst}" ]]; then
+            if cmp -s "${diag}/best.pt" "${dst}/best.pt"; then
+                echo "  ${src} -> ${tgt}  (already present, identical, skipped)"
+                continue
+            fi
+            echo "  ERROR: ${dst} exists and differs from the diagonal. Not overwriting."
+            exit 1
+        fi
         mkdir -p "${dst}"
-        cp -f "${diag}/best.pt" "${dst}/best.pt"
-        [[ -f "${diag}/config.json" ]] && cp -f "${diag}/config.json" "${dst}/config.json"
-        # Remove any stale metrics.json so evaluate.py does not skip this dir.
-        rm -f "${dst}/metrics.json"
+        cp "${diag}/best.pt" "${dst}/best.pt"
+        cp "${diag}/config.json" "${dst}/config.json"
         echo "  ${src} -> ${tgt}"
     done
 done
@@ -56,6 +75,7 @@ done
 
 # Byte-identity check: the off-diagonal copies must equal their diagonal source.
 echo "  byte-identity of copies:"
+fail=0
 for src in "${DOMAINS[@]}"; do
     ref="${MODEL_DIR}/${src}__to__${src}__none/best.pt"
     for tgt in "${DOMAINS[@]}"; do
@@ -64,9 +84,12 @@ for src in "${DOMAINS[@]}"; do
             echo "    OK  ${src}__to__${tgt}"
         else
             echo "    FAIL ${src}__to__${tgt} differs from diagonal"
+            fail=1
         fi
     done
 done
+# Non-zero exit so an afterok-chained evaluate job does not start.
+[[ "${fail}" -eq 1 ]] && { echo "Aborting: byte-identity check failed."; exit 1; }
 
 echo
-echo "Done. Now run: sbatch scripts/evaluate.sh"
+echo "Done. Now run: SEED=${SEED} sbatch scripts/evaluate.sh"

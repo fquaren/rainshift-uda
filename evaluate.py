@@ -175,14 +175,29 @@ def _load_or_fit_transform(src_path, tgt_path, args, device):
 
 @torch.no_grad()
 def evaluate_model(
-    model, model_type, loader, device, stats, n_ensemble=0, sample_steps=20, transform=None, desc="Evaluating"
+    model, model_type, loader, device, stats, n_ensemble=0, sample_steps=20, transform=None,
+    desc="Evaluating", collect_fields=True,
 ):
+    """collect_fields=False streams the metrics without concatenating the
+    prediction/truth fields. Required for the TRAINING split: at ~122k samples
+    of 200x200 float32 the two arrays would be ~40 GB. Physical-space metrics
+    are then accumulated as running sums instead, and no example fields can be
+    saved for that split."""
     var = "precipitation"
     all_pred, all_true, all_ens = [], [], []
 
     sum_loss = 0.0
     n_elements = 0
     n_nonfinite_batches = 0
+    # Running physical-space accumulators, used when collect_fields=False.
+    s_se = s_ae = s_bias = 0.0
+    n_phys = 0
+    per_sample_mse_mm, per_sample_mae_mm = [], []
+    # Per-sample loss in STANDARDISED space, one scalar per test sample.
+    # Kept separately from the aggregate because downstream diagnostics
+    # (OODiag-style analog matching, regime stratification, error-distribution
+    # comparisons) need the sample-wise error, not its mean.
+    per_sample_std = []
 
     for batch in tqdm(loader, desc=desc):
         x, s, y = (t.to(device, non_blocking=True) for t in batch)
@@ -199,11 +214,25 @@ def evaluate_model(
             n_nonfinite_batches += 1
 
         # Accumulate exact MSE in standardized space
-        sum_loss += torch.sum((pred - y) ** 2).item()
+        sq = (pred - y) ** 2
+        sum_loss += torch.sum(sq).item()
         n_elements += pred.numel()
+        # Mean over the spatial/channel dims -> one value per sample.
+        per_sample_std.append(sq.float().mean(dim=tuple(range(1, sq.ndim))).cpu().numpy())
 
-        all_pred.append(inverse_transform(pred.float().cpu().numpy(), var, stats))
-        all_true.append(inverse_transform(y.float().cpu().numpy(), var, stats))
+        p_mm = inverse_transform(pred.float().cpu().numpy(), var, stats)
+        t_mm = inverse_transform(y.float().cpu().numpy(), var, stats)
+        ax = tuple(range(1, p_mm.ndim))
+        per_sample_mse_mm.append(np.mean((p_mm - t_mm) ** 2, axis=ax))
+        per_sample_mae_mm.append(np.mean(np.abs(p_mm - t_mm), axis=ax))
+        if collect_fields:
+            all_pred.append(p_mm)
+            all_true.append(t_mm)
+        else:
+            s_se += float(((p_mm - t_mm) ** 2).sum())
+            s_ae += float(np.abs(p_mm - t_mm).sum())
+            s_bias += float((p_mm - t_mm).sum())
+            n_phys += p_mm.size
 
         if model_type == "afm" and n_ensemble > 0:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -213,13 +242,13 @@ def evaluate_model(
             )
             all_ens.append(ens_np)
 
-    if not all_pred:
+    if not per_sample_std:
         raise RuntimeError(
             f"{desc}: no batches evaluated (empty loader). Cannot compute metrics."
         )
 
-    pred = np.concatenate(all_pred)
-    true = np.concatenate(all_true)
+    pred = np.concatenate(all_pred) if collect_fields else None
+    true = np.concatenate(all_true) if collect_fields else None
 
     if n_nonfinite_batches > 0:
         # A non-finite prediction almost always means the checkpoint was
@@ -231,21 +260,73 @@ def evaluate_model(
             f"loss). Retrain this configuration rather than trusting NaN metrics."
         )
 
-    metrics = compute_metrics(pred, true)
+    if collect_fields:
+        metrics = compute_metrics(pred, true)
+    else:
+        n_phys = max(n_phys, 1)
+        metrics = {
+            "rmse_mm": float(np.sqrt(s_se / n_phys)),
+            "mae_mm": float(s_ae / n_phys),
+            "bias_mm": float(s_bias / n_phys),
+            "n_samples": int(sum(len(a) for a in per_sample_std)),
+        }
     metrics["mse_std"] = float(sum_loss / max(n_elements, 1))
+
+    # Sample-wise errors, aligned by index (see the ordering note in
+    # save_results).
+    per_sample = {
+        "mse_std": np.concatenate(per_sample_std),
+        "mse_mm": np.concatenate(per_sample_mse_mm),
+        "mae_mm": np.concatenate(per_sample_mae_mm),
+    }
 
     if all_ens:
         ens = np.concatenate(all_ens)
         metrics["crps_mm"] = compute_crps(ens, true)
         metrics["spread_mm"] = float(ens.std(axis=1).mean())
 
-    return metrics, pred, true
+    return metrics, pred, true, per_sample
 
 
-def save_results(metrics, src_pred, src_true, tgt_pred, tgt_true, out_dir, n_save=5):
+def save_results(metrics, src_pred, src_true, tgt_pred, tgt_true, out_dir, n_save=5,
+                 src_per_sample=None, tgt_per_sample=None, train_per_sample=None):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    # Sample-wise losses on the test sets, one row per sample, in test-set
+    # order so they can be joined to the inputs by index. Saved for every
+    # evaluated configuration, independent of n_save (which only controls how
+    # many example FIELDS are stored).
+    if any(d is not None for d in (src_per_sample, tgt_per_sample, train_per_sample)):
+        ps = {}
+        for tag, d in (("src", src_per_sample), ("tgt", tgt_per_sample),
+                       ("train", train_per_sample)):
+            if d is None:
+                continue
+            for k, v in d.items():
+                ps[f"{tag}_{k}"] = np.asarray(v, dtype=np.float32)
+        if ps:
+            # Ordering contract. These arrays are in DataLoader emission order,
+            # which equals the Zarr time order ONLY because the evaluation
+            # loaders use num_workers<=1. With num_workers>1 the IterableDataset
+            # shards chunks strided across workers and the DataLoader
+            # round-robins their batches, so emission order becomes a
+            # permutation of time order (e.g. with 2 workers, batch_size 64 and
+            # 200-sample chunks, position 64 is time index 200). Do not raise
+            # num_workers here without also emitting an explicit index.
+            n_src = len(ps.get("src_mse_std", []))
+            n_tgt = len(ps.get("tgt_mse_std", []))
+            if n_src:
+                ps["src_time_index"] = np.arange(n_src, dtype=np.int32)
+            if n_tgt:
+                ps["tgt_time_index"] = np.arange(n_tgt, dtype=np.int32)
+            # No train_time_index. The TRAIN split shuffles its chunk order,
+            # streams through a shuffle buffer and skips validation and purged
+            # chunks, so emission order is not time order even at
+            # num_workers=1. The train per-sample losses are usable as a
+            # distribution (OODiag), not for per-timestep joins.
+            np.savez_compressed(out_dir / "per_sample_loss.npz", **ps)
 
     if n_save > 0:
         out_dict = {}
@@ -341,7 +422,7 @@ def cmd_single(args):
         ClimateSRDatasetNPY(args.src_path, "test", stats=src_stats),
         args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=1,   # see note in save_results: >1 permutes sample order
         pin_memory=True,
     )
 
@@ -351,7 +432,7 @@ def cmd_single(args):
         ClimateSRDatasetNPY(args.target_path, "test", stats=tgt_stats),
         args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=1,   # see note in save_results: >1 permutes sample order
         pin_memory=True,
     )
 
@@ -362,7 +443,7 @@ def cmd_single(args):
         transform = _load_or_fit_transform(args.src_path, args.target_path, args, device)
 
     # 1. Evaluate Source (No Transform)
-    src_metrics, src_pred, src_true = evaluate_model(
+    src_metrics, src_pred, src_true, src_per_sample = evaluate_model(
         model,
         args.model,
         src_loader,
@@ -375,7 +456,7 @@ def cmd_single(args):
     )
 
     # 2. Evaluate Target (With Transform)
-    tgt_metrics, tgt_pred, tgt_true = evaluate_model(
+    tgt_metrics, tgt_pred, tgt_true, tgt_per_sample = evaluate_model(
         model,
         args.model,
         tgt_loader,
@@ -395,7 +476,8 @@ def cmd_single(args):
     tag = f"{tag_base}____{args.input_transform}" if args.input_transform != "none" else tag_base
     res_dir = Path(args.output_dir) / "results" / tag
 
-    save_results(combined_metrics, src_pred, src_true, tgt_pred, tgt_true, res_dir, args.save_samples)
+    save_results(combined_metrics, src_pred, src_true, tgt_pred, tgt_true, res_dir, args.save_samples,
+                     src_per_sample=src_per_sample, tgt_per_sample=tgt_per_sample)
 
     src, tgt, method = parse_exp_name(tag_base)
     append_csv(
@@ -463,14 +545,14 @@ def cmd_batch(args):
             ClimateSRDatasetZarr(str(tgt_path), "test", stats=src_stats),
             args.batch_size,
             shuffle=False,
-            num_workers=2,
+            num_workers=1,   # see note in save_results: >1 permutes sample order
             pin_memory=True,
         )
         src_loader = DataLoader(
             ClimateSRDatasetZarr(str(src_path), "test", stats=src_stats),
             args.batch_size,
             shuffle=False,
-            num_workers=2,
+            num_workers=1,   # see note in save_results: >1 permutes sample order
             pin_memory=True,
         )
 
@@ -481,7 +563,7 @@ def cmd_batch(args):
         model = load_model(model_type, str(ckpt), device, args.base_features)
 
         # 1. Evaluate Source (source stats)
-        src_metrics, src_pred, src_true = evaluate_model(
+        src_metrics, src_pred, src_true, src_per_sample = evaluate_model(
             model,
             model_type,
             src_loader,
@@ -494,7 +576,7 @@ def cmd_batch(args):
         )
 
         # 2. Evaluate Target (SOURCE stats — model outputs live in source space)
-        tgt_metrics, tgt_pred, tgt_true = evaluate_model(
+        tgt_metrics, tgt_pred, tgt_true, tgt_per_sample = evaluate_model(
             model,
             model_type,
             tgt_loader,
@@ -510,7 +592,35 @@ def cmd_batch(args):
         combined_metrics = {f"src_{k}": v for k, v in src_metrics.items()}
         combined_metrics.update({f"tgt_{k}": v for k, v in tgt_metrics.items()})
 
-        save_results(combined_metrics, src_pred, src_true, tgt_pred, tgt_true, res_dir, args.save_samples)
+        # ---- TRAINING-split pass -------------------------------------
+        # OODiag-style diagnostics reference the training loss L_train and
+        # need it sample-wise, not just as an aggregate. We therefore also
+        # score the model on its own SOURCE TRAINING split. Fields are not
+        # collected (collect_fields=False): at ~122k samples of 200x200 the
+        # prediction and truth arrays would be ~40 GB. Only metrics and
+        # per-sample losses are produced -- no example fields are saved for
+        # this split, which is what "no predictions" means here.
+        train_per_sample = None
+        if args.eval_train:
+            train_loader = DataLoader(
+                ClimateSRDatasetZarr(str(src_path), "train", stats=src_stats,
+                                     subset_chunks=args.train_subset_chunks),
+                args.batch_size,
+                shuffle=False,
+                num_workers=1,
+                pin_memory=True,
+            )
+            train_metrics, _, _, train_per_sample = evaluate_model(
+                model, model_type, train_loader, device, src_stats,
+                args.n_ensemble, args.sample_steps, transform=None,
+                desc="Evaluating Train", collect_fields=False,
+            )
+            for k, v in train_metrics.items():
+                combined_metrics[f"train_{k}"] = v
+
+        save_results(combined_metrics, src_pred, src_true, tgt_pred, tgt_true, res_dir, args.save_samples,
+                     src_per_sample=src_per_sample, tgt_per_sample=tgt_per_sample,
+                     train_per_sample=train_per_sample)
 
         append_csv(
             csv_path,
@@ -547,6 +657,17 @@ def _add_common_args(p):
     p.add_argument("--save_samples", type=int, default=5)
 
     # input transforms (shared)
+    p.add_argument(
+        "--eval_train", action="store_true",
+        help="also score the model on its own SOURCE TRAINING split (metrics + "
+             "per-sample losses only, no fields). Needed for OODiag-style "
+             "diagnostics that reference L_train."
+    )
+    p.add_argument(
+        "--train_subset_chunks", type=int, default=None,
+        help="cap the training-split chunks scored by --eval_train "
+             "(200 samples per chunk). None = the full split."
+    )
     p.add_argument(
         "--input_transform", default="none", choices=_TRANSFORM_CHOICES, help="test-time input transform to apply"
     )
