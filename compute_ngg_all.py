@@ -54,13 +54,24 @@ def _summarise(ngg_path: Path, domains: list) -> dict:
             "min_ngg": float("nan"),
             "max_ngg": float("nan"),
         }
-    return {
+    stats = {
         "n_finite": int(valid.size),
         "mean_ngg": float(valid.mean()),
         "median_ngg": float(np.median(valid)),
         "min_ngg": float(valid.min()),
         "max_ngg": float(valid.max()),
     }
+    # Trade components against source-only, written by compute_ngg.py when
+    # E_S is the fixed baseline. Averaged over off-diagonal cells; note the
+    # cells are in different source normalisations, so read the sign per
+    # cell (delta_*.npy) before trusting the mean.
+    for name in ("delta_src", "delta_tgt"):
+        path = ngg_path.parent / f"{name}.npy"
+        if path.exists():
+            d = np.load(path)[~np.eye(ngg.shape[0], dtype=bool)]
+            d = d[np.isfinite(d)]
+            stats[f"mean_{name}"] = float(d.mean()) if d.size else float("nan")
+    return stats
 
 
 def run(args: argparse.Namespace) -> None:
@@ -81,6 +92,8 @@ def run(args: argparse.Namespace) -> None:
         passthrough += ["--error_metric", args.error_metric]
     if args.w1_agg:
         passthrough += ["--w1_agg", args.w1_agg]
+    if args.e_s_ref:
+        passthrough += ["--e_s_ref", args.e_s_ref]
     if args.dedup:
         passthrough += ["--dedup", args.dedup]
     if args.legacy_schema:
@@ -132,7 +145,7 @@ def run(args: argparse.Namespace) -> None:
     # Write summary.csv
     summary_path = out_root / "summary.csv"
     if summary_rows:
-        fieldnames = list(summary_rows[0].keys())
+        fieldnames = list(dict.fromkeys(k for r in summary_rows for k in r))
         # make sure every row has all keys
         for r in summary_rows:
             for k in fieldnames:
@@ -171,6 +184,7 @@ def parse_args() -> argparse.Namespace:
     # None means 'use compute_ngg.py's own default'.
     p.add_argument("--error_metric", default=None)
     p.add_argument("--w1_agg", default=None)
+    p.add_argument("--e_s_ref", default=None, choices=[None, "baseline", "own"])
     p.add_argument("--dedup", default=None, choices=[None, "mean", "last", "first"])
     p.add_argument("--legacy_schema", action="store_true")
     return p.parse_args()

@@ -9,10 +9,10 @@ and periodically purged, `~` is small.
 
 ## Hard rules
 
-1. **Nothing that imports torch or touches the data runs outside a job.** There is no
-   Python on the login node at all: the container is arm64 (GH200) and the login node is
-   amd64, so `singularity exec` fails there. Syntax checks, file listings, log tails and
-   text edits are fine. The login node is shared with the whole faculty.
+1. **Nothing that imports torch or touches the data runs outside a job.** The login node
+   has the dl-torch env's `python` on PATH; do not run it there. Syntax checks, file
+   listings, log tails and text edits are fine. The login node is shared with the whole
+   faculty.
 2. **Never submit a job without showing me the command first and waiting for a yes.**
    Print the `sbatch` line, the resource request and how many runs the script will loop
    over. One phase-2 run is about 1.5 GPU-hours against a shared allocation.
@@ -26,13 +26,57 @@ and periodically purged, `~` is small.
    `results/`, or job logs.
 7. **No `rm -rf`, no `rm` on anything under `/work` or `/scratch`.** To get rid of
    something, move it to a `_trash/` folder in the same tree and tell me.
-8. **Always run python through the Singularity container, inside a job**, never the bare
-   interpreter. `singularity` is not on PATH until `module load singularityce/4.1.0`.
+8. **Run python only inside a job, through `scripts/python_env.sh`.** On x86 nodes that
+   is the dl-torch mamba env, called by absolute path; on `gpu-gh` it is the GH200
+   Singularity container (the env is x86 only). Job scripts `source` it and call
+   `run_python`; GPU jobs also call `require_cuda`, which aborts if torch cannot see a
+   GPU, because `evaluate.py` silently falls back to CPU.
+
+## Partitions and Python
+
+Experiments run on the `gpu` partition (7 x86 nodes × 2 A100, **40 GB**). The GH200
+partition `gpu-gh` is one node with one GPU; use it only when the A100s cannot do the job
+(fall back with `sbatch --partition gpu-gh --mem 0 ...`). CPU-only jobs such as
+`scripts/ngg.sh` run on `cpu`. `scripts/python_env.sh` picks the interpreter from
+`uname -m`:
+
+```
+x86_64   (gpu, gpu-h100, gpu-l40, cpu)   /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/mamba_root/envs/dl-torch/bin/python
+aarch64  (gpu-gh)                        singularity exec --nv /users/fquareng/singularity/dl_gh200.sif python
+```
+
+The two stacks differ, and results trained on one are compared with the other:
+
+```
+             dl-torch (x86)       GH200 container
+python       3.14                 3.12
+torch        2.13.0+cu132         2.9.0a0 (nv25.09)
+numpy        2.5.2                2.1.0
+xarray       2026.7.0             2025.10.1
+zarr         3.3.0                2.18.7
+```
+
+The dl-torch env has two numpy dist-infos (2.4.4 and 2.5.2); the installed files are
+2.5.2. On `gpu-gh`, `module load singularityce/4.1.0` fails ("unknown module") and
+`singularity` is already on PATH; `SINGULARITYENV_LD_PRELOAD` of the hpcx libraries is
+set only there. An x86 Singularity image was tried and abandoned on 2026-09-30: the
+unpinned recipe resolves xarray 2026.9 with zarr 2.18.7, which cannot open the data.
+
+QOS on `gpu` is chosen by the time limit: ≤ 12 h is `gpu-normal`, 6 GPUs per user at
+once; up to 3 days is `gpu-long`, 4 GPUs per user. Phase 2 therefore runs as a job array,
+one run per task, 12 h, 24 CPUs, 200 GB (two tasks per node). Phase 1 and the oracle loop
+over several runs and are submitted with `--time 72:00:00`.
+
+Phase 1, the oracles and joint_ot for seeds 42/43/44 were trained on GH200 with the
+container; the other phase-2 methods on A100 with dl-torch. That hardware-and-software
+split lines up with the method comparison. It is checked by one A100/dl-torch re-run of
+seed-42 europe→horn joint_ot (`unet_seed42_a100check/`) against the GH200 seed spread;
+see PLAN.md for the outcome.
 
 ## Paths
 
 ```
-CONTAINER   /users/fquareng/singularity/dl_gh200.sif
+PYTHON      see "Partitions and Python"
 CODE_ROOT   /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda
 DATA_ROOT   /work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift   # read-only
 OUTPUT_DIR  /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda/unet_seed${SEED}
@@ -41,8 +85,9 @@ OUTPUT_DIR  /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift
 Run python as:
 
 ```
-module load singularityce/4.1.0
-singularity exec --nv "${CONTAINER}" python "${CODE_ROOT}/<script>.py" ...
+source "${CODE_ROOT}/scripts/python_env.sh"
+require_cuda                     # GPU jobs only
+run_python "${CODE_ROOT}/<script>.py" ...
 ```
 
 Domains: `europe_west`, `horn-of-africa`, `melanesia`. `blacksea` is a dummy — ignore it.
@@ -81,14 +126,17 @@ Seeds: 42, 43, 44.
   (512×12×12, then GAP'd) is used. coral and mmd do exactly the same, joint_ot uses the
   prediction; none of them is lighter than DANN. `run_training` also clamps DANN to
   `batch_size ≤ 128`.
-- **The validation split depends on the seed.** All three domains have 877 chunks, so
-  stride = 877/88 ≈ 9.97 and the offset is `seed % int(stride)` = `seed % 9`
-  (`dataset_zarr.py:216`). Seeds 42/43/44 get offsets 6/7/8: three validation sets
-  shifted by one chunk (200 h) from each other. 42's and 44's validation chunks are each
-  in the other's training set; 43's sit in both their purge gaps. Seed error bars
-  therefore mix initialisation variance with a small, autocorrelated split variance, and
-  seeds that are equal mod 9 (e.g. 42 and 51) get the identical split. The test split
-  does not depend on the seed.
+- **`--seed` does not reach the dataset.** `ClimateSRDatasetZarr` has its own
+  `seed=42` default, which sets both the validation offset (`seed % int(stride)` =
+  `seed % 9`, `dataset_zarr.py:216`) and the shuffle RNG (`dataset_zarr.py:316`, and
+  `:388` for the joint dataset). Neither `train_unet.py` nor `train_afm.py` passes
+  `seed=` to it; `--seed` only reaches `torch.manual_seed`. So every run to date,
+  seeds 42/43/44 alike, has the same validation split (offset 6) and the same data order,
+  and seed error bars measure initialisation variance only. Found 2026-09-30, after the
+  seeded runs; left as is so that all seeded runs stay comparable. Passing the seed
+  through would give seeds 42/43/44 offsets 6/7/8 (splits one chunk apart) and
+  different data orders, and would make new runs incomparable with the existing ones.
+  The test split does not depend on the seed either way.
 - **The residual UNet lost its A/B and was removed.** Do not reintroduce it.
 - **The validation split is strided with a purge gap, `val_chunks=88`.** Do not switch it
   back to a contiguous tail split; the series is autocorrelated.

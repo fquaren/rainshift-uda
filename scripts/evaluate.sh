@@ -17,22 +17,26 @@
 #SBATCH --output outputs/%j
 #SBATCH --error  job_errors/%j
 
-#SBATCH --partition gpu-gh
+# Default: one A100 on the gpu partition. To fall back to the GH200 node:
+# sbatch --partition gpu-gh --mem 0 ...
+#SBATCH --partition gpu
 #SBATCH --gres gpu:1
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task 12
-#SBATCH --mem 0
+#SBATCH --mem 200G
 #SBATCH --time 24:00:00
+
+# singularity is on PATH on the GPU nodes; load the module only if it is not.
+command -v singularity >/dev/null || module load singularityce/4.1.0
 
 set -euo pipefail
 
-export SINGULARITY_BINDPATH="/work,/scratch,/users"
-export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/lib/libucp.so.0:/opt/hpcx/ucx/lib/libucs.so.0"
-
-CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
 CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
+# dl-torch mamba env on x86 nodes, the GH200 container on gpu-gh.
+source "${CODE_ROOT}/scripts/python_env.sh"
+require_cuda
 OUTPUT_DIR="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda"
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift"
 
@@ -66,10 +70,6 @@ TRANSFORMS=("none") # "qm_precip" "qm_tp" "qm_all" "ot")
 # AFM probabilistic settings
 N_ENSEMBLE=16
 SAMPLE_STEPS=20
-
-run_python() {
-    singularity exec --nv "${CONTAINER}" python "$@"
-}
 
 # -------------------------------------------------------------------
 #  UNet: deterministic evaluation across all transforms
@@ -177,6 +177,9 @@ echo ""
 
 # -------------------------------------------------------------------
 #  NGG Computation
+#  E_S is the source-only in-domain risk for every method (--e_s_ref
+#  baseline). Output goes to ngg_v2/: the old ngg/ trees used the method's
+#  own E_S, which rewards source degradation, and are left as they are.
 # -------------------------------------------------------------------
 echo "=== Computing NGG ==="
 for model in "unet"; do # "afm"
@@ -189,7 +192,8 @@ for model in "unet"; do # "afm"
             --model "${model}" \
             --error_metric "mse_std" \
             --w1_agg "mean_inputs" \
-            --output_root "${RESULTS_DIR}/ngg/${model}_${tf}"
+            --e_s_ref "baseline" \
+            --output_root "${RESULTS_DIR}/ngg_v2/${model}_${tf}"
     done
 done
 

@@ -28,13 +28,19 @@ models/
   unet.py                 DualEncoderUNet
   afm.py                  AFMModel (encoder + flow UNet)
 scripts/
-  run_exp_unet.sh         two-phase SLURM launcher (UNet)
-  run_exp_afm.sh          two-phase SLURM launcher (AFM)
-  evaluate.sh             batch evaluation
+  python_env.sh           sourced by every job: picks the interpreter per node
+  run_exp_unet.sh         UNet phases 1 / 2 / oracle (phase 2 as a job array)
+  run_exp_afm.sh          AFM phases (not yet seeded or ported, see PLAN.md)
+  materialise_baselines.sh  pair-named copies of the source-only models
+  evaluate.sh             batch evaluation + NGG, one seed per job
+  ngg.sh                  recompute NGG from existing results.csv (CPU)
+launch_sbatch.sh          submits the UNet pipeline per seed, stages chained
 uda.py                    all UDA methods
-train_unet.py             UNet training + Optuna
-train_afm.py              AFM training + Optuna
+train_unet.py             UNet training
+train_afm.py              AFM training
 evaluate.py               single/batch evaluation
+compute_ngg.py            NGG for one (model, method, transform)
+compute_ngg_all.py        NGG for every method in a results.csv
 ```
 
 ## Quick start
@@ -72,20 +78,36 @@ python evaluate.py batch \
     --output_dir experiments/results
 ```
 
-## SLURM (full grid)
+## SLURM (full grid, curnagl)
+
+Jobs run on the `gpu` partition (A100 40 GB) with the dl-torch mamba env; the
+GH200 node (`gpu-gh`) is a fallback and uses the Singularity container. See
+CLAUDE.md, "Partitions and Python".
 
 ```bash
-# Phase 1 then phase 2 with dependency chain
-P1=$(PHASE=1 sbatch --parsable scripts/run_exp_unet.sh)
-PHASE=2 sbatch --dependency=afterok:${P1} scripts/run_exp_unet.sh
+# Print the plan, then submit. Per seed: phase 1 -> materialise -> oracle ->
+# phase 2 (array, one run per task) -> evaluate, chained with afterok.
+DRY=1 ./launch_sbatch.sh
+./launch_sbatch.sh                                   # seeds 42 43 44, all stages
+STAGES="4 5" SEEDS="42" METHODS="dann mmd" ./launch_sbatch.sh   # resume partway
 
-# Same for AFM
-P1=$(PHASE=1 sbatch --parsable scripts/run_exp_afm.sh)
-PHASE=2 sbatch --dependency=afterok:${P1} scripts/run_exp_afm.sh
-
-# Evaluate everything
-sbatch scripts/evaluate.sh
+# Recompute NGG from existing results (CPU job)
+SEEDS="42 43 44" sbatch scripts/ngg.sh
 ```
+
+Outputs: checkpoints in `results_rainshift_uda/unet_seed<N>/` and
+`unet_seed<N>_oracle/`, metrics in `results/seed<N>/unet/{none,oracle}/results.csv`,
+NGG in `results/seed<N>/ngg_v2/`.
+
+## NGG
+
+`NGG_m(S, T) = (E_T(f_m) − E_S(f_S^none)) / (W1(S, T) + ε)`, with E the
+standardised MSE (`mse_std`). E_S is the source-only in-domain risk for every
+method, so a method cannot lower its NGG by degrading its source fit
+(`--e_s_ref own` reproduces the earlier definition). `delta_src.npy` and
+`delta_tgt.npy` hold the source inflation and target change against
+source-only. Report `mse_std`; the mm-space RMSE is dominated by a few
+exploding pixels and is not stable across seeds.
 
 ## Domain difficulty ranking
 

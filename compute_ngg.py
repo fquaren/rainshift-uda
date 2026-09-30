@@ -2,11 +2,28 @@
 Normalised Generalisation Gap (NGG) for deterministic domain transfer on the
 RainShift benchmark.
 
-For a model f_S trained on source S and evaluated on target T,
+For a model f trained on source S (source-only or with a UDA method m) and
+evaluated on target T,
 
-    NGG(S, T) = ( E_T(f_S) - E_S(f_S) ) / ( W1(S, T) + eps )
+    NGG_m(S, T) = ( E_T(f_m) - E_S(f_S^none) ) / ( W1(S, T) + eps )
 
-where E is MSE (the training loss family), W1 is the per-variable 1D
+where f_S^none is the source-only model on S, so the reference E_S is the
+same for every method. The numerator is how far method m's target risk sits
+above the in-domain risk that is achievable on S. An earlier definition used
+the method's own source risk E_S(f_m); a method that degraded its source fit
+then lowered its NGG without improving the target, which rewards exactly the
+source/target trade the diagnosis is meant to expose. That definition is kept
+as --e_s_ref own for reproducing old numbers. For m = none both definitions
+coincide, because the off-diagonal source-only checkpoints are byte-identical
+copies of the diagonal one.
+
+Alongside NGG the script saves the two components of the trade, both relative
+to the source-only model on the same (S, T) cell:
+
+    delta_src(S, T) = E_S(f_m) - E_S(f_S^none)    (source inflation)
+    delta_tgt(S, T) = E_T(f_m) - E_T(f_S^none)    (target change; < 0 is a gain)
+
+E is MSE (the training loss family), W1 is the per-variable 1D
 Wasserstein distance computed on domain-normalised pixel distributions, and
 
     eps = 0.1 * min_{S != T, W1(S, T) > 0} W1(S, T)
@@ -233,8 +250,15 @@ def compute_ngg_new(
     w1: np.ndarray,
     domains: list,
     errors: dict,
+    e_s_ref: dict = None,
 ) -> tuple:
-    """New schema: both E_S and E_T come from the same (S, T) row."""
+    """
+    New schema: E_T comes from the (S, T) row of the method.
+
+    With `e_s_ref` ({source: E_S(f_S^none)}), E_S is that fixed source-only
+    reference. Without it, E_S is the method's own src_ column on the same row
+    (the old definition).
+    """
     n = len(domains)
     eps = _compute_epsilon(w1)
     ngg = np.full((n, n), np.nan, dtype=np.float64)
@@ -248,13 +272,33 @@ def compute_ngg_new(
             if key not in errors:
                 missing_pairs.append(key)
                 continue
-            e_s, e_t = errors[key]
+            e_s_own, e_t = errors[key]
+            e_s = e_s_own if e_s_ref is None else e_s_ref.get(s, np.nan)
             w = w1[i, j]
             if not np.isfinite(w):
                 continue
             ngg[i, j] = (e_t - e_s) / (w + eps)
 
     return ngg, eps, missing_pairs
+
+
+def compute_deltas(domains: list, errors: dict, baseline: dict) -> tuple:
+    """
+    Source inflation and target change of a method against the source-only
+    model on the same (S, T) cell. NaN where either row is missing.
+    """
+    n = len(domains)
+    d_src = np.full((n, n), np.nan, dtype=np.float64)
+    d_tgt = np.full((n, n), np.nan, dtype=np.float64)
+    for i, s in enumerate(domains):
+        for j, t in enumerate(domains):
+            if i == j or (s, t) not in errors or (s, t) not in baseline:
+                continue
+            e_s, e_t = errors[(s, t)]
+            b_s, b_t = baseline[(s, t)]
+            d_src[i, j] = e_s - b_s
+            d_tgt[i, j] = e_t - b_t
+    return d_src, d_tgt
 
 
 def compute_ngg_legacy(
@@ -352,6 +396,7 @@ def run(args: argparse.Namespace) -> None:
     idx = [w1_domains.index(d) for d in domains]
     w1 = w1_full[np.ix_(idx, idx)]
 
+    baseline = None
     if args.legacy_schema:
         ngg, eps, missing_self = compute_ngg_legacy(w1, domains, errors)
         if missing_self:
@@ -364,7 +409,27 @@ def run(args: argparse.Namespace) -> None:
                 "re-export results.csv and drop --legacy_schema."
             )
     else:
-        ngg, eps, missing_pairs = compute_ngg_new(w1, domains, errors)
+        e_s_ref = None
+        if args.e_s_ref == "baseline":
+            # Source-only rows from the same CSV, whatever --method is. The
+            # (S, S) row gives the in-domain reference E_S(f_S^none).
+            baseline = _load_error_table(
+                Path(args.results_csv),
+                args.model,
+                "none",
+                args.transform,
+                args.error_metric,
+                False,
+                args.dedup,
+            )
+            e_s_ref = {s: baseline[(s, s)][0] for s in domains if (s, s) in baseline}
+            missing_ref = [s for s in domains if s not in e_s_ref]
+            if missing_ref:
+                raise RuntimeError(
+                    f"--e_s_ref baseline needs the source-only (S, S) row for "
+                    f"every source; missing for {missing_ref} in {args.results_csv}."
+                )
+        ngg, eps, missing_pairs = compute_ngg_new(w1, domains, errors, e_s_ref)
         if missing_pairs:
             n_expected = len(domains) * (len(domains) - 1)
             print(
@@ -375,11 +440,16 @@ def run(args: argparse.Namespace) -> None:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     np.save(out / "ngg_matrix.npy", ngg)
+    if baseline is not None:
+        d_src, d_tgt = compute_deltas(domains, errors, baseline)
+        np.save(out / "delta_src.npy", d_src)
+        np.save(out / "delta_tgt.npy", d_tgt)
     (out / "ngg_meta.json").write_text(
         json.dumps(
             {
                 "domains": domains,
                 "epsilon": eps,
+                "e_s_ref": None if args.legacy_schema else args.e_s_ref,
                 "w1_agg": args.w1_agg,
                 "error_metric": args.error_metric,
                 "error_is_mse_like": _squared(args.error_metric),
@@ -398,7 +468,8 @@ def run(args: argparse.Namespace) -> None:
     title = (
         f"NGG  model={args.model}  method={args.method}  "
         f"transform={args.transform}\n"
-        f"W1 agg = {args.w1_agg}   error from {args.error_metric}"
+        f"W1 agg = {args.w1_agg}   error from {args.error_metric}   "
+        f"E_S ref = {'legacy' if args.legacy_schema else args.e_s_ref}"
     )
     plot_heatmap(ngg, domains, title, out / "ngg_heatmap.png")
 
@@ -417,6 +488,13 @@ def run(args: argparse.Namespace) -> None:
         m = row_mean[i]
         tag = "     nan" if np.isnan(m) else f"{m:8.3f}"
         print(f"  {r:2d}. {domains[i]:24s}  mean NGG = {tag}")
+
+    if baseline is not None and args.method != "none":
+        print(f"\nTrade against source-only ({args.error_metric}; delta_tgt < 0 is a target gain):")
+        for i, s in enumerate(domains):
+            for j, t in enumerate(domains):
+                if i != j and np.isfinite(d_src[i, j]):
+                    print(f"  {s:>16s} -> {t:<16s}  delta_src = {d_src[i, j]:+.4f}   " f"delta_tgt = {d_tgt[i, j]:+.4f}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -438,6 +516,14 @@ def parse_args() -> argparse.Namespace:
         help="Base metric name without src_/tgt_ prefix. "
         "mse_std matches the training loss exactly; "
         "rmse_mm is squared to produce MSE in mm^2",
+    )
+    p.add_argument(
+        "--e_s_ref",
+        default="baseline",
+        choices=["baseline", "own"],
+        help="E_S in the NGG numerator: 'baseline' is the source-only in-domain "
+        "risk E_S(f_S^none), the same for every method; 'own' is the method's "
+        "own source risk (the old definition, which rewards source degradation)",
     )
     p.add_argument("--w1_agg", default="mean_inputs", help="(V,D,D) -> (D,D) aggregation")
     p.add_argument(

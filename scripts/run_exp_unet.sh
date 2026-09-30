@@ -25,30 +25,40 @@
 #SBATCH --output outputs/%j
 #SBATCH --error  job_errors/%j
 
-#SBATCH --partition gpu-gh
+# Default: one A100 on the gpu partition, half a node, so two runs share a
+# node. <= 12 h keeps the job in the gpu-normal QOS (6 GPUs per user); a
+# GH200 epoch takes ~440 s, so even 25 epochs fit on an A100 unless it is
+# more than ~4x slower. Phase 1 and oracle loop over several runs and need
+# the long limit: pass --time 72:00:00 on the sbatch line.
+# To fall back to the GH200 node: sbatch --partition gpu-gh --mem 0 ...
+#SBATCH --partition gpu
 #SBATCH --gres gpu:1
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task 24
-#SBATCH --mem 0
-#SBATCH --time 72:00:00
+#SBATCH --mem 200G
+#SBATCH --time 12:00:00
+
+# singularity is on PATH on the GPU nodes; load the module only if it is not.
+command -v singularity >/dev/null || module load singularityce/4.1.0
 
 set -euo pipefail
 
-export SINGULARITY_BINDPATH="/work,/scratch,/users"
-export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/lib/libucp.so.0:/opt/hpcx/ucx/lib/libucs.so.0"
-
 # --- Configuration --------------------------------------------------------
-CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
 CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
+# dl-torch mamba env on x86 nodes, the GH200 container on gpu-gh.
+source "${CODE_ROOT}/scripts/python_env.sh"
+require_cuda
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift"
 # Seed. Every run of every phase is tagged by it, and each seed gets its OWN
 # output tree, so repeated seeds never overwrite one another's checkpoints,
 # base_hp, best_hp or oracle directories. Launch one job per seed.
 SEED="${SEED:-42}"
 OUTPUT_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda"
-OUTPUT_DIR="${OUTPUT_ROOT}/unet_seed${SEED}"
+# OUTPUT_SUFFIX sends a run to a side tree, e.g. _a100check for the hardware
+# calibration, so it cannot collide with the checkpoints in unet_seed<N>/.
+OUTPUT_DIR="${OUTPUT_ROOT}/unet_seed${SEED}${OUTPUT_SUFFIX:-}"
 DATA_FORMAT="npy"
 
 PHASE="${PHASE:-1}"
@@ -76,7 +86,13 @@ TARGET_REGIONS=(
 
 # Bash arrays are whitespace-delimited: NO commas, or each element keeps a
 # trailing comma and argparse --uda_method choices rejects it.
-METHODS=("joint_ot") # "dann" "mmd" "spectral" "fda" "adabn")
+METHODS=("fda" "spectral" "adabn" "dann" "mmd") # done: "joint_ot"
+# Space-separated override from the environment, e.g. METHODS_ENV="joint_ot".
+if [[ -n "${METHODS_ENV:-}" ]]; then
+    read -ra METHODS <<< "${METHODS_ENV}"
+fi
+# Optional restriction to one pair, e.g. PAIR_ENV="europe_west|horn-of-africa".
+PAIR_ENV="${PAIR_ENV:-}"
 # Dropped: "coral" (subsumed by MMD, mean-blind, weakly scaled) and
 # "mmd_ms" (same mechanism as MMD, unstable). joint_ot = DeepJDOT, the
 # only method aligning the JOINT distribution and so the only one that
@@ -96,9 +112,6 @@ DANN_WEIGHT=5e-4
 
 # --------------------------------------------------------------------------
 
-run_python() {
-    singularity exec --nv "${CONTAINER}" python "$@"
-}
 
 # ===========================================================================
 #  PHASE 1: source-only baselines — ONE RUN PER SOURCE DOMAIN
@@ -173,8 +186,14 @@ elif [[ "${PHASE}" == "2" ]]; then
     for src in "${SOURCE_REGIONS[@]}"; do
         for tgt in "${TARGET_REGIONS[@]}"; do
             [[ "$src" == "$tgt" ]] && continue
+            [[ -n "${PAIR_ENV}" && "${src}|${tgt}" != "${PAIR_ENV}" ]] && continue
 
             HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
+            # A side tree (OUTPUT_SUFFIX) reuses the seed's own phase-1 HPs.
+            MAIN_HP="${OUTPUT_ROOT}/unet_seed${SEED}/base_hp/${src}__to__${tgt}.json"
+            if [[ ! -f "${HP_FILE}" && -n "${OUTPUT_SUFFIX:-}" && -f "${MAIN_HP}" ]]; then
+                cp "${MAIN_HP}" "${HP_FILE}"
+            fi
             if [[ ! -f "${HP_FILE}" ]]; then
                 echo "WARNING: Missing base HPs for ${src} -> ${tgt}, skipping."
                 continue
@@ -186,9 +205,19 @@ elif [[ "${PHASE}" == "2" ]]; then
         done
     done
 
-    echo "=== PHASE 2: Fixed UDA training ==="
-    
-    for i in "${!RUNS[@]}"; do
+    echo "=== PHASE 2: Fixed UDA training (${#RUNS[@]} runs: ${METHODS[*]}) ==="
+
+    # As a job array, each task trains exactly one run, RUNS[task id]. The
+    # order is fixed (source, target, method), so --array=0-$((N-1)) with
+    # N = 6 pairs x |METHODS| covers every run once.
+    INDICES=("${!RUNS[@]}")
+    if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        (( SLURM_ARRAY_TASK_ID < ${#RUNS[@]} )) || {
+            echo "ERROR: array task ${SLURM_ARRAY_TASK_ID} >= ${#RUNS[@]} runs"; exit 1; }
+        INDICES=("${SLURM_ARRAY_TASK_ID}")
+    fi
+
+    for i in "${INDICES[@]}"; do
         IFS='|' read -r src tgt method <<< "${RUNS[$i]}"
         echo "--- [$((i+1))/${#RUNS[@]}] ${src} -> ${tgt} | ${method} ---"
 

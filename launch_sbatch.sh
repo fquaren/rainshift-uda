@@ -41,6 +41,11 @@ SCRIPTS="${SCRIPTS:-scripts}"
 PATIENCE_TRAIN="${PATIENCE_TRAIN:-5}"
 PATIENCE_ORACLE="${PATIENCE_ORACLE:-8}"
 
+# Phase 2 runs as a job array, one run per task: 6 pairs x |METHODS|.
+METHODS="${METHODS:-fda spectral adabn dann mmd}"
+read -ra _methods <<< "${METHODS}"
+N_PHASE2=$(( 6 * ${#_methods[@]} ))
+
 DRY="${DRY:-}"
 
 has_stage() { [[ " ${STAGES} " == *" $1 "* ]]; }
@@ -70,7 +75,7 @@ for SEED in ${SEEDS}; do
     if has_stage 1; then
         jid=$(submit "phase1  (baselines)" \
               env SEED="${SEED}" PATIENCE="${PATIENCE_TRAIN}" PHASE=1 \
-              sbatch --parsable ${dep} "${SCRIPTS}/run_exp_unet.sh")
+              sbatch --parsable --time 72:00:00 ${dep} "${SCRIPTS}/run_exp_unet.sh")
         dep="--dependency=afterok:${jid}"
     fi
 
@@ -87,14 +92,15 @@ for SEED in ${SEEDS}; do
     if has_stage 3; then
         jid=$(submit "oracle  (joint training)" \
               env SEED="${SEED}" PATIENCE="${PATIENCE_ORACLE}" PHASE=oracle \
-              sbatch --parsable ${dep} "${SCRIPTS}/run_exp_unet.sh")
+              sbatch --parsable --time 72:00:00 ${dep} "${SCRIPTS}/run_exp_unet.sh")
         dep="--dependency=afterok:${jid}"
     fi
 
     if has_stage 4; then
-        jid=$(submit "phase2  (UDA methods)" \
-              env SEED="${SEED}" PATIENCE="${PATIENCE_TRAIN}" PHASE=2 \
-              sbatch --parsable ${dep} "${SCRIPTS}/run_exp_unet.sh")
+        # afterok on an array job id waits for every task to succeed.
+        jid=$(submit "phase2  (UDA methods, array of ${N_PHASE2})" \
+              env SEED="${SEED}" PATIENCE="${PATIENCE_TRAIN}" PHASE=2 METHODS_ENV="${METHODS}" \
+              sbatch --parsable --array=0-$(( N_PHASE2 - 1 )) ${dep} "${SCRIPTS}/run_exp_unet.sh")
         dep="--dependency=afterok:${jid}"
     fi
 
