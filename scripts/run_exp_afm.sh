@@ -1,12 +1,21 @@
 #!/bin/bash -l
 # ===========================================================================
-#  RainShift UDA — AFM two-phase experiments
+#  RainShift UDA — AFM (flow matching) experiments, per seed.
 #
-#  PHASE 1: Baseline training on vanilla model.
-#  PHASE 2: Standard training for UDA methods.
+#  Mirrors run_exp_unet.sh so the two arms differ only in the model:
+#    PHASE=1       source-only baselines, one run per source domain
+#    PHASE=2       UDA methods; as a job array, one run per task
+#    PHASE=oracle  joint source+target training, separate _oracle tree
 #
-#  Usage: PHASE=1 sbatch scripts/run_exp_afm.sh
-#         PHASE=2 sbatch scripts/run_exp_afm.sh
+#  Output tree: afm_seed${SEED}${OUTPUT_SUFFIX}/ (and ..._oracle/), the tree
+#  evaluate.sh reads. Run tags are afm_{src}__to__{tgt}__{method}.
+#  After PHASE=1, run materialise_baselines.sh with MODEL=afm.
+#
+#  Usage:
+#    SEED=42 PHASE=1 sbatch --time 72:00:00 scripts/run_exp_afm.sh
+#    SEED=42 PHASE=2 METHODS_ENV="fda spectral" sbatch --array=0-11 scripts/run_exp_afm.sh
+#    SEED=42 PHASE=oracle sbatch --time 72:00:00 scripts/run_exp_afm.sh
+#  Smoke test (2 epochs, few chunks, side tree): see scripts/smoke_afm.sh.
 # ===========================================================================
 
 #SBATCH --account tbeucler_downscaling
@@ -18,140 +27,147 @@
 #SBATCH --output outputs/%j
 #SBATCH --error  job_errors/%j
 
-#SBATCH --partition gpu-gh
+# Same defaults as run_exp_unet.sh: one A100 (40 GB), half a node, <= 12 h.
+# To fall back to the GH200 node: sbatch --partition gpu-gh --mem 0 ...
+#SBATCH --partition gpu
 #SBATCH --gres gpu:1
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task 24
-#SBATCH --mem 0
-#SBATCH --time 72:00:00
+#SBATCH --mem 200G
+#SBATCH --time 12:00:00
+
+# singularity is only needed on gpu-gh; load the module only if it is missing.
+command -v singularity >/dev/null || module load singularityce/4.1.0
 
 set -euo pipefail
 
-export SINGULARITY_BINDPATH="/work,/scratch,/users"
-export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/lib/libucp.so.0:/opt/hpcx/ucx/lib/libucs.so.0"
-
-CONTAINER="/users/fquareng/singularity/dl_gh200.sif"
 CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
+# dl-torch mamba env on x86 nodes, the GH200 container on gpu-gh.
+source "${CODE_ROOT}/scripts/python_env.sh"
+require_cuda
+
 DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift"
-OUTPUT_DIR="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda/afm"
+SEED="${SEED:?SEED must be set, e.g. SEED=42}"
+OUTPUT_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda"
+OUTPUT_DIR="${OUTPUT_ROOT}/afm_seed${SEED}${OUTPUT_SUFFIX:-}"
 DATA_FORMAT="npy"
 
 PHASE="${PHASE:-1}"
-echo "Selected PHASE: ${PHASE}"
+echo "Selected PHASE: ${PHASE}  SEED: ${SEED}"
+echo "Output tree:    ${OUTPUT_DIR}"
 
-mkdir -p "${OUTPUT_DIR}/base_hp"
-mkdir -p "${OUTPUT_DIR}/best_hp"
+mkdir -p "${OUTPUT_DIR}/base_hp" "${OUTPUT_DIR}/best_hp"
 
+DOMAINS=("europe_west" "horn-of-africa" "melanesia")
 
-SOURCE_REGIONS=(
-    "europe_west"
-    # "blacksea"
-    "horn-of-africa"
-    "melanesia"
-)
+# Bash arrays are whitespace-delimited: NO commas.
+# Default is the full set; restrict to the Stage 2 survivors with METHODS_ENV.
+METHODS=("fda" "spectral" "adabn" "dann" "mmd" "joint_ot")
+if [[ -n "${METHODS_ENV:-}" ]]; then
+    read -ra METHODS <<< "${METHODS_ENV}"
+fi
+# Optional restriction to one pair, e.g. PAIR_ENV="europe_west|horn-of-africa".
+PAIR_ENV="${PAIR_ENV:-}"
 
-TARGET_REGIONS=(
-    "europe_west"
-    # "blacksea"
-    "horn-of-africa"
-    "melanesia"
-)
+EPOCHS="${EPOCHS:-25}"
+# Early stopping as in the UNet arm: 5 for phase 1 and 2, 8 for the oracle.
+PATIENCE="${PATIENCE:-5}"
+PATIENCE_ORACLE="${PATIENCE_ORACLE:-8}"
+NUM_WORKERS=12
+# Phase 1 sets these; phase 2 and the oracle read them back from base_hp/.
+BATCH_SIZE="${BATCH_SIZE:-512}"
+# train_afm.py's own default, kept explicit. NOT tuned: flow net at LR,
+# encoder at LR/10. --weight_decay is ignored by train_afm.build_optimizer,
+# which hard-codes per-group weight decay.
+LR="${LR:-1e-5}"
 
-# Bash arrays are whitespace-delimited: NO commas, or each element keeps a
-# trailing comma and argparse --uda_method choices rejects it.
-METHODS=("joint_ot" "dann" "mmd" "spectral" "fda" "adabn")
-# Dropped: "coral" (subsumed by MMD, mean-blind, weakly scaled) and
-# "mmd_ms" (same mechanism as MMD, unstable). joint_ot = DeepJDOT, the
-# only method aligning the JOINT distribution and so the only one that
-# can address conditional shift.
-
-EPOCHS=25
-PATIENCE="${PATIENCE:--1}"
-NUM_WORKERS=24
-BATCH_SIZE=512
-
+# UDA settings identical to run_exp_unet.sh.
 FDA_BETA=0.01
 LAMBDA_UDA=0.1
+DANN_WEIGHT=5e-4
+JDOT_REG=0.001
 
-run_python() {
-    singularity exec --nv "${CONTAINER}" python "$@"
+# Smoke tests: cap the chunks per split.
+EXTRA=()
+if [[ -n "${SUBSET_CHUNKS:-}" ]]; then
+    EXTRA+=(--subset_chunks "${SUBSET_CHUNKS}")
+fi
+
+common_args() {
+    echo --data_format "${DATA_FORMAT}" --epochs "${EPOCHS}" \
+         --num_workers "${NUM_WORKERS}" --seed "${SEED}"
+}
+
+tag() { echo "afm_$1__to__$2__$3"; }
+
+# A run directory holding best.pt but no completion marker (best_hp/ or
+# base_hp/ JSON, or config.json, all written only after training ends) is a
+# run that died part-way. Retraining would overwrite that checkpoint, so stop
+# instead (CLAUDE.md rules 4 and 7).
+refuse_partial() {
+    if [[ -e "$1/best.pt" ]]; then
+        echo "ERROR: $1 holds a checkpoint from an unfinished run."
+        echo "       Move it to a _trash/ folder in the same tree, then rerun."
+        exit 1
+    fi
 }
 
 # ===========================================================================
-#  PHASE 1: source-only baselines — ONE RUN PER SOURCE DOMAIN
-#
-#  A source-only model never sees the target: with --uda_method none the
-#  target loader is built but never drawn from, so europe_west->horn and
-#  europe_west->melanesia train byte-identical weights. The old pair loop
-#  therefore trained each of the 3 models twice (4 of 6 runs were duplicate
-#  compute). We train 3 models and fan the resulting HP file out to the 6
-#  pair names that Phase 2 and evaluate.py look up.
-#
-#  target_path is set to the SOURCE itself rather than to a dummy domain:
-#    - weights are unchanged (target is unused),
-#    - tgt_mae then reports IN-DOMAIN test error, i.e. the diagonal of the
-#      3x3 transfer matrix, which the paper reports anyway,
-#    - the checkpoint dir is unambiguously {src}__to__{src}__none,
-#    - no I/O is wasted streaming a domain that is never used.
-#
-#  PATIENCE_P1 defaults to 5: validation bottoms out at epoch 3-6 on all
-#  three domains, so 25 epochs spends ~80% of the wall clock past the
-#  checkpoint that is actually selected.
+#  PHASE 1: source-only baselines, one run per source domain
+#  (see run_exp_unet.sh for why one run per source is exact).
 # ===========================================================================
 if [[ "${PHASE}" == "1" ]]; then
-    PATIENCE_P1="${PATIENCE_P1:-5}"
+    echo "=== AFM PHASE 1: source-only baselines (${#DOMAINS[@]} runs), patience=${PATIENCE} ==="
 
-    echo "=== PHASE 1: source-only baselines (${#SOURCE_REGIONS[@]} runs) ==="
-    echo "    patience=${PATIENCE_P1}"
-
-    for i in "${!SOURCE_REGIONS[@]}"; do
-        src="${SOURCE_REGIONS[$i]}"
-        echo "--- [$((i+1))/${#SOURCE_REGIONS[@]}] source=${src} ---"
+    for i in "${!DOMAINS[@]}"; do
+        src="${DOMAINS[$i]}"
+        echo "--- [$((i+1))/${#DOMAINS[@]}] source=${src} ---"
 
         HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${src}.json"
         if [[ -f "${HP_FILE}" ]]; then
             echo "  Base HPs already exist: ${HP_FILE}, skipping training."
         else
+            refuse_partial "${OUTPUT_DIR}/$(tag "${src}" "${src}" none)"
             run_python "${CODE_ROOT}/train_afm.py" \
                 --source_path "${DATA_ROOT}/${src}" \
                 --target_path "${DATA_ROOT}/${src}" \
                 --output_dir  "${OUTPUT_DIR}" \
-                --data_format "${DATA_FORMAT}" \
                 --uda_method  none \
-                --epochs      "${EPOCHS}" \
                 --batch_size  "${BATCH_SIZE}" \
-                --patience    "${PATIENCE_P1}" \
-                --num_workers "${NUM_WORKERS}" \
+                --lr          "${LR}" \
+                --patience    "${PATIENCE}" \
+                $(common_args) "${EXTRA[@]}" \
                 2>&1 | tee "${OUTPUT_DIR}/afm_phase1_${src}.log"
         fi
 
-        # Fan the source-keyed HP file out to every pair name. Phase 2's
-        # skip-guard and train_unet's own base-HP lookup both key on
-        # {src}__to__{tgt}.json, so without this Phase 2 finds nothing and
-        # silently skips every run.
+        # Fan the source-keyed HP file out to every pair name, which is what
+        # phase 2, the oracle and train_afm's base-HP lookup key on.
         if [[ -f "${HP_FILE}" ]]; then
-            for tgt in "${TARGET_REGIONS[@]}"; do
+            for tgt in "${DOMAINS[@]}"; do
                 [[ "$src" == "$tgt" ]] && continue
                 cp -f "${HP_FILE}" "${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
             done
-            echo "  Fanned base HPs out to $((${#TARGET_REGIONS[@]} - 1)) pair name(s)."
         else
-            echo "  WARNING: ${HP_FILE} not produced; Phase 2 will skip ${src}."
+            echo "  WARNING: ${HP_FILE} not produced; phase 2 will skip ${src}."
         fi
     done
-    echo "=== PHASE 1 complete ==="
+    echo "=== AFM PHASE 1 complete ==="
 
+# ===========================================================================
+#  PHASE 2: UDA methods, base HPs from phase 1. One run per array task.
+# ===========================================================================
 elif [[ "${PHASE}" == "2" ]]; then
     RUNS=()
-    for src in "${SOURCE_REGIONS[@]}"; do
-        for tgt in "${TARGET_REGIONS[@]}"; do
+    for src in "${DOMAINS[@]}"; do
+        for tgt in "${DOMAINS[@]}"; do
             [[ "$src" == "$tgt" ]] && continue
+            [[ -n "${PAIR_ENV}" && "${src}|${tgt}" != "${PAIR_ENV}" ]] && continue
             HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
             if [[ ! -f "${HP_FILE}" ]]; then
-                echo "WARNING: Missing base HPs for ${src} -> ${tgt}, using default."
-                continue
+                echo "ERROR: missing base HPs ${HP_FILE}; run PHASE=1 first."
+                exit 1
             fi
             for method in "${METHODS[@]}"; do
                 RUNS+=("${src}|${tgt}|${method}")
@@ -159,10 +175,16 @@ elif [[ "${PHASE}" == "2" ]]; then
         done
     done
 
-    echo "=== AFM PHASE 2: UDA training (Fixed Hyperparameters) ==="
-    echo "Total runs: ${#RUNS[@]}"
+    echo "=== AFM PHASE 2: ${#RUNS[@]} runs (${METHODS[*]}), patience=${PATIENCE} ==="
 
-    for i in "${!RUNS[@]}"; do
+    INDICES=("${!RUNS[@]}")
+    if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        (( SLURM_ARRAY_TASK_ID < ${#RUNS[@]} )) || {
+            echo "ERROR: array task ${SLURM_ARRAY_TASK_ID} >= ${#RUNS[@]} runs"; exit 1; }
+        INDICES=("${SLURM_ARRAY_TASK_ID}")
+    fi
+
+    for i in "${INDICES[@]}"; do
         IFS='|' read -r src tgt method <<< "${RUNS[$i]}"
         echo "--- [$((i+1))/${#RUNS[@]}] ${src} -> ${tgt} | ${method} ---"
 
@@ -171,76 +193,71 @@ elif [[ "${PHASE}" == "2" ]]; then
             echo "  Already done, skipping."
             continue
         fi
+        refuse_partial "${OUTPUT_DIR}/$(tag "${src}" "${tgt}" "${method}")"
 
         run_python "${CODE_ROOT}/train_afm.py" \
             --source_path "${DATA_ROOT}/${src}" \
             --target_path "${DATA_ROOT}/${tgt}" \
             --output_dir  "${OUTPUT_DIR}" \
-            --data_format "${DATA_FORMAT}" \
             --uda_method  "${method}" \
             --lambda_uda  "${LAMBDA_UDA}" \
             --fda_beta    "${FDA_BETA}" \
-            --epochs      "${EPOCHS}" \
+            --dann_weight "${DANN_WEIGHT}" \
+            --jdot_reg    "${JDOT_REG}" \
             --patience    "${PATIENCE}" \
-            --num_workers "${NUM_WORKERS}" \
+            $(common_args) "${EXTRA[@]}" \
             2>&1 | tee "${OUTPUT_DIR}/afm_phase2_${src}__to__${tgt}__${method}.log"
-        echo ""
     done
-    echo "=== AFM PHASE 2 complete ==="
 
 # ===========================================================================
-#  PHASE oracle: joint source+target training (upper bound on transfer).
-#  Produces E_T(h_joint) for the addressable-budget denominator. Written to a
-#  separate output dir to avoid colliding with Phase 1 source-only 'none'
-#  checkpoints. Evaluate on both source and target test sets afterwards.
+#  PHASE oracle: joint source+target training, kept in ${OUTPUT_DIR}_oracle
+#  so it cannot collide with the phase-1 __none checkpoints.
 # ===========================================================================
 elif [[ "${PHASE}" == "oracle" ]]; then
     ORACLE_DIR="${OUTPUT_DIR}_oracle"
     mkdir -p "${ORACLE_DIR}/base_hp"
 
     PAIRS=()
-    for src in "${SOURCE_REGIONS[@]}"; do
-        for tgt in "${TARGET_REGIONS[@]}"; do
+    for src in "${DOMAINS[@]}"; do
+        for tgt in "${DOMAINS[@]}"; do
             [[ "$src" == "$tgt" ]] && continue
+            [[ -n "${PAIR_ENV}" && "${src}|${tgt}" != "${PAIR_ENV}" ]] && continue
             PAIRS+=("${src}|${tgt}")
         done
     done
 
-    echo "=== AFM PHASE oracle: joint source+target training ==="
-    echo "Domain pairs: ${#PAIRS[@]}   output: ${ORACLE_DIR}"
+    echo "=== AFM PHASE oracle: ${#PAIRS[@]} pairs, patience=${PATIENCE_ORACLE}, output ${ORACLE_DIR} ==="
 
     for i in "${!PAIRS[@]}"; do
         IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
         echo "--- [$((i+1))/${#PAIRS[@]}] ${src} + ${tgt} (joint) ---"
 
-        DONE_MARKER="${ORACLE_DIR}/afm_${src}__to__${tgt}____none/best.pt"
-        if [[ -f "${DONE_MARKER}" ]]; then
-            echo "  Oracle checkpoint exists, skipping."
+        # config.json is written only after training ends; best.pt from the
+        # first epoch on, so it cannot tell a finished run from a killed one.
+        RUN_DIR="${ORACLE_DIR}/$(tag "${src}" "${tgt}" none)"
+        if [[ -f "${RUN_DIR}/config.json" ]]; then
+            echo "  Oracle run complete, skipping."
             continue
         fi
+        refuse_partial "${RUN_DIR}"
 
+        # Same base HPs as the source-only baseline (fair oracle comparison).
         HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
-        if [[ -f "${HP_FILE}" ]]; then
-            cp "${HP_FILE}" "${ORACLE_DIR}/base_hp/${src}__to__${tgt}.json"
-        else
-            echo "  WARNING: no base HPs for ${src}->${tgt}; oracle uses argparse defaults."
-        fi
+        [[ -f "${HP_FILE}" ]] || { echo "ERROR: missing ${HP_FILE}; run PHASE=1 first."; exit 1; }
+        cp "${HP_FILE}" "${ORACLE_DIR}/base_hp/${src}__to__${tgt}.json"
 
         run_python "${CODE_ROOT}/train_afm.py" \
             --source_path "${DATA_ROOT}/${src}" \
             --target_path "${DATA_ROOT}/${tgt}" \
             --output_dir  "${ORACLE_DIR}" \
-            --data_format "${DATA_FORMAT}" \
             --uda_method  none \
             --joint_training \
-            --epochs      "${EPOCHS}" \
-            --batch_size  "${BATCH_SIZE}" \
-            --patience    "${PATIENCE}" \
-            --num_workers "${NUM_WORKERS}" \
+            --patience    "${PATIENCE_ORACLE}" \
+            $(common_args) "${EXTRA[@]}" \
             2>&1 | tee "${ORACLE_DIR}/afm_oracle_${src}__to__${tgt}.log"
     done
     echo "=== AFM PHASE oracle complete ==="
 
 else
-    echo "ERROR: PHASE must be 1, 2, or oracle"; exit 1
+    echo "ERROR: PHASE must be 1, 2, or oracle (got: ${PHASE})"; exit 1
 fi

@@ -220,7 +220,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
     opt = build_optimizer(model, _lr, ep)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
 
-    tag = f"afm_{_tag(args.source_path, args.target_path)}____{args.uda_method}"
+    tag = f"afm_{_tag(args.source_path, args.target_path)}__{args.uda_method}"
     out = Path(args.output_dir) / tag
     out.mkdir(parents=True, exist_ok=True)
 
@@ -280,6 +280,10 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
         if args.patience > 0 and wait >= args.patience:
             print(f"Early stopping at epoch {epoch}")
             break
+
+    # Peak GPU memory of the whole run, for sizing jobs (A100s have 40 GB).
+    print(f"peak GPU memory: {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB "
+          f"(batch {_bs}, method {args.uda_method})")
 
     if args.uda_method == "adabn":
         if (out / "best.pt").exists():

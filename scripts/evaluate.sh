@@ -112,7 +112,7 @@ fi
 # -------------------------------------------------------------------
 #  AFM deterministic: across all transforms
 # -------------------------------------------------------------------
-# run_exp_afm.sh is not seeded yet (fixed afm/ tree), so this runs only once
+# run_exp_afm.sh writes afm_seed<N>/; this runs only once
 # an afm_seed<N>/ tree exists.
 if [[ -d "${AFM_DIR}" ]]; then
 for tf in "${TRANSFORMS[@]}"; do
@@ -142,12 +142,43 @@ for tf in "none" "ot"; do
         --transform_cache_dir "${CACHE_DIR}" \
         --n_ensemble "${N_ENSEMBLE}" \
         --sample_steps "${SAMPLE_STEPS}" \
-        --save_samples 5 \
-        --eval_train
+        --save_samples 5
+    # No --eval_train here: an ensemble over the ~122k-sample training split
+    # (x members x steps) per checkpoint does not fit the time limit, and the
+    # deterministic pass above already supplies the training-split risk.
     echo ""
 done
 else
     echo "=== AFM: ${AFM_DIR} not found; skipping AFM eval. ==="
+fi
+
+# -------------------------------------------------------------------
+#  AFM ORACLE: deterministic and probabilistic, no input transform.
+#  Its target risk (MSE and CRPS) is the AFM addressable-budget
+#  denominator, as unet/oracle is for the UNet arm.
+# -------------------------------------------------------------------
+if [[ -d "${AFM_DIR}_oracle" ]]; then
+    echo "=== AFM | ORACLE (joint, deterministic) ==="
+    run_python "${CODE_ROOT}/evaluate.py" batch \
+        --exp_root "${AFM_DIR}_oracle" \
+        --data_root "${DATA_ROOT}" \
+        --output_dir "${RESULTS_DIR}/afm/oracle" \
+        --input_transform none \
+        --transform_cache_dir "${CACHE_DIR}" \
+        --save_samples 10 \
+        --eval_train
+    echo ""
+    echo "=== AFM | ORACLE (joint, probabilistic, ${N_ENSEMBLE} members) ==="
+    run_python "${CODE_ROOT}/evaluate.py" batch \
+        --exp_root "${AFM_DIR}_oracle" \
+        --data_root "${DATA_ROOT}" \
+        --output_dir "${RESULTS_DIR}/afm_prob/oracle" \
+        --input_transform none \
+        --transform_cache_dir "${CACHE_DIR}" \
+        --n_ensemble "${N_ENSEMBLE}" \
+        --sample_steps "${SAMPLE_STEPS}" \
+        --save_samples 5
+    echo ""
 fi
 
 # -------------------------------------------------------------------

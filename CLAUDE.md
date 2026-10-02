@@ -143,7 +143,7 @@ Seeds: 42, 43, 44.
 - **Oracle and source-only checkpoints share the name `{src}__to__{tgt}__none`.** There
   is no `__oracle` tag. The oracle (`PHASE=oracle`, i.e. `--uda_method none
   --joint_training`) is kept apart only by its directory: `unet_seed<N>_oracle/` beside
-  `unet_seed<N>/` (afm: `afm_oracle/`, tag `afm_{src}__to__{tgt}____none`). Once the
+  `unet_seed<N>/` (afm: `afm_seed<N>_oracle/`, tag `afm_{src}__to__{tgt}__none`). Once the
   baselines are materialised, the source-only tree has the same six off-diagonal names
   as the oracle tree, so anything that globs `*__none` (`conditional_shift.py`,
   `evaluate.py --exp_root`) silently accepts whichever tree it is

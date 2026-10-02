@@ -134,6 +134,18 @@ DANN_WEIGHT=5e-4
 #  three domains, so 25 epochs spends ~80% of the wall clock past the
 #  checkpoint that is actually selected.
 # ===========================================================================
+# A run directory holding best.pt but no completion marker (best_hp/ or
+# base_hp/ JSON, or config.json, all written only after training ends) is a
+# run that died part-way: time limit, OOM, node drain. Retraining would
+# overwrite that checkpoint, so stop instead (CLAUDE.md rules 4 and 7).
+refuse_partial() {
+    if [[ -e "$1/best.pt" ]]; then
+        echo "ERROR: $1 holds a checkpoint from an unfinished run."
+        echo "       Move it to a _trash/ folder in the same tree, then rerun."
+        exit 1
+    fi
+}
+
 if [[ "${PHASE}" == "1" ]]; then
     PATIENCE_P1="${PATIENCE_P1:-5}"
 
@@ -148,6 +160,7 @@ if [[ "${PHASE}" == "1" ]]; then
         if [[ -f "${HP_FILE}" ]]; then
             echo "  Base HPs already exist: ${HP_FILE}, skipping training."
         else
+            refuse_partial "${OUTPUT_DIR}/${src}__to__${src}__none"
             run_python "${CODE_ROOT}/train_unet.py" \
                 --source_path "${DATA_ROOT}/${src}" \
                 --target_path "${DATA_ROOT}/${src}" \
@@ -226,6 +239,7 @@ elif [[ "${PHASE}" == "2" ]]; then
             echo "  Run completed previously, skipping."
             continue
         fi
+        refuse_partial "${OUTPUT_DIR}/${src}__to__${tgt}__${method}"
 
         run_python "${CODE_ROOT}/train_unet.py" \
             --source_path "${DATA_ROOT}/${src}" \
@@ -272,13 +286,15 @@ elif [[ "${PHASE}" == "oracle" ]]; then
         IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
         echo "--- [$((i+1))/${#PAIRS[@]}] ${src} + ${tgt} (joint) ---"
 
-        # Oracle completion marker: the source-only base HPs are reused as the
-        # base-HP source, but the oracle checkpoint lives under ORACLE_DIR.
-        DONE_MARKER="${ORACLE_DIR}/${src}__to__${tgt}__none/best.pt"
-        if [[ -f "${DONE_MARKER}" ]]; then
-            echo "  Oracle checkpoint exists, skipping."
+        # Oracle completion marker: config.json, written only after training
+        # ends. best.pt alone is written from the first epoch on, so an oracle
+        # killed part-way used to be skipped as if complete.
+        RUN_DIR="${ORACLE_DIR}/${src}__to__${tgt}__none"
+        if [[ -f "${RUN_DIR}/config.json" ]]; then
+            echo "  Oracle run complete, skipping."
             continue
         fi
+        refuse_partial "${RUN_DIR}"
 
         # Reuse the Phase 1 base HPs for this pair if present, so lr/bs/wd
         # match the source-only baseline (fair oracle comparison).

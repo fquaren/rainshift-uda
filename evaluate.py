@@ -99,6 +99,21 @@ def _infer_model_type(exp_dir_name):
     return "afm" if exp_dir_name.startswith("afm_") else "unet"
 
 
+def run_base_features(run_dir, default):
+    """
+    Width the run was trained at. train_afm.py records base_features in
+    config.json (AFM trains at 64); train_unet.py hard-codes 32 and does not
+    record it, so UNet runs fall back to `default`. Building an AFM model at
+    the CLI default of 32 fails load_state_dict on every AFM checkpoint.
+    """
+    cfg = Path(run_dir) / "config.json"
+    if cfg.exists():
+        bf = json.loads(cfg.read_text()).get("base_features")
+        if bf is not None:
+            return int(bf)
+    return default
+
+
 def load_model(model_type, checkpoint, device, base_features=32):
     ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
     clean = {k.removeprefix("_orig_mod."): v for k, v in ckpt.items()}
@@ -408,6 +423,22 @@ def parse_exp_name(name):
     return None, None, None
 
 
+def target_checkpoint(ckpt, method):
+    """
+    Checkpoint to score on the TARGET domain. AdaBN keeps per-domain
+    BatchNorm statistics: best.pt holds the source statistics, and both
+    trainers write the target-adapted model to best_adabn.pt. Scoring best.pt
+    on the target (as evaluate.py did until 2026-10-02) evaluates an unadapted
+    model, i.e. a second source-only run. Returns None for an AdaBN run
+    without best_adabn.pt.
+    """
+    ckpt = Path(ckpt)
+    if method != "adabn":
+        return ckpt
+    adapted = ckpt.parent / "best_adabn.pt"
+    return adapted if adapted.exists() else None
+
+
 # ---------------------------------------------------------------------------
 #  Single evaluation
 # ---------------------------------------------------------------------------
@@ -437,6 +468,13 @@ def cmd_single(args):
     )
 
     model = load_model(args.model, args.checkpoint, device, args.base_features)
+    # Same target-checkpoint rule as batch mode (best_adabn.pt for AdaBN).
+    _, _, method = parse_exp_name(Path(args.checkpoint).parent.stem)
+    tgt_ckpt = target_checkpoint(args.checkpoint, method)
+    if tgt_ckpt is None:
+        raise FileNotFoundError(f"adabn run without best_adabn.pt next to {args.checkpoint}")
+    tgt_model = model if tgt_ckpt == Path(args.checkpoint) else load_model(
+        args.model, str(tgt_ckpt), device, args.base_features)
 
     transform = None
     if args.input_transform != "none":
@@ -457,7 +495,7 @@ def cmd_single(args):
 
     # 2. Evaluate Target (With Transform)
     tgt_metrics, tgt_pred, tgt_true, tgt_per_sample = evaluate_model(
-        model,
+        tgt_model,
         args.model,
         tgt_loader,
         device,
@@ -560,7 +598,17 @@ def cmd_batch(args):
         if args.input_transform != "none":
             transform = _load_or_fit_transform(str(src_path), str(tgt_path), args, device)
 
-        model = load_model(model_type, str(ckpt), device, args.base_features)
+        base_features = run_base_features(ckpt.parent, args.base_features)
+        model = load_model(model_type, str(ckpt), device, base_features)
+
+        # Target is scored with target_checkpoint() (best_adabn.pt for AdaBN);
+        # source and train splits keep best.pt and its source statistics.
+        tgt_ckpt = target_checkpoint(ckpt, method)
+        if tgt_ckpt is None:
+            print(f"  Skipping {exp_name} (adabn run without best_adabn.pt)")
+            del model
+            continue
+        tgt_model = model if tgt_ckpt == ckpt else load_model(model_type, str(tgt_ckpt), device, base_features)
 
         # 1. Evaluate Source (source stats)
         src_metrics, src_pred, src_true, src_per_sample = evaluate_model(
@@ -577,7 +625,7 @@ def cmd_batch(args):
 
         # 2. Evaluate Target (SOURCE stats — model outputs live in source space)
         tgt_metrics, tgt_pred, tgt_true, tgt_per_sample = evaluate_model(
-            model,
+            tgt_model,
             model_type,
             tgt_loader,
             device,
@@ -638,7 +686,7 @@ def cmd_batch(args):
             if isinstance(v, float):
                 print(f"    {k}: {v:.4f}")
 
-        del model
+        del model, tgt_model
         torch.cuda.empty_cache()
 
     print(f"\nResults -> {csv_path}")
