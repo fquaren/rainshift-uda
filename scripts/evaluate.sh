@@ -7,6 +7,12 @@
 #  TRANSFORMS (none by default; qm_tp, qm_precip, qm_all available).
 #
 #  Results land in {RESULTS_DIR}/{model}/{transform}/results.csv
+#
+#  Optional (audit 2026-10-29 re-scoring), all off by default:
+#    RESULTS_SUFFIX=_v3   write results/seed<N>_v3/ instead; refused if it exists
+#    TREE_SUFFIX=_fdafix  score unet_seed<N>_fdafix/ (and its _oracle/ if any);
+#                         needs RESULTS_SUFFIX; no NGG (no source-only rows there)
+#    UNET_ONLY=1          skip the AFM trees
 # ===========================================================================
 
 #SBATCH --account tbeucler_downscaling
@@ -47,10 +53,16 @@ DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift"
 # re-run resumes instead of overwriting. The old unseeded unet/ tree and
 # results/unet/ are never touched.
 SEED="${SEED:?SEED must be set, e.g. SEED=42 sbatch scripts/evaluate.sh}"
-UNET_DIR="${OUTPUT_DIR}/unet_seed${SEED}"
-ORACLE_DIR="${OUTPUT_DIR}/unet_seed${SEED}_oracle"
+TREE_SUFFIX="${TREE_SUFFIX:-}"
+RESULTS_SUFFIX="${RESULTS_SUFFIX:-}"
+[[ -n "${TREE_SUFFIX}" && -z "${RESULTS_SUFFIX}" ]] && { echo "ERROR: TREE_SUFFIX needs RESULTS_SUFFIX."; exit 1; }
+UNET_DIR="${OUTPUT_DIR}/unet_seed${SEED}${TREE_SUFFIX}"
+ORACLE_DIR="${OUTPUT_DIR}/unet_seed${SEED}${TREE_SUFFIX}_oracle"
 AFM_DIR="${OUTPUT_DIR}/afm_seed${SEED}"
-RESULTS_DIR="${OUTPUT_DIR}/results/seed${SEED}"
+RESULTS_DIR="${OUTPUT_DIR}/results/seed${SEED}${RESULTS_SUFFIX}"
+if [[ -n "${RESULTS_SUFFIX}" && -e "${RESULTS_DIR}" ]]; then
+    echo "ERROR: ${RESULTS_DIR} exists. Not overwriting."; exit 1
+fi
 # Input-transform cache is seed-independent; share it across seeds.
 CACHE_DIR="${OUTPUT_DIR}/results/transforms"
 
@@ -119,7 +131,7 @@ fi
 # -------------------------------------------------------------------
 # run_exp_afm.sh writes afm_seed<N>/; this runs only once
 # an afm_seed<N>/ tree exists.
-if [[ -d "${AFM_DIR}" ]]; then
+if [[ "${UNET_ONLY:-0}" != "1" && -d "${AFM_DIR}" ]]; then
 for tf in "${TRANSFORMS[@]}"; do
     echo "=== AFM (deterministic) | transform: ${tf} ==="
     run_python "${CODE_ROOT}/evaluate.py" batch \
@@ -162,7 +174,7 @@ fi
 #  Its target risk (MSE and CRPS) is the AFM addressable-budget
 #  denominator, as unet/oracle is for the UNet arm.
 # -------------------------------------------------------------------
-if [[ -d "${AFM_DIR}_oracle" ]]; then
+if [[ "${UNET_ONLY:-0}" != "1" && -d "${AFM_DIR}_oracle" ]]; then
     echo "=== AFM | ORACLE (joint, deterministic) ==="
     run_python "${CODE_ROOT}/evaluate.py" batch \
         --exp_root "${AFM_DIR}_oracle" \
@@ -191,6 +203,10 @@ fi
 #  conversion, which no longer exists. If the cube is missing, NGG is
 #  skipped rather than computed from the own-stats normalized/ cube.
 # -------------------------------------------------------------------
+if [[ -n "${TREE_SUFFIX}" ]]; then
+    echo "=== Evaluation complete (side tree ${TREE_SUFFIX}: no NGG) ==="
+    exit 0
+fi
 if [[ ! -f "${W1_MATRIX}" || ! -f "${W1_META}" ]]; then
     echo "=== NGG skipped: raw W1 cube ${W1_MATRIX} missing (cannot be regenerated without NPY) ==="
     echo "=== Evaluation complete (no NGG) ==="

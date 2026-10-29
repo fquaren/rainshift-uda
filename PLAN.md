@@ -454,6 +454,14 @@ Retraining and re-scoring needed:
 - Re-score the main and GAP-ablation trees for `mse_log_*`, including the oracle source side at 0.1 mm/h.
 - Regenerate `ngg_v3/`.
 
+**Submitted 2026-10-29 (after tests passed):**
+- FDA retrain (fixed), side tree `unet_seed<S>_fdafix/`: arrays 66708660 / 66708664 / 66708668 (seeds 42/43/44, tasks 0–5); scoring into `results/seed<S>_fdafix/`: 66708661 / 66708665 / 66708669.
+- DANN with `--uda_grad_ratio 0.5` (as in the GAP ablation), side tree `unet_seed<S>_danngr05/`: arrays 66708662 / 66708666 / 66708670; scoring into `results/seed<S>_danngr05/`: 66708663 / 66708667 / 66708671.
+- Main-tree re-score (all `mse_log_*`, oracle included) into `results/seed<S>_v3/`, with `ngg_v3/` computed at the end: 66708672 / 66708673 / 66708674. This NGG still holds the void FDA rows of the main tree. The GAP-ablation trees are not re-scored yet: `compare_gap_ablation.py` reads fixed paths.
+- P1b: 66708675 → `unet/conditional_shift_binned_p1b.json`.
+- P16 (BN frozen): smoke 66708676; arrays 66708677 / 66708679 / 66708681 `afterok` on it; merges 66708678 / 66708680 / 66708682.
+- P2: half-split smoke 66708729; array 66708730 (0–17%6) `afterok` on it; `run_cond_test.sh` 66708731 `afterok` on the array.
+
 ## Dependencies
 
 - **0.1** (seed-aware materialise + evaluate) blocks everything: it produces the first seeded results.

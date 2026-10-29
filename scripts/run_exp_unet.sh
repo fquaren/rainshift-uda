@@ -114,6 +114,14 @@ LAMBDA_UDA=0.1
 # collapses the discriminator to ln(2). Ignored by non-DANN methods.
 DANN_WEIGHT=5e-4
 
+# Optional gradient-matched weight for mmd / mmd_ms / dann (audit A2), off by
+# default. The run tag does not record it, so it needs its own side tree.
+UDA_EXTRA=()
+[[ -n "${UDA_GRAD_RATIO:-}" ]] && UDA_EXTRA+=(--uda_grad_ratio "${UDA_GRAD_RATIO}")
+if (( ${#UDA_EXTRA[@]} )) && [[ -z "${OUTPUT_SUFFIX:-}" ]]; then
+    echo "ERROR: UDA_GRAD_RATIO needs an OUTPUT_SUFFIX side tree."; exit 1
+fi
+
 # --------------------------------------------------------------------------
 
 
@@ -262,6 +270,7 @@ elif [[ "${PHASE}" == "2" ]]; then
             --num_workers "${NUM_WORKERS}" \
             --seed        "${SEED}" \
             --jdot_reg    0.001 \
+            "${UDA_EXTRA[@]}" \
             2>&1 | tee "${OUTPUT_DIR}/phase2_${src}__to__${tgt}__${method}.log"
     done
 
