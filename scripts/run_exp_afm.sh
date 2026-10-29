@@ -4,17 +4,21 @@
 #
 #  Mirrors run_exp_unet.sh so the two arms differ only in the model:
 #    PHASE=1       source-only baselines, one run per source domain
-#    PHASE=2       UDA methods; as a job array, one run per task
+#    PHASE=2       UDA methods
 #    PHASE=oracle  joint source+target training, separate _oracle tree
+#  Every phase runs as a job array, one run per task (PLAN.md 3.6 step 5);
+#  without --array it loops over all runs in one job.
 #
 #  Output tree: afm_seed${SEED}${OUTPUT_SUFFIX}/ (and ..._oracle/), the tree
 #  evaluate.sh reads. Run tags are afm_{src}__to__{tgt}__{method}.
 #  After PHASE=1, run materialise_baselines.sh with MODEL=afm.
 #
-#  Usage:
-#    SEED=42 PHASE=1 sbatch --time 72:00:00 scripts/run_exp_afm.sh
+#  Usage (task order: DOMAINS for phase 1, src-major pairs for the oracle):
+#    SEED=42 PHASE=1 LR=1e-4 ENC_LR_RATIO=1.0 sbatch --array=0-2 scripts/run_exp_afm.sh
 #    SEED=42 PHASE=2 METHODS_ENV="fda spectral" sbatch --array=0-11 scripts/run_exp_afm.sh
-#    SEED=42 PHASE=oracle sbatch --time 72:00:00 scripts/run_exp_afm.sh
+#    SEED=42 PHASE=oracle sbatch --array=0-5 --time 24:00:00 scripts/run_exp_afm.sh
+#  An oracle epoch streams both training splits (~0.7 h), so up to 25 epochs
+#  needs the 24 h limit, which is the gpu-long QOS. Phase 1 and 2 fit 12 h.
 #  Smoke test (2 epochs, few chunks, side tree): see scripts/smoke_afm.sh.
 # ===========================================================================
 
@@ -76,12 +80,35 @@ EPOCHS="${EPOCHS:-25}"
 PATIENCE="${PATIENCE:-5}"
 PATIENCE_ORACLE="${PATIENCE_ORACLE:-8}"
 NUM_WORKERS=12
-# Phase 1 sets these; phase 2 and the oracle read them back from base_hp/.
-BATCH_SIZE="${BATCH_SIZE:-512}"
-# train_afm.py's own default, kept explicit. NOT tuned: flow net at LR,
-# encoder at LR/10. --weight_decay is ignored by train_afm.build_optimizer,
+# Width 32, so the AFM encoder is exactly the UNet arm's DualEncoderUNet and
+# the arms differ in the objective, not the backbone. Passed in every phase
+# (common_args): train_afm reads base_features from argv, not from base_hp/.
+#
+# Phase 1 sets the batch size; phase 2 and the oracle read it back from
+# base_hp/. At width 64 the AFM ran out of memory on a 40 GB A100 at batch
+# 512 and at batch 128 (smoke tests 65294537, 65308291, 2026-10-02): two
+# full-resolution UNets in fp32 plus, for dann / mmd / joint_ot, a second
+# encoder pass on the target batch. Width 32 at batch 64 was estimated at
+# ~16 GB (source-only) and ~25 GB (two-forward methods).
+BASE_FEATURES="${BASE_FEATURES:-32}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+# Flow net at LR, encoder at LR * ENC_LR_RATIO. Both come from the LR sweep
+# (scripts/tune_afm_lr.sh, PLAN.md 3.1); phase 1 refuses to train on the
+# untuned default except in a smoke test. Phase 2 and the oracle read both
+# back from base_hp/. --weight_decay is ignored by train_afm.build_optimizer,
 # which hard-codes per-group weight decay.
+if [[ "${PHASE}" == "1" && -z "${LR:-}" && -z "${SUBSET_CHUNKS:-}" ]]; then
+    echo "ERROR: PHASE=1 needs LR (and ENC_LR_RATIO) from the LR sweep."; exit 1
+fi
 LR="${LR:-1e-5}"
+ENC_LR_RATIO="${ENC_LR_RATIO:-0.1}"
+# Checkpoint selection and early stopping on the validation CRPS of the
+# sampled ensemble, not on the encoder mean's MSE, so the flow network is
+# part of what is selected. Same settings as the sweep.
+SELECT_ON="${SELECT_ON:-crps}"
+# EMA of weights and BatchNorm buffers; validation, selection and best.pt use
+# the EMA copy (PLAN.md 3.6 step 2). Every phase gets the same decay.
+EMA_DECAY="${EMA_DECAY:-0.999}"
 
 # UDA settings identical to run_exp_unet.sh.
 FDA_BETA=0.01
@@ -97,10 +124,24 @@ fi
 
 common_args() {
     echo --data_format "${DATA_FORMAT}" --epochs "${EPOCHS}" \
-         --num_workers "${NUM_WORKERS}" --seed "${SEED}"
+         --num_workers "${NUM_WORKERS}" --seed "${SEED}" \
+         --base_features "${BASE_FEATURES}" --select_on "${SELECT_ON}" \
+         --val_crps_members 4 --val_crps_steps 10 --val_crps_chunks 8 \
+         --ema_decay "${EMA_DECAY}"
 }
 
 tag() { echo "afm_$1__to__$2__$3"; }
+
+# One run per array task; every run in a plain job. Sets INDICES. Called
+# directly, not in $(...), so the exit stops the job.
+select_indices() {   # $1 = number of runs
+    INDICES=($(seq 0 $(( $1 - 1 ))))
+    if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        (( SLURM_ARRAY_TASK_ID < $1 )) || {
+            echo "ERROR: array task ${SLURM_ARRAY_TASK_ID} >= $1 runs"; exit 1; }
+        INDICES=("${SLURM_ARRAY_TASK_ID}")
+    fi
+}
 
 # A run directory holding best.pt but no completion marker (best_hp/ or
 # base_hp/ JSON, or config.json, all written only after training ends) is a
@@ -121,7 +162,8 @@ refuse_partial() {
 if [[ "${PHASE}" == "1" ]]; then
     echo "=== AFM PHASE 1: source-only baselines (${#DOMAINS[@]} runs), patience=${PATIENCE} ==="
 
-    for i in "${!DOMAINS[@]}"; do
+    select_indices "${#DOMAINS[@]}"
+    for i in "${INDICES[@]}"; do
         src="${DOMAINS[$i]}"
         echo "--- [$((i+1))/${#DOMAINS[@]}] source=${src} ---"
 
@@ -137,6 +179,7 @@ if [[ "${PHASE}" == "1" ]]; then
                 --uda_method  none \
                 --batch_size  "${BATCH_SIZE}" \
                 --lr          "${LR}" \
+                --encoder_lr_ratio "${ENC_LR_RATIO}" \
                 --patience    "${PATIENCE}" \
                 $(common_args) "${EXTRA[@]}" \
                 2>&1 | tee "${OUTPUT_DIR}/afm_phase1_${src}.log"
@@ -177,13 +220,7 @@ elif [[ "${PHASE}" == "2" ]]; then
 
     echo "=== AFM PHASE 2: ${#RUNS[@]} runs (${METHODS[*]}), patience=${PATIENCE} ==="
 
-    INDICES=("${!RUNS[@]}")
-    if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-        (( SLURM_ARRAY_TASK_ID < ${#RUNS[@]} )) || {
-            echo "ERROR: array task ${SLURM_ARRAY_TASK_ID} >= ${#RUNS[@]} runs"; exit 1; }
-        INDICES=("${SLURM_ARRAY_TASK_ID}")
-    fi
-
+    select_indices "${#RUNS[@]}"
     for i in "${INDICES[@]}"; do
         IFS='|' read -r src tgt method <<< "${RUNS[$i]}"
         echo "--- [$((i+1))/${#RUNS[@]}] ${src} -> ${tgt} | ${method} ---"
@@ -228,7 +265,8 @@ elif [[ "${PHASE}" == "oracle" ]]; then
 
     echo "=== AFM PHASE oracle: ${#PAIRS[@]} pairs, patience=${PATIENCE_ORACLE}, output ${ORACLE_DIR} ==="
 
-    for i in "${!PAIRS[@]}"; do
+    select_indices "${#PAIRS[@]}"
+    for i in "${INDICES[@]}"; do
         IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
         echo "--- [$((i+1))/${#PAIRS[@]}] ${src} + ${tgt} (joint) ---"
 

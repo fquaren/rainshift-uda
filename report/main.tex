@@ -1,0 +1,579 @@
+% =====================================================================
+%  First draft, 2026-10-05. Built from PLAN.md, the code, and the seeded
+%  results in results_rainshift_uda/results/seeds_42_43_44_unet_mse_std_log/.
+%  Every number in a table or sentence is from those outputs; anything not
+%  yet measured is a \todo{}. Not compiled on the cluster (no TeX there).
+%  See report/NOTES.md for sources, open items and what changed from the
+%  February specification.
+% =====================================================================
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\note}[1]{\textcolor{blue}{[Note: #1]}}
+\newcommand{\Es}{\mathcal{E}_S}
+\newcommand{\Et}{\mathcal{E}_T}
+\newcommand{\lamhat}{\hat{\lambda}}
+
+\title{Feature alignment cannot recover a shifted conditional:\\
+a diagnosis of unsupervised domain adaptation for precipitation super-resolution}
+\author{Filippo Quarenghi \and \todo{co-authors}}
+\date{Draft, \today}
+
+\begin{document}
+\maketitle
+
+% ---------------------------------------------------------------------
+\begin{abstract}
+Deep-learning downscaling of precipitation is trained where high-resolution
+observations exist and applied where they do not. Unsupervised domain
+adaptation (UDA) promises to close the resulting transfer gap with unlabelled
+data from the target region. We test that promise on three RainShift regions
+(western Europe, the Horn of Africa and Melanesia), mapping ERA5 predictors to
+IMERG precipitation at 0.1\textdegree. We argue that the failure of UDA here
+is a property of the task. First, the regions differ in the conditional
+distribution of precipitation given the atmospheric state, not only in the
+distribution of that state: at matched inputs, the observed precipitation
+distributions differ by 14.5 to 86.9 times a within-domain null. Second, this
+gap is reducible in principle but not identifiable from unlabelled target
+data. A model trained jointly on labelled source and target data leaves only
+0.4--6\,\% of the transfer gap in five of six transfer directions (18\,\% in
+the sixth), so a single predictor good on both domains exists, but nothing in
+the unlabelled target inputs says which one it is. Third, six UDA methods,
+seeded three times, recover at most about half of that budget. Consistent
+target gains occur almost only when western Europe is the target. Most come
+with large increases in source risk, but two (FDA and test-time AdaBN into
+Europe from the Horn) cost almost nothing on the source and are not yet
+explained. Method ordering differs between seeds in every direction, though
+source-only is last in all seeds for Horn$\to$Europe and first in all seeds
+for Melanesia$\to$Horn. \todo{rewrite the Europe sentence after the zero-rain check.}
+\todo{Claim 3 mechanism: GAP ablation
+and BatchNorm control, pending.} \todo{Claim 4: the same diagnosis for a
+flow-matching model, with the risk in CRPS, pending.}
+\end{abstract}
+
+% ---------------------------------------------------------------------
+\section{Introduction}
+
+Statistical downscaling with neural networks reaches high skill in the region
+it was trained on, and loses much of it in other regions
+\citep{harder2025rainshift}. That loss matters most where it is least
+measurable: high-resolution precipitation observations are dense over Europe,
+North America and East Asia, and sparse over much of the tropics, where
+downscaled projections are most needed. Unsupervised domain adaptation (UDA)
+offers an apparently cheap remedy: keep the labelled source region, add
+unlabelled predictors from the target region, and align the two during
+training \citep{ganin2016dann,long2015dan}.
+
+The standard justification for UDA bounds target risk by source risk, a
+divergence between input distributions, and a term $\lambda$, the risk of the
+best joint hypothesis \citep{bendavid2010theory}. Feature alignment acts only
+on the divergence. It helps when the shift is a covariate shift, a change in
+$P(X)$ with $P(Y\mid X)$ fixed. When $P(Y\mid X)$ itself differs between
+regions, matching input or feature distributions does not determine the target
+conditional, and enforcing invariance can increase target error
+\citep{zhao2019invariant,johansson2019support}.
+
+This paper is a diagnosis, not a method. We make four claims, each tested
+directly:
+\begin{enumerate}
+  \item The three RainShift regions differ in $P(Y\mid X)$, not only in $P(X)$
+        (Section~\ref{sec:shift}).
+  \item The resulting transfer gap is reducible in principle, since a joint
+        oracle nearly recovers target in-domain risk, but it is not
+        identifiable from unlabelled target data (Section~\ref{sec:oracle}).
+  \item UDA methods recover at most about half of the gap, and only into
+        Europe. Most of those gains come with a large loss on the source, and
+        outside Europe the gains do not survive a change of seed
+        (Section~\ref{sec:methods}). \todo{mechanism, pending the GAP
+        ablation and the BatchNorm control.}
+  \item The failure is a property of the task, not of the mean-squared-error
+        objective: it persists for a flow-matching model scored in CRPS
+        (Section~\ref{sec:afm}). \todo{pending.}
+\end{enumerate}
+
+% ---------------------------------------------------------------------
+\section{Related work}
+\label{sec:related}
+
+\paragraph{Downscaling across regions.} RainShift \citep{harder2025rainshift}
+is a benchmark for precipitation downscaling across geographies. It pairs
+ERA5 predictors with a single IMERG target over regions with different
+climates. \todo{one paragraph on its baselines and reported gaps.}
+
+\paragraph{Cross-region transfer that does work.} \citet{qian2026} report good
+transfer of a wavelet diffusion model across six US regions. Their
+low-resolution input is a block average of the high-resolution target, the
+same product at the same time, so $P(Y\mid X)$ is close to the same map
+everywhere and only the marginal changes; they state this limit in their
+\S4.3. The conditional shift we measure cannot arise in that design. Their
+result is a contrast rather than a contradiction: marginal shift without
+conditional shift transfers, and ours does not.
+
+\citet{glawion2025} train spateGAN-ERA5 on German radar and claim robust
+global applicability, including the tropics. Three points separate that claim
+from ours. Their generalisation is one of structural and distributional
+realism, not pointwise accuracy, and they report that interpolation and
+RainFARM win on RMSE and MAE. Their raw RAPSD underestimates power at all
+wavelengths outside Germany, and the alignment claim is made on the
+normalised spectrum, which divides out a marginal amplitude error. And their
+evaluation target changes with geography (gauge-adjusted RADKLIM,
+non-adjusted MRMS, heterogeneously adjusted AURA), so target-product shift is
+confounded with geographic shift. RainShift's single IMERG target avoids that
+confound. \todo{check both summaries against the papers before submission.}
+
+\paragraph{Domain adaptation theory.} The bound of \citet{bendavid2010theory}
+and its optimal-transport analogue \citep{redko2017ot} make the joint risk
+$\lambda$ the term that alignment cannot touch. \citet{zhao2019invariant} show
+that learning invariant representations can increase target error when the
+label distributions or conditionals differ, and \citet{johansson2019support}
+show that invariance does not imply identifiability without support overlap
+and invertibility. We measure $\lambda$ directly with a labelled oracle rather
+than assume it is small.
+
+\paragraph{Methods tested.} Input-level FDA \citep{yang2020fda}; feature-level
+MMD \citep{gretton2012mmd,long2015dan} and DANN
+\citep{ganin2016dann}; joint distribution optimal transport (DeepJDOT,
+\citealp{courty2017jdot,damodaran2018deepjdot}); an output-level spectral
+density loss; and test-time AdaBN \citep{li2018adabn}.
+
+% ---------------------------------------------------------------------
+\section{Data and setup}
+\label{sec:setup}
+
+\paragraph{Regions and variables.} We use three RainShift regions
+\citep{harder2025rainshift}, with ERA5 \citep{hersbach2020era5} predictors and
+IMERG \citep{huffman2023imerg} targets:
+western Europe (\texttt{europe\_west}), the Horn of Africa and Melanesia. Each
+input is a $9\times80\times80$ field of ERA5 variables (CAPE, convective and
+total precipitation, surface pressure, total column cloud liquid water, total
+column water, top-of-atmosphere incident solar radiation, and the two wind
+components) plus two static high-resolution fields, land--sea mask and
+geopotential. The target is IMERG precipitation on a $200\times200$ grid at
+0.1\textdegree. \todo{wind level; time resolution and the exact train,
+validation and test periods from the RainShift release.} Each test split holds
+17,520 samples and each training split 122,520, after removing validation and
+purged chunks. \todo{confirm both counts against \texttt{results.csv}; they
+are not a multiple of the 200-sample chunk.}
+
+\paragraph{Transforms and normalisation.} The IMERG target and the ERA5 total and
+convective precipitation inputs are log-transformed,
+$\log(\max(y,0)+10^{-5})$ with precipitation in mm; the static geopotential
+gets the same transform in its own units (it is zero over ocean). All are then
+z-scored; the other continuous inputs are
+z-scored; the land--sea mask is passed through. All
+datasets, including the target, are normalised with the source domain's
+statistics. Normalising the target by its own statistics would remove part of
+the shift being measured.
+
+\paragraph{Validation split.} The training record is divided into chunks of
+200 consecutive samples. Validation uses 88 chunks spread uniformly across the
+record, and training chunks adjacent to a validation chunk are dropped (a
+purge gap of one chunk) to limit autocorrelation leakage.
+
+\paragraph{Model.} A dual-encoder UNet with base width 32. The dynamic inputs
+are bicubically upsampled to $200\times200$ and pass through a four-level
+encoder to a $512\times12\times12$ bottleneck; a two-level static encoder
+feeds the decoder through skip connections. The output is standardised
+log-precipitation.
+
+\paragraph{Training.} AdamW, learning rate $5\times10^{-4}$, weight decay
+$10^{-3}$, batch 128, cosine schedule over 25 epochs, with the checkpoint
+selected on source validation MSE. Source-only runs stop early with patience
+5; the UDA runs and (check) the oracle runs use all 25 epochs. Validation loss
+bottoms out at epoch 3--6 on all three domains, so most of the schedule lies
+past the selected checkpoint. Learning rate and weight decay are the trainer
+defaults and were not tuned. \todo{confirm the oracle's patience from its
+\texttt{config.json}.}
+
+\paragraph{Protocol.} For each source $S$ a source-only model is trained once;
+on its own test split it gives the in-domain risk, the diagonal of the
+transfer matrix. Each UDA method is trained once per ordered pair $(S,T)$ and
+selected on source validation only, so no target label enters selection. The
+oracle for $(S,T)$ is trained on labelled source and target data together and
+selected on the mean of source and target validation loss (never the test
+split). Every configuration is run with seeds 42, 43 and 44. Source-only and oracle
+models were trained on GH200 (PyTorch 2.9) and JDOT likewise; DANN, FDA, MMD,
+the spectral loss and AdaBN were run on A100 (PyTorch 2.13). The difference
+$\Et(m)-\Et(\text{source-only})$ of those five methods therefore includes
+a software-stack difference; only JDOT is compared like with like
+(Section~\ref{sec:limits}). \note{the seed
+sets the weight initialisation only; the data order and validation split are
+the same in all runs (Section~\ref{sec:limits}).}
+
+\paragraph{UDA settings.} A fixed weight $\lambda=0.1$ for MMD, the spectral
+loss and JDOT; DANN uses an adversarial weight $5\times10^{-4}$ with the
+standard gradient-reversal ramp; JDOT uses entropic regularisation $10^{-3}$;
+FDA uses $\beta=0.01$; AdaBN re-estimates BatchNorm statistics on the target
+training split after training. MMD, DANN and the JDOT feature term act
+on the globally average-pooled bottleneck. Weights were not searched
+(Section~\ref{sec:limits}). CORAL and multi-scale MMD were implemented and
+dropped before the seeded runs, CORAL as subsumed by MMD and mean-blind, and
+multi-scale MMD as the same mechanism and unstable; neither is reported
+(Appendix~\ref{app:dropped}).
+
+\paragraph{Risk and units.} The risk is the MSE of standardised
+log-precipitation, the training loss. A model trained on $S$ is scored, on
+both test splits, in $S$'s standardised units, so raw values from different
+sources are not comparable. We report every risk as MSE of log-precipitation,
+$\mathrm{MSE}_{\log} = s_S^2\,\mathrm{MSE}_{\mathrm{std}}$, with $s_S$ the
+standard deviation of log-precipitation in $S$ (3.72, 2.70 and 4.68 for
+Europe, the Horn and Melanesia). The conversion is exact because the
+transform is a log followed by a z-score. Errors in mm are not reported: they
+are dominated by a few pixels whose predictions blow up under the inverse
+transform. Means and standard deviations are over the three seeds, and every
+difference is formed within a seed before it is averaged.
+
+% ---------------------------------------------------------------------
+\section{The regions differ in the conditional}
+\label{sec:shift}
+
+We test for conditional shift without a model. Pixels from 600 test frames per
+region are brought to a common $40\times40$ grid and binned on two predictors,
+CAPE and total column water, with $5\times5$ shared quantile bins from the
+pooled data. Within each bin we compute the exact Wasserstein-1 distance
+between the two regions' log-precipitation distributions and average over
+bins weighted by occupancy, giving $W_1^{\mathrm{cond}}$. Under pure covariate
+shift in the binned inputs, matched inputs give matched targets and
+$W_1^{\mathrm{cond}}$ falls to the noise floor. We calibrate that floor by
+splitting the pixels of one region at random into two halves and running the
+same pipeline. Because neighbouring pixels and frames are strongly
+autocorrelated, such a split is optimistic and the null is probably too small;
+the excess factors below are upper figures. \todo{recompute the null with a
+split by blocks of time (for example by year) and restate the factors.}
+
+\begin{table}[t]
+\centering
+\caption{Matched-input conditional shift (log-precipitation $W_1$). Support is
+the smaller region's share of pixels in bins both regions occupy.}
+\label{tab:condshift}
+\begin{tabular}{lrrrrr}
+\toprule
+pair & $W_1^{\mathrm{cond}}$ & null & excess over null & $W_1^{\mathrm{uncond}}$ & support \\
+\midrule
+Europe -- Horn      & 2.140 & 0.025 & 86.9$\times$ & 1.192 & 99.6\,\% \\
+Horn -- Melanesia   & 0.395 & 0.027 & 14.5$\times$ & 3.169 & 99.98\,\% \\
+Europe -- Melanesia & 2.152 & 0.029 & (74.5$\times$) & 1.977 & 43.8\,\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:condshift} shows conditional shift far above the null for
+Europe--Horn and Horn--Melanesia. Europe--Melanesia falls below the 50\,\%
+support threshold and is not interpreted. Two limits bound what this shows.
+The test is pixel-wise, $P(y_{\mathrm{pixel}}\mid
+\mathrm{CAPE}_{\mathrm{pixel}},\mathrm{TCW}_{\mathrm{pixel}})$, while the
+model learns a field-wise conditional. And it conditions on two of the eleven
+inputs. A difference between the regions in the distribution of the unbinned
+inputs given CAPE and TCW produces nonzero $W_1^{\mathrm{cond}}$ even when
+the conditional given all inputs is identical, so a large value is not by
+itself evidence of conditional shift in the full input. Conversely, a real
+shift in the full conditional can be diluted by the coarse binning. The test
+is therefore suggestive, not a bound in either direction, and claim~1 rests on
+the model-based check below. \todo{model-based corroboration, the 9-D diagnostic from
+\texttt{conditional\_shift.py}: numbers and a sentence.} Since ERA5 and IMERG
+are different products, part of the measured conditional shift is regionally
+varying reanalysis error rather than different physics. For the question asked
+here the distinction does not matter: either way it is invisible in the
+unlabelled target inputs.
+
+% ---------------------------------------------------------------------
+\section{The gap is reducible but not identifiable}
+\label{sec:oracle}
+
+\begin{table}[t]
+\centering
+\caption{Transfer matrix, $\mathrm{MSE}_{\log}$ of the source-only model
+(rows: source; columns: target; diagonal: in-domain). Mean $\pm$ sd over
+three seeds.}
+\label{tab:transfer}
+\begin{tabular}{lccc}
+\toprule
+source $\backslash$ target & Europe & Horn & Melanesia \\
+\midrule
+Europe    & $7.26\pm0.00$ & $5.66\pm0.33$ & $16.52\pm0.05$ \\
+Horn      & $12.86\pm0.15$ & $4.56\pm0.01$ & $16.06\pm0.38$ \\
+Melanesia & $13.15\pm1.30$ & $5.21\pm0.01$ & $13.63\pm0.01$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For a pair $(S,T)$ let $h_S$, $h_T$ be the in-domain source-only models and
+$h_{\mathrm{joint}}$ the oracle. We decompose the source-only transfer gap as
+\begin{equation}
+\underbrace{\Et(h_S)-\Et(h_T)}_{\text{gap}}
+= \underbrace{\Et(h_S)-\Et(h_{\mathrm{joint}})}_{\text{budget}}
++ \underbrace{\Et(h_{\mathrm{joint}})-\Et(h_T)}_{\lamhat},
+\end{equation}
+where the budget is what labelled target data recovers and $\lamhat$ is what
+even the oracle leaves. $\lamhat$ is our estimate of the joint-risk term of
+\citet{bendavid2010theory}, measured relative to the in-domain optimum.
+
+\begin{table}[t]
+\centering
+\caption{Oracle decomposition in $\mathrm{MSE}_{\log}$. The source cost is
+$\Es(h_{\mathrm{joint}})-\Es(h_S)$. Mean $\pm$ sd over three seeds, paired
+within seed.}
+\label{tab:oracle}
+\begin{tabular}{lccccc}
+\toprule
+pair & gap & budget & $\lamhat$ & $\lamhat/\text{gap}$ & source cost \\
+\midrule
+Europe $\to$ Horn      & $1.10\pm0.33$ & $1.06\pm0.33$ & $0.038\pm0.004$ & $0.037\pm0.012$ & $0.058\pm0.001$ \\
+Europe $\to$ Melanesia & $2.89\pm0.06$ & $2.73\pm0.02$ & $0.164\pm0.056$ & $0.056\pm0.018$ & $0.054\pm0.004$ \\
+Horn $\to$ Europe      & $5.61\pm0.15$ & $5.58\pm0.17$ & $0.022\pm0.039$ & $0.004\pm0.007$ & $0.074\pm0.027$ \\
+Horn $\to$ Melanesia   & $2.44\pm0.37$ & $2.03\pm0.48$ & $0.413\pm0.146$ & $0.177\pm0.086$ & $0.077\pm0.013$ \\
+Melanesia $\to$ Europe & $5.90\pm1.30$ & $5.80\pm1.27$ & $0.095\pm0.055$ & $0.016\pm0.009$ & $0.158\pm0.147$ \\
+Melanesia $\to$ Horn   & $0.65\pm0.02$ & $0.63\pm0.04$ & $0.023\pm0.025$ & $0.036\pm0.039$ & $0.208\pm0.181$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Every transfer direction has a positive gap (Table~\ref{tab:oracle}), from
+0.65 (Melanesia $\to$ Horn) to 5.9 (Melanesia $\to$ Europe). In five of six
+directions the oracle closes all but 0.4--6\,\% of it, at a source cost of
+0.05--0.21. Horn $\to$ Melanesia is the exception: the oracle leaves
+$18\pm9$\,\% of the gap. \todo{either a stronger oracle (capacity, longer
+training) closes it, or it is reported as an irreducible component.}
+
+A small $\lamhat$ does not contradict Section~\ref{sec:shift}. The inputs
+include static fields and top-of-atmosphere radiation that identify the
+region, so a single network can represent two different conditionals by
+conditioning on where it is. A good joint hypothesis exists. What unlabelled
+target data cannot provide is which one: two target conditionals that agree
+on $P_T(X)$ are indistinguishable from $(P_S(X,Y), P_T(X))$, and every UDA
+method sees only those two distributions. The budget in Table~\ref{tab:oracle}
+is reachable with target labels and, in this sense, not identifiable without
+them. \todo{state this as a short proposition with proof sketch, or cite the
+closest existing result.}
+
+% ---------------------------------------------------------------------
+\section{UDA methods do not recover the budget}
+\label{sec:methods}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Target change $\Et(m)-\Et(\text{source-only})$ in
+$\mathrm{MSE}_{\log}$; negative is a gain. Mean $\pm$ sd over three seeds,
+paired within seed. Bold: a gain in all three seeds.}
+\label{tab:dtgt}
+\begin{tabular}{lcccccc}
+\toprule
+pair & JDOT & DANN & FDA & MMD & spectral & AdaBN \\
+\midrule
+Eur $\to$ Horn & $\mathbf{-0.37\pm0.28}$ & $0.08\pm0.13$ & $-0.26\pm0.46$ & $0.20\pm0.83$ & $0.02\pm0.46$ & $1.62\pm0.20$ \\
+Eur $\to$ Mel  & $0.65\pm0.95$ & $0.81\pm1.64$ & $\mathbf{-0.52\pm0.55}$ & $0.67\pm0.47$ & $0.81\pm0.82$ & $1.85\pm0.35$ \\
+Horn $\to$ Eur & $\mathbf{-0.61\pm0.36}$ & $\mathbf{-1.05\pm0.31}$ & $\mathbf{-1.49\pm0.03}$ & $\mathbf{-0.82\pm0.18}$ & $\mathbf{-1.39\pm0.17}$ & $\mathbf{-1.43\pm0.08}$ \\
+Horn $\to$ Mel & $3.14\pm0.62$ & $0.16\pm0.60$ & $0.71\pm1.17$ & $0.61\pm1.04$ & $0.69\pm0.79$ & $3.27\pm1.25$ \\
+Mel $\to$ Eur  & $\mathbf{-2.85\pm1.06}$ & $\mathbf{-3.08\pm1.32}$ & $-1.45\pm1.37$ & $\mathbf{-3.04\pm1.12}$ & $\mathbf{-3.40\pm1.04}$ & $0.91\pm0.94$ \\
+Mel $\to$ Horn & $2.12\pm0.99$ & $1.64\pm0.52$ & $0.63\pm0.66$ & $1.63\pm0.19$ & $2.18\pm1.08$ & $6.75\pm1.50$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Source inflation $\Es(m)-\Es(\text{source-only})$ in
+$\mathrm{MSE}_{\log}$. For reference, the in-domain source risks are 7.26
+(Europe), 4.56 (Horn) and 13.63 (Melanesia).}
+\label{tab:dsrc}
+\begin{tabular}{lcccccc}
+\toprule
+pair & JDOT & DANN & FDA & MMD & spectral & AdaBN \\
+\midrule
+Eur $\to$ Horn & $0.81\pm0.14$ & $0.47\pm0.09$ & $0.27\pm0.06$ & $0.61\pm0.24$ & $0.49\pm0.05$ & $0.08\pm0.02$ \\
+Eur $\to$ Mel  & $2.47\pm0.45$ & $2.13\pm0.24$ & $0.61\pm0.03$ & $1.96\pm0.08$ & $2.02\pm0.33$ & $0.01\pm0.07$ \\
+Horn $\to$ Eur & $0.53\pm0.22$ & $2.07\pm0.62$ & $0.11\pm0.00$ & $2.38\pm0.66$ & $2.10\pm1.07$ & $0.01\pm0.02$ \\
+Horn $\to$ Mel & $0.69\pm0.19$ & $0.46\pm0.09$ & $0.12\pm0.03$ & $0.43\pm0.08$ & $0.37\pm0.08$ & $0.03\pm0.02$ \\
+Mel $\to$ Eur  & $12.2\pm1.2$ & $26.8\pm3.0$ & $1.80\pm0.18$ & $29.4\pm3.2$ & $39.8\pm3.5$ & $0.00\pm0.03$ \\
+Mel $\to$ Horn & $3.89\pm0.98$ & $10.4\pm1.3$ & $0.38\pm0.04$ & $8.91\pm1.49$ & $9.25\pm0.85$ & $0.03\pm0.09$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Tables~\ref{tab:dtgt} and~\ref{tab:dsrc} give the change in target and source
+risk of each method against source-only. Four observations.
+
+\emph{Consistent target gains are confined to Europe as the target.} Every
+method improves Horn $\to$ Europe in all three seeds, recovering 11--27\,\% of
+the oracle budget. Four methods improve Melanesia $\to$ Europe in all seeds,
+recovering about half. Away from Europe, only JDOT on Europe $\to$ Horn
+($32\pm15$\,\% of the budget) and FDA on Europe $\to$ Melanesia
+($19\pm20$\,\%) gain in all three seeds. Every other method--pair cell is
+worse than source-only or within seed noise, and on
+Melanesia $\to$ Horn no method gains in any seed.
+
+\emph{Most gains are paid for on the source, two are not.} Into Europe from
+Melanesia, DANN, MMD and the spectral loss raise the source risk by 27 to 40,
+two to three times the in-domain source risk of 13.6, for a target gain of
+about 3. The methods move the model off the source conditional; outside Europe
+as a target, they do not buy target risk in exchange. The exceptions are FDA
+and AdaBN on Horn $\to$ Europe, which gain $1.49\pm0.03$ and $1.43\pm0.08$
+at a source cost of $0.11$ and $0.01$, in all three seeds. They are the
+strongest results for UDA in this study. We do not read them as adaptation
+until the zero-rain check below has been run, since AdaBN only re-estimates
+normalisation statistics and a shift towards drier predictions would lower the
+target risk without any alignment.
+
+\emph{The ordering of methods is not stable, with two exceptions.} Ranking
+the seven models (source-only and six methods) by target risk, the order
+differs between seeds in all six directions, which with seven items and three
+seeds is the default rather than a finding. The stable parts are that
+source-only is last in all seeds for Horn $\to$ Europe and first in all seeds
+for Melanesia $\to$ Horn. \todo{Kendall's $W$ per pair, or a sentence on which
+pairwise comparisons are stable.}
+
+\emph{AdaBN is not a neutral baseline.} Re-estimating BatchNorm statistics on
+the target raises mean target risk in five of six directions, four of them
+well beyond seed noise, by up to $6.75\pm1.50$ on Melanesia $\to$ Horn. It
+helps only Horn $\to$ Europe.
+
+\paragraph{Two explanations to rule out.} The Europe-as-target gains need
+checking against a simpler cause. In earlier, unseeded evaluations every
+foreign model scored on Europe had a bias equal to minus its MAE, the
+signature of predicting almost no rain. If that holds, any perturbation that
+lowers predicted rain scores better there.
+\todo{field-mean check of the seeded methods.} Second, every method with a
+target forward pass (DANN, MMD, JDOT, the spectral loss) runs it in training
+mode, so the BatchNorm running statistics used at test time become a
+source--target mixture, a partial AdaBN. That would explain why FDA, which
+has no target forward pass, inflates source risk least among the trained
+methods (Table~\ref{tab:dsrc}). It does not explain the AdaBN row, which
+replaces the statistics by target ones entirely and still shows no source
+inflation. The reason is in the protocol: AdaBN keeps per-domain
+statistics, and its source risk is scored with the unadapted checkpoint, so
+the row cannot show BatchNorm mixing. \todo{confirm in \texttt{evaluate.py}
+(\texttt{target\_checkpoint()}) before submission.} \todo{GAP-ablation control arm: target forward with
+zero alignment weight; report the share of source inflation it reproduces.}
+
+\paragraph{Is feature alignment blocked by pooling?} Every feature-level
+loss acts on the globally average-pooled bottleneck: 512 numbers per sample,
+with the spatial layout averaged away. If the regions differ mainly in where
+features fire, alignment never sees the difference. The JDOT feature term,
+for instance, carried 0.3\,\% of the transport cost. We test this directly on
+Europe $\to$ Melanesia with three seeds and four arms: a control with the
+target forward pass and no alignment; unbiased MMD on pooled features;
+unbiased MMD on a $4\times4$ grid of per-cell means and standard deviations
+(16,384 dimensions); and the grid MMD at all four encoder levels, since the
+skip connections bypass the bottleneck. The aligned arms weight the MMD so
+that its encoder gradient is half the task gradient, and each run logs the
+discrepancy under both poolings as a manipulation check. \todo{results and
+reading, from \texttt{results/gap\_ablation/summary/summary.md}.}
+
+% ---------------------------------------------------------------------
+\section{The failure does not depend on the objective}
+\label{sec:afm}
+
+A referee can answer the analysis above in one sentence: a loss whose
+minimiser is the conditional mean collapses towards that mean under shift. We
+therefore repeat the diagnosis with adaptive flow matching
+\citep{fotiadis2025afm,lipman2023flow}. Its encoder is the same width-32 dual
+UNet, so the two arms differ in the objective, not the backbone. The risk
+becomes the fair CRPS \citep{gneiting2007scoring,ferro2014fair} in
+standardised log space, and the oracle decomposition becomes
+$\lamhat_{\mathrm{CRPS}}=\mathrm{CRPS}_T(h_{\mathrm{joint}})-\mathrm{CRPS}_T(h_T)$.
+UDA methods act on the encoder exactly as in the UNet arm; FDA and AdaBN also
+reach the flow network. No method adapts the generative part, so this tests
+whether the gap survives a probabilistic objective, not whether UDA can be
+made to work for flow matching. \todo{learning-rate sweep, training, CRPS
+transfer matrix and $\lamhat_{\mathrm{CRPS}}$; spread--skill under transfer.}
+
+% ---------------------------------------------------------------------
+\section{Structure-aware evaluation}
+\label{sec:structure}
+
+\todo{FSS across scale with per-domain quantile-matched thresholds; RAPSD,
+raw and normalised; Moran's I of the target per sample as a difficulty
+covariate. Question for Moran's I: does the transfer asymmetry survive
+conditioning on target morphology? Case-study panel, median and tail cases
+picked from the per-sample losses.}
+
+% ---------------------------------------------------------------------
+\section{Discussion}
+
+The results separate two questions that the UDA literature usually merges:
+whether a hypothesis good on both regions exists, and whether unlabelled target
+data can find it. Here the first answer is yes in five of six directions and
+the second is no. Alignment acts on input or feature marginals, and the
+missing information is in the conditional.
+
+Our claim concerns pointwise risk and what unlabelled target data can
+identify. It does not say that a generative model cannot produce structurally
+realistic fields in a new region; \citet{glawion2025} show that it can.
+Realism of the generated distribution and accuracy of the conditional are
+different targets, and the second is the one downscaling for impact studies
+needs.
+
+\todo{what would help instead: a few labelled target samples, physically
+constrained conditionals, or target-specific bias correction; one paragraph,
+no new experiments.}
+
+% ---------------------------------------------------------------------
+\section{Limitations}
+\label{sec:limits}
+
+\begin{itemize}
+  \item \emph{Seed variance is initialisation variance.} The seed sets weight
+        initialisation and cuDNN nondeterminism only; all runs share the
+        validation split and the data order, which is also the same in every
+        epoch. Error bars are therefore narrower than a full re-draw of the
+        training procedure would give.
+  \item \emph{Two software stacks.} Source-only, oracle and JDOT runs were
+        trained on GH200 (PyTorch 2.9); the other methods on A100 (PyTorch
+        2.13). A re-run of the seed-42 Europe$\to$Horn JDOT configuration on
+        A100 (\texttt{unet\_seed42\_a100check}) is compared with the GH200
+        seed spread. \todo{its training, validation and test metrics against
+        that spread; until they are in, the five A100 methods carry an
+        unquantified stack difference.}
+  \item \emph{No hyper-parameter search} for the UNet or the UDA weights.
+        Tuning the weights would move each method along its own trade-off; the
+        oracle bounds what any weight can recover.
+  \item \emph{Three regions, one pair of products.} The conclusions are
+        conditional on ERA5 predictors and an IMERG target.
+  \item \emph{Pixel-wise shift test.} Section~\ref{sec:shift} measures a
+        two-coordinate, pixel-wise conditional and gives an upper bound.
+\end{itemize}
+
+% ---------------------------------------------------------------------
+\section{Conclusion}
+
+\todo{after claims 3 and 4 are in.}
+
+\todo{references: Qian 2026, Glawion 2025 and the IMERG entry are placeholders;
+verify the Fotiadis title and the ERA5 entry; remove the \texttt{note} fields
+that say TODO before submission.}
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+% ---------------------------------------------------------------------
+\appendix
+\section{Recovery and seed counts}
+
+\todo{the recovery table (fraction of the oracle budget) and the per-cell seed
+counts from \texttt{tables.md}; note that recovery is unstable where the budget
+is small (Melanesia $\to$ Horn, 0.63).}
+
+\section{Dropped methods}
+\label{app:dropped}
+
+\todo{the CORAL and multi-scale MMD audit: what was run, what made them
+inert or unstable.}
+
+\section{Normalised generalisation gap}
+
+\todo{decide whether to keep NGG. Each cell is consistent, but means over
+pairs weight each source by $s_S^2$; report per pair or rescale first.}
+
+\end{document}

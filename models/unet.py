@@ -55,6 +55,8 @@ class DualEncoderUNet(nn.Module):
         static_channels: int = 2,
         out_channels: int = 1,
         base_features: int = 64,
+        dyn_keep=None,
+        stat_keep=None,
     ):
         super().__init__()
         f = base_features  # shorthand
@@ -95,6 +97,19 @@ class DualEncoderUNet(nn.Module):
         # --- Output head ---
         self.final_conv = nn.Conv2d(f, out_channels, kernel_size=1)
 
+        # --- Input masking (PLAN.md P19) ---
+        # A channel with keep 0 is zeroed before the encoders: the source mean
+        # in z-scored space, all-sea for lsm, a constant either way. Layers and
+        # seeded initialisation stay those of the full model. A None buffer is
+        # left out of the state dict, so unmasked checkpoints are unchanged,
+        # and a masked one fails to load into an unmasked model instead of
+        # silently running on every input.
+        def _keep(v):
+            return None if v is None else torch.as_tensor(v, dtype=torch.float32).reshape(1, -1, 1, 1)
+
+        self.register_buffer("dyn_keep", _keep(dyn_keep))
+        self.register_buffer("stat_keep", _keep(stat_keep))
+
     def _match_size(self, x, target):
         """Interpolate x to match target's spatial dims (handles pooling rounding)."""
         if x.shape[2:] != target.shape[2:]:
@@ -114,6 +129,11 @@ class DualEncoderUNet(nn.Module):
             features (optional): dict with keys 'bottleneck', 'enc4', 'enc3',
                                  'enc2' for multi-scale UDA losses
         """
+
+        if self.dyn_keep is not None:
+            x_dyn = x_dyn * self.dyn_keep
+        if self.stat_keep is not None:
+            x_stat = x_stat * self.stat_keep
 
         # x_dyn arrives at native input resolution (80x80) when the dataset
         # yields raw inputs (upsample_on_gpu=True). Bring it to the target grid

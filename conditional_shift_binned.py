@@ -87,7 +87,8 @@ def _w1_exact(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _load_matched(domain_path: Path, split: str, n_frames: int, seed: int):
-    """Return per-pixel (cape, tcw, log-precip) on a common 40x40 grid.
+    """Return per-pixel (cape, tcw, log-precip) on a common 40x40 grid, and
+    each pixel's time index in the split (hours from its start).
 
     Inputs are 80x80 and the target 200x200; both are block-averaged to 40x40
     so each input pixel has one collocated target value.
@@ -113,7 +114,7 @@ def _load_matched(domain_path: Path, split: str, n_frames: int, seed: int):
 
     di.close()
     do.close()
-    return cape.ravel(), tcw.ravel(), p.ravel()
+    return cape.ravel(), tcw.ravel(), p.ravel(), np.repeat(idx, 40 * 40)
 
 
 def _binned_w1(a_cape, a_tcw, a_p, b_cape, b_tcw, b_p, n_bins, min_count):
@@ -154,20 +155,46 @@ def _binned_w1(a_cape, a_tcw, a_p, b_cape, b_tcw, b_p, n_bins, min_count):
     return cond, uncond, len(w), support
 
 
-def null_baseline(cape, tcw, p, n_bins, min_count, seed):
-    """W1_cond under a TRUE null: one domain split at random into two halves.
+# Null splits (PLAN.md P1). "pixel" is the original random pixel split: it
+# puts neighbouring pixels of the same frame, and frames an hour apart, in
+# both halves, so the halves share weather and the null is too LOW. The block
+# splits keep whole blocks of time together: "week" assigns 168-hour blocks
+# to the halves at random, "year" splits the split's first 8,760 hours from
+# the rest (the test split is two years; this one also carries interannual
+# variability, so it is the most conservative).
+NULL_BLOCK_HOURS = {"pixel": None, "week": 168, "year": 8760}
 
-    Runs the identical pipeline, so the returned value contains exactly the
+
+def null_baseline(cape, tcw, p, t, n_bins, min_count, seed, mode="week", n_rep=20):
+    """W1_cond under a TRUE null: one domain split into two halves.
+
+    Runs the identical pipeline, so the returned values contain exactly the
     same finite-sample noise and residual within-bin covariate variation as a
-    real cross-domain comparison. It is the floor W1_cond must clear.
+    real cross-domain comparison. They are the floor W1_cond must clear.
+    `t` is each pixel's time index; block modes split on t // block_hours.
+    Returns the n_rep null values (one for "year", which has a single split)
+    and the bins used in the last one.
     """
     rng = np.random.default_rng(seed)
-    m = rng.permutation(p.size)
-    h = p.size // 2
-    i, j = m[:h], m[h:]
-    cond, _, nb, _ = _binned_w1(cape[i], tcw[i], p[i],
-                                cape[j], tcw[j], p[j], n_bins, min_count)
-    return cond, nb
+    hours = NULL_BLOCK_HOURS[mode]
+    if hours is not None:
+        blocks = t // hours
+        ub = np.unique(blocks)
+        if len(ub) < 2:
+            raise ValueError(f"null mode {mode}: only {len(ub)} block(s) of {hours} h")
+    vals, nb = [], 0
+    for _ in range(1 if mode == "year" else n_rep):
+        if hours is None:
+            half = np.zeros(p.size, bool)
+            half[rng.permutation(p.size)[: p.size // 2]] = True
+        elif mode == "year":
+            half = blocks == ub[0]
+        else:
+            half = np.isin(blocks, ub[rng.permutation(len(ub))[: len(ub) // 2]])
+        cond, _, nb, _ = _binned_w1(cape[half], tcw[half], p[half],
+                                    cape[~half], tcw[~half], p[~half], n_bins, min_count)
+        vals.append(cond)
+    return np.asarray(vals, float), nb
 
 
 def main():
@@ -182,29 +209,44 @@ def main():
     ap.add_argument("--support_threshold", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="conditional_shift_binned.json")
+    ap.add_argument("--null_modes", nargs="+", default=["pixel", "week", "year"],
+                    choices=list(NULL_BLOCK_HOURS))
+    ap.add_argument("--null_reps", type=int, default=20,
+                    help="random splits per null mode (\"year\" has one)")
     a = ap.parse_args()
+    if Path(a.out).exists():
+        raise SystemExit(f"{a.out} exists. Not overwriting.")
 
     root = Path(a.data_root)
     data = {d: _load_matched(root / d, a.split, a.n_frames, a.seed) for d in a.domains}
 
-    # Null floor, one per domain: identical pipeline on a random split.
-    print("=== null baseline (same domain split in half; W1_cond under a true null) ===")
-    nulls = {}
+    # Null floor, one per domain and split mode: identical pipeline on a
+    # split of one domain. The verdict uses the LARGEST block-null mean of
+    # the two domains' (the most conservative floor); the pixel null is kept
+    # only to compare with the numbers it produced before P1.
+    print("=== null baselines (one domain split in half; W1_cond under a true null) ===")
+    nulls, null_stats = {}, {}
     for d in a.domains:
-        c, t, p = data[d]
-        nv, nb = null_baseline(c, t, p, a.n_bins, a.min_count, a.seed)
-        nulls[d] = nv
-        print(f"  {d:22s} W1_cond_null = {nv:.4f}   ({nb} bins)")
-    null_med = float(np.nanmedian(list(nulls.values())))
-    print(f"  median null floor = {null_med:.4f}\n")
+        c, tc, p, t = data[d]
+        null_stats[d] = {}
+        for mode in a.null_modes:
+            v, nb = null_baseline(c, tc, p, t, a.n_bins, a.min_count, a.seed, mode, a.null_reps)
+            null_stats[d][mode] = {"mean": float(np.nanmean(v)), "sd": float(np.nanstd(v)),
+                                   "p95": float(np.nanpercentile(v, 95)), "n": int(v.size),
+                                   "bins": nb}
+            print(f"  {d:22s} {mode:6s} mean {np.nanmean(v):.4f}  sd {np.nanstd(v):.4f}  "
+                  f"p95 {np.nanpercentile(v, 95):.4f}  (n={v.size}, {nb} bins)")
+        block = [m for m in a.null_modes if m != "pixel"] or ["pixel"]
+        nulls[d] = max(null_stats[d][m]["mean"] for m in block)
+    print(f"  floors used: { {d: round(v, 4) for d, v in nulls.items()} }\n")
 
     print("=== matched-input conditional discrepancy ===")
     print(f"{'pair':34s} {'W1_cond':>8} {'/null':>7} {'W1_unc':>8} "
           f"{'ratio':>7} {'support':>8} {'bins':>5}  verdict")
     res = {}
     for x, y in itertools.combinations(a.domains, 2):
-        cond, unc, nb, sup = _binned_w1(*data[x], *data[y], a.n_bins, a.min_count)
-        floor = np.nanmean([nulls[x], nulls[y]])
+        cond, unc, nb, sup = _binned_w1(*data[x][:3], *data[y][:3], a.n_bins, a.min_count)
+        floor = max(nulls[x], nulls[y])
         excess = cond / floor if floor and np.isfinite(floor) and floor > 0 else np.nan
         ratio = cond / unc if unc and np.isfinite(unc) and unc > 0 else np.nan
 
@@ -222,13 +264,16 @@ def main():
 
         res[f"{x}__{y}"] = {"w1_cond": cond, "w1_uncond": unc,
                             "null_floor": floor, "excess_over_null": excess,
+                            "excess_by_mode": {m: cond / max(null_stats[x][m]["mean"], null_stats[y][m]["mean"])
+                                               for m in a.null_modes},
                             "ratio_cond_over_uncond": ratio,
                             "support_min": sup, "n_bins_used": nb,
                             "verdict": verdict}
         print(f"{x+' <-> '+y:34s} {cond:8.4f} {excess:7.2f} {unc:8.4f} "
               f"{ratio:7.2f} {sup:8.1%} {nb:5d}  {verdict}")
 
-    Path(a.out).write_text(json.dumps({"nulls": nulls, "pairs": res}, indent=2))
+    Path(a.out).write_text(json.dumps({"nulls": nulls, "null_stats": null_stats,
+                                       "args": vars(a), "pairs": res}, indent=2))
     print(f"\nWrote {a.out}")
     print(
         "\nReading the table:\n"

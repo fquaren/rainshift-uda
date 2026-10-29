@@ -55,19 +55,65 @@ def coral_loss(src_feat: torch.Tensor, tgt_feat: torch.Tensor) -> torch.Tensor:
     return (cov_s - cov_t).pow(2).sum() / d
 
 
+def pool_features(feat: torch.Tensor, pool: str = "gap") -> torch.Tensor:
+    """
+    (B, C, H, W) feature map -> (B, D) vector for a feature-alignment loss.
+
+    gap    global average pooling, D = C. What every feature loss here used
+           originally: it keeps which channels fire and discards where.
+    grid4  per-channel mean and standard deviation over a 4 x 4 grid of cells
+           (3 x 3 cells at the 12 x 12 bottleneck), D = 32 C. Keeps coarse
+           geometry; the GAP ablation (PLAN.md, Stage 2 panel c). The std
+           rather than the variance keeps both halves in feature units, so
+           neither dominates the RBF distance.
+    """
+    if pool == "gap":
+        return F.adaptive_avg_pool2d(feat, 1).flatten(1)
+    if pool == "grid4":
+        m = F.adaptive_avg_pool2d(feat, 4)
+        v = (F.adaptive_avg_pool2d(feat * feat, 4) - m * m).clamp_min(0.0)
+        return torch.cat([m.flatten(1), (v + 1e-6).sqrt().flatten(1)], dim=1)
+    raise ValueError(f"unknown pool '{pool}'")
+
+
+def _mmd_from_vectors(src, tgt, bandwidths, unbiased=False):
+    """Multi-kernel MMD^2 between two (B, D) sets. The biased estimator keeps
+    the kernel diagonal, which adds ~2/B times (1 - mean off-diagonal kernel)
+    regardless of the domains; the unbiased one drops it (and can be < 0)."""
+    d_ss = torch.cdist(src, src, p=2.0).pow(2)
+    d_tt = torch.cdist(tgt, tgt, p=2.0).pow(2)
+    d_st = torch.cdist(src, tgt, p=2.0).pow(2)
+
+    def _within(k):
+        if not unbiased:
+            return k.mean()
+        n = k.size(0)
+        return (k.sum() - k.diagonal().sum()) / (n * (n - 1))
+
+    loss = torch.tensor(0.0, device=src.device, dtype=src.dtype)
+    for bw in bandwidths:
+        gamma = 1.0 / (2.0 * bw * bw)
+        loss = loss + _within(torch.exp(-gamma * d_ss)) + _within(torch.exp(-gamma * d_tt)) \
+            - 2.0 * torch.exp(-gamma * d_st).mean()
+    return loss / len(bandwidths)
+
+
 def mmd_loss(
     src_feat: torch.Tensor,
     tgt_feat: torch.Tensor,
     bandwidths: Optional[list] = None,
+    pool: str = "gap",
+    unbiased: bool = False,
 ) -> torch.Tensor:
     """
     Multi-kernel Maximum Mean Discrepancy with Gaussian RBF kernels, on
-    single-level GAP-pooled features.
+    single-level pooled features (pool_features). The defaults, GAP and the
+    biased estimator, are what every seeded MMD run used.
 
     Gretton et al., JMLR 2012; Long et al., ICML 2015 (DAN).
     """
-    src = F.adaptive_avg_pool2d(src_feat, 1).flatten(1)
-    tgt = F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1)
+    src = pool_features(src_feat, pool)
+    tgt = pool_features(tgt_feat, pool)
 
     # Bandwidths. A FIXED ladder (the old default [0.01..100]) is wrong here:
     # GAP-pooled 512-d bottleneck features have median pairwise distance ~70,
@@ -76,27 +122,32 @@ def mmd_loss(
     # a batch-size artefact carrying no domain signal (this is why single-scale
     # MMD logged a near-constant 0.0115). We therefore default to the median
     # heuristic (Gretton et al. 2012) with the standard DAN 2^{-2..2} ladder,
-    # matching what mmd_multiscale_loss already did.
+    # matching what mmd_multiscale_loss already did. The median is taken on the
+    # pooled vectors, so it follows the pooling.
     if bandwidths is None:
-        bw = _median_heuristic_bandwidth(src_feat, tgt_feat)
+        bw = _median_pairwise_distance(src, tgt)
         bandwidths = [bw * (2.0**k) for k in (-2, -1, 0, 1, 2)]
 
-    def _pairwise_sq_dist(a, b):
-        return torch.cdist(a, b, p=2.0).pow(2)
+    return _mmd_from_vectors(src, tgt, bandwidths, unbiased)
 
-    d_ss = _pairwise_sq_dist(src, src)
-    d_tt = _pairwise_sq_dist(tgt, tgt)
-    d_st = _pairwise_sq_dist(src, tgt)
 
-    loss = torch.tensor(0.0, device=src.device, dtype=src.dtype)
-    for bw in bandwidths:
-        gamma = 1.0 / (2.0 * bw * bw)
-        k_ss = torch.exp(-gamma * d_ss)
-        k_tt = torch.exp(-gamma * d_tt)
-        k_st = torch.exp(-gamma * d_st)
-        loss = loss + k_ss.mean() + k_tt.mean() - 2.0 * k_st.mean()
-
-    return loss / len(bandwidths)
+@torch.no_grad()
+def mmd_diagnostics(src_feat: torch.Tensor, tgt_feat: torch.Tensor) -> Dict[str, float]:
+    """
+    Logging only: unbiased MMD^2 source vs target under both poolings, and a
+    within-batch null (first vs second half of the source batch) with the
+    same bandwidths. The null halves come from one shuffle buffer, so they
+    are closer than independent draws and the null is a lower reference.
+    """
+    out = {}
+    for pool in ("gap", "grid4"):
+        s, t = pool_features(src_feat, pool), pool_features(tgt_feat, pool)
+        bw = _median_pairwise_distance(s, t)
+        bws = [bw * (2.0**k) for k in (-2, -1, 0, 1, 2)]
+        h = s.size(0) // 2
+        out[f"mmd_{pool}"] = _mmd_from_vectors(s, t, bws, unbiased=True).item()
+        out[f"null_{pool}"] = _mmd_from_vectors(s[:h], s[h:2 * h], bws, unbiased=True).item()
+    return out
 
 
 def mmd_multiscale_loss(
@@ -105,6 +156,8 @@ def mmd_multiscale_loss(
     levels: Iterable[str] = ("enc2", "enc3", "enc4", "bottleneck"),
     bandwidths: Optional[list] = None,
     median_heuristic: bool = True,
+    pool: str = "gap",
+    unbiased: bool = False,
 ) -> torch.Tensor:
     """
     Multi-scale MMD: average single-scale MMD losses across several encoder
@@ -130,14 +183,12 @@ def mmd_multiscale_loss(
             f"Requested {list(levels)}, available {list(src_feats)}."
         )
 
+    # With the median heuristic, mmd_loss derives each level's bandwidth from
+    # that level's pooled vectors, so it follows --pool.
     losses = []
     for lvl in active_levels:
-        if median_heuristic:
-            bw = _median_heuristic_bandwidth(src_feats[lvl], tgt_feats[lvl])
-            bws = [bw * (2.0**k) for k in (-2, -1, 0, 1, 2)]
-        else:
-            bws = bandwidths
-        losses.append(mmd_loss(src_feats[lvl], tgt_feats[lvl], bandwidths=bws))
+        bws = None if median_heuristic else bandwidths
+        losses.append(mmd_loss(src_feats[lvl], tgt_feats[lvl], bandwidths=bws, pool=pool, unbiased=unbiased))
 
     return torch.stack(losses).mean()
 
@@ -155,9 +206,17 @@ def _median_heuristic_bandwidth(
     not receive gradient. Capped at max_samples per domain to avoid O(n^2)
     memory on large batches.
     """
-    src = F.adaptive_avg_pool2d(src_feat, 1).flatten(1)
-    tgt = F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1)
+    return _median_pairwise_distance(
+        F.adaptive_avg_pool2d(src_feat, 1).flatten(1),
+        F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1),
+        max_samples,
+    )
 
+
+@torch.no_grad()
+def _median_pairwise_distance(src: torch.Tensor, tgt: torch.Tensor, max_samples: int = 512) -> float:
+    """Median pairwise Euclidean distance over the stacked (B, D) source and
+    target vectors; a scalar constant, so it carries no gradient."""
     if src.size(0) > max_samples:
         src = src[:max_samples]
     if tgt.size(0) > max_samples:

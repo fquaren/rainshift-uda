@@ -8,11 +8,13 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
 
 from data.dataset import inverse_transform, load_domain_stats
 from data.dataset_zarr import ClimateSRDatasetZarr, JointZarrDataset
 from models.afm import AFMModel
+from prob_metrics import crps_fair
 from uda import (
     DomainDiscriminator,
     coral_loss,
@@ -72,6 +74,23 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
     )
 
 
+def build_crps_loader(args, path, src_stats, batch_size):
+    """Validation subset for the ensemble CRPS: --val_crps_chunks chunks
+    spread evenly over the validation split. The first N chunks of the
+    strided split would cover only the start of the record, i.e. one or two
+    seasons, so the subset is thinned rather than truncated."""
+    ds = ClimateSRDatasetZarr(
+        path, "validation", stats=src_stats,
+        val_chunks=args.val_chunks, shuffle_buffer_chunks=args.shuffle_buffer_chunks,
+    )
+    n = args.val_crps_chunks
+    if n and n < len(ds.chunk_ids):
+        idx = np.linspace(0, len(ds.chunk_ids) - 1, n).round().astype(int)
+        ds.chunk_ids = [ds.chunk_ids[i] for i in idx]
+    nw = min(args.num_workers, len(ds.chunk_ids))
+    return DataLoader(ds, batch_size, num_workers=nw, pin_memory=True, persistent_workers=nw > 0)
+
+
 def build_uda(method, mmd_levels, device, base_features=64):
     if method == "coral":
         return {"loss_fn": coral_loss}, []
@@ -93,22 +112,36 @@ def build_uda(method, mmd_levels, device, base_features=64):
     return {}, []
 
 
-def build_optimizer(model, base_lr, uda_params):
+def build_optimizer(model, base_lr, uda_params, encoder_lr_ratio=0.1):
     encoder_params = list(model.encoder.parameters())
     flow_params = list(model.flow_net.parameters())
 
     return torch.optim.AdamW(
         [
-            {"params": encoder_params, "lr": base_lr * 0.1, "weight_decay": 1e-3},
+            {"params": encoder_params, "lr": base_lr * encoder_lr_ratio, "weight_decay": 1e-3},
             {"params": flow_params, "lr": base_lr, "weight_decay": 1e-5},
             {"params": uda_params, "lr": base_lr * 0.1, "weight_decay": 1e-4},
         ]
     )
 
 
+def build_ema(model, decay):
+    """EMA of the weights AND the buffers (PLAN.md 3.6 step 2). BatchNorm
+    running statistics belong to the weights that produced them, so the EMA
+    weights get EMA statistics rather than the raw model's last ~10 batches;
+    re-estimating them afterwards was measured to cost 0.003-0.015 val CRPS
+    (afm_val_diag.py). sigma_z, itself an EMA of the encoder RMSE, is smoothed
+    once more. The integer num_batches_tracked is truncated by the update and
+    stops advancing, which is harmless: it is read only when momentum is None.
+    The first update copies the model, so the random init never enters."""
+    if decay <= 0:
+        return None
+    return AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(decay), use_buffers=True)
+
+
 def train_one_epoch(
     model, src_ld, tgt_ld, opt, uda_comp, method, lam_eff, beta, device, epoch, total, dann_weight=5e-4,
-    jdot_alpha=1.0, jdot_reg=0.1,
+    jdot_alpha=1.0, jdot_reg=0.1, ema=None,
 ):
     model.train()
     sf, se, su, n = 0.0, 0.0, 0.0, 0
@@ -176,6 +209,8 @@ def train_one_epoch(
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        if ema is not None:
+            ema.update_parameters(model)
         sf += out["flow_loss"].item()
         se += out["encoder_loss"].item()
         su += uda.item()
@@ -202,8 +237,29 @@ def evaluate(model, loader, device, stats, var="precipitation", n_ens=0, steps=2
     return {"loss": sl / n, "mae_mm": sm / n}
 
 
-def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_beta=None, weight_decay=None, enc_w=None):
+@torch.no_grad()
+def evaluate_crps(model, loader, device, n_ens, steps, seed=0):
+    """Fair CRPS of an n_ens-member ensemble in standardised space, the
+    space of the training loss. The generator is reseeded on every call, so
+    each epoch and each run scores the same noise draws and differences in the
+    score come from the model, not the sampler."""
+    model.eval()
+    g = torch.Generator(device=device)
+    g.manual_seed(seed)
+    tot, n = 0.0, 0
+    for b in loader:
+        x, s, y = (t.to(device, non_blocking=True) for t in b)
+        ens = model.sample(x, s, n_samples=n_ens, steps=steps, generator=g)
+        c = crps_fair(ens, y)
+        tot += c.sum().item()
+        n += c.numel()
+    return tot / max(n, 1)
+
+
+def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_beta=None, weight_decay=None, enc_w=None,
+                 encoder_lr_ratio=None):
     _lr = lr or args.lr
+    _er = encoder_lr_ratio if encoder_lr_ratio is not None else args.encoder_lr_ratio
     _lam = lambda_uda if lambda_uda is not None else args.lambda_uda
     _bs = batch_size or args.batch_size
     _beta = fda_beta if fda_beta is not None else args.fda_beta
@@ -213,18 +269,28 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
     ss = load_domain_stats(args.source_path)
     ts = load_domain_stats(args.target_path)
     src_tr, src_val, tgt_tr, tgt_te, tgt_val = build_loaders(args, ss, ts, _bs)
+    use_crps = args.select_on == "crps" or args.val_crps_every > 0
+    if use_crps:
+        src_val_crps = build_crps_loader(args, args.source_path, ss, _bs)
+        tgt_val_crps = build_crps_loader(args, args.target_path, ss, _bs) if args.joint_training else None
 
     model = AFMModel(9, 2, 1, args.base_features, encoder_loss_weight=_ew).to(device)
+    # With --ema_decay > 0, every validation score, the selection and best.pt
+    # use the EMA copy; best.pt stays a plain AFMModel state dict, so the
+    # evaluation and AdaBN paths load it unchanged.
+    ema = build_ema(model, args.ema_decay)
+    ev = ema.module if ema is not None else model
 
     uc, ep = build_uda(args.uda_method, args.mmd_levels, device, args.base_features)
-    opt = build_optimizer(model, _lr, ep)
+    opt = build_optimizer(model, _lr, ep, _er)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
 
     tag = f"afm_{_tag(args.source_path, args.target_path)}__{args.uda_method}"
     out = Path(args.output_dir) / tag
     out.mkdir(parents=True, exist_ok=True)
 
-    best, wait = float("inf"), 0
+    best, wait, best_epoch = float("inf"), 0, 0
+    history = []
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         # Per-epoch lambda; ignored when the method has no auxiliary loss
@@ -244,41 +310,80 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
             epoch,
             args.epochs,
             dann_weight=args.dann_weight,
-            jdot_alpha=args.jdot_alpha, jdot_reg=args.jdot_reg,
+            jdot_alpha=args.jdot_alpha, jdot_reg=args.jdot_reg, ema=ema,
         )
         sched.step()
-        val = evaluate(model, src_val, device, ss)
-        tgt = evaluate(model, tgt_te, device, ss)
+        val = evaluate(ev, src_val, device, ss)
+        tgt = evaluate(ev, tgt_te, device, ss)
+
+        # Validation CRPS of the sampled ensemble. With --select_on mse the
+        # checkpoint is chosen on the encoder mean mu alone, and the flow
+        # network never enters selection; --select_on crps scores the
+        # generative model itself. Computed every epoch when selecting on it.
+        crps_src = crps_tgt = float("nan")
+        if use_crps and (args.select_on == "crps" or epoch % args.val_crps_every == 0):
+            crps_src = evaluate_crps(ev, src_val_crps, device, args.val_crps_members, args.val_crps_steps)
+            if args.joint_training:
+                crps_tgt = evaluate_crps(ev, tgt_val_crps, device, args.val_crps_members, args.val_crps_steps)
 
         # Oracle runs select on the JOINT criterion (target validation split,
         # never test); UDA runs select on source validation only so that no
         # target label influences selection. See train_unet.py for the full
         # argument -- selecting an oracle on source risk alone biases the
         # addressable budget downwards.
+        val_tgt = None
         if args.joint_training:
-            val_tgt = evaluate(model, tgt_val, device, ss)
-            select = 0.5 * (val["loss"] + val_tgt["loss"])
-            sel_str = f" sel={select:.4f}(src {val['loss']:.4f}/tgt {val_tgt['loss']:.4f})"
+            val_tgt = evaluate(ev, tgt_val, device, ss)
+        if args.select_on == "crps":
+            src_sel, tgt_sel = crps_src, crps_tgt
         else:
-            select = val["loss"]
+            src_sel, tgt_sel = val["loss"], (val_tgt["loss"] if val_tgt else float("nan"))
+        if args.joint_training:
+            select = 0.5 * (src_sel + tgt_sel)
+            sel_str = f" sel={select:.4f}(src {src_sel:.4f}/tgt {tgt_sel:.4f})"
+        else:
+            select = src_sel
             sel_str = ""
+        crps_str = f" val_crps={crps_src:.4f}" if crps_src == crps_src else ""
 
         print(
             f"[{epoch:3d}/{args.epochs}] {time.time()-t0:5.1f}s  "
             f"flow={tr['flow']:.4f} enc={tr['enc']:.4f} uda={tr['uda']:.4f} "
             f"lam={lam_eff:.4f} sigma_z={tr['sigma_z']:.4f} "
-            f"val={val['loss']:.4f} tgt_mae={tgt['mae_mm']:.3f}mm" + sel_str
+            f"val={val['loss']:.4f}{crps_str} tgt_mae={tgt['mae_mm']:.3f}mm" + sel_str
         )
 
         if select < best:
             best = select
+            best_epoch = epoch
             wait = 0
-            torch.save(model.state_dict(), out / "best.pt")
+            torch.save(ev.state_dict(), out / "best.pt")
         else:
             wait += 1
 
+        # Per-epoch curves for the learning-rate sweep. Validation only: the
+        # target-test MAE printed above is deliberately left out, so nothing
+        # downstream can select on a test number.
+        history.append({
+            "epoch": epoch, "time_s": round(time.time() - t0, 1),
+            "flow": tr["flow"], "enc": tr["enc"], "uda": tr["uda"], "sigma_z": tr["sigma_z"],
+            "val_mse": val["loss"], "val_crps": crps_src,
+            "tgt_val_mse": val_tgt["loss"] if val_tgt else float("nan"), "tgt_val_crps": crps_tgt,
+            "select": select,
+        })
+        with open(out / "history.csv", "w") as f:
+            f.write(",".join(history[0]) + "\n")
+            for h in history:
+                f.write(",".join(f"{v:.6g}" if isinstance(v, float) else str(v) for v in h.values()) + "\n")
+
         if args.patience > 0 and wait >= args.patience:
             print(f"Early stopping at epoch {epoch}")
+            break
+        # Truncates the run without changing the cosine schedule, which is
+        # still set by --epochs: a sweep run sees the first stop_after epochs
+        # of exactly the schedule a full run would see.
+        if args.stop_after and epoch >= args.stop_after:
+            print(f"Stopping after epoch {epoch} (--stop_after; schedule length {args.epochs})")
             break
 
     # Peak GPU memory of the whole run, for sizing jobs (A100s have 40 GB).
@@ -301,7 +406,9 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
         "lambda": _lam,
         "beta": _beta,
         "enc_w": _ew,
+        "encoder_lr_ratio": _er,
         "best_val_loss": best,
+        "best_epoch": best_epoch,
     }
 
     if args.uda_method == "none":
@@ -337,6 +444,9 @@ def _adabn_afm(model, loader, device):
     model.train()
     for x, s, _ in loader:
         x, s = x.to(device), s.to(device)
+        # The encoder upsamples x itself, but flow_net concatenates x with the
+        # 200x200 fields, so it needs x on the target grid (80x80 crashed).
+        x = model._match_dyn(x, s)
         mu = model.encoder(x, s)
         t = torch.rand(x.shape[0], device=device)
         z = mu + model.sigma_z * torch.randn_like(mu)
@@ -399,6 +509,23 @@ def parse_args():
         help="DANN adversarial loss weight; small because GRL alpha already ramps the reversal (Wang et al. 2026 best ~5e-4).",
     )
     p.add_argument("--encoder_loss_weight", type=float, default=0.1)
+    p.add_argument("--encoder_lr_ratio", type=float, default=0.1,
+                   help="Encoder learning rate as a fraction of --lr (the flow net trains at --lr). "
+                        "Phase 2 and the oracle read it back from base_hp/.")
+    p.add_argument("--select_on", default="mse", choices=["mse", "crps"],
+                   help="Checkpoint selection and early stopping: 'mse' of the encoder mean mu on the "
+                        "validation split, or the fair CRPS of the sampled ensemble on a validation subset.")
+    p.add_argument("--val_crps_members", type=int, default=4)
+    p.add_argument("--val_crps_steps", type=int, default=10, help="Midpoint steps (2 network calls each).")
+    p.add_argument("--val_crps_chunks", type=int, default=8,
+                   help="Validation chunks (200 samples each) for the CRPS, spread evenly over the split.")
+    p.add_argument("--val_crps_every", type=int, default=0,
+                   help="Also log the validation CRPS every N epochs when selecting on mse (0 = never).")
+    p.add_argument("--ema_decay", type=float, default=0.0,
+                   help="EMA of weights and buffers, updated every step; validation, selection and best.pt "
+                        "use the EMA copy (0 = off, the Stage A behaviour). PLAN.md 3.6 sets 0.999.")
+    p.add_argument("--stop_after", type=int, default=0,
+                   help="Stop after this many epochs without shortening the cosine schedule (0 = off).")
     p.add_argument("--joint_training", action="store_true", help="Train on concatenated source and target domains")
     p.add_argument(
         "--val_chunks",
@@ -446,6 +573,8 @@ def main():
             batch_size=b["batch_size"],
             weight_decay=b["weight_decay"],
             enc_w=b.get("encoder_loss_weight", 0.1),
+            # Phase-1 files written before the flag existed used 0.1.
+            encoder_lr_ratio=b.get("encoder_lr_ratio", 0.1),
         )
     else:
         if args.uda_method != "none":

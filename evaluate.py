@@ -8,7 +8,10 @@ Modes:
 Metrics (physical space, mm):
   Deterministic: RMSE, MAE, bias
   Probabilistic: CRPS, spread (AFM only, when --n_ensemble > 0)
-  Standardized:  mse_std (exact optimizer loss space)
+  Standardized:  mse_std (exact optimizer loss space); crps_std and
+                 spread_std for AFM ensembles. crps_mm is kept as a record
+                 only: like rmse_mm it is dominated by members that blow up
+                 when converted back to mm.
 
 Optional test-time input transforms (--input_transform):
   none       no transform (default)
@@ -56,11 +59,15 @@ def load_stats(domain_path):
     return _compute_and_cache_stats(_P(domain_path), None)
 from models.afm import AFMModel
 from models.unet import DualEncoderUNet
-from quantile_map import QuantileMap, fit_qm_from_npy
+from prob_metrics import crps_fair, ensemble_spread, rank_histogram
+from quantile_map import QuantileMap, fit_qm_from_zarr
 from sinkhorn import SinkhornOTMap, fit_ot_from_npy
 
 
 _TRANSFORM_CHOICES = ["none", "qm_tp", "qm_precip", "qm_all", "ot"]
+# Raised dry floors for log(mm + floor), as in field_mean_check.FLOORS_MM
+# (PLAN.md P14, decision D1). Training stays in log(mm + 1e-5).
+FLOORS_MM = {"e001": 0.01, "e01": 0.1}
 
 
 # ---------------------------------------------------------------------------
@@ -76,18 +83,6 @@ def compute_metrics(pred, true):
         "bias_mm": float(np.mean(d)),
         "n_samples": int(pred.shape[0]),
     }
-
-
-def compute_crps(ensemble, truth):
-    M = ensemble.shape[1]
-    abs_err = np.abs(ensemble - truth[:, np.newaxis]).mean()
-    spread, count = 0.0, 0
-    for i in range(M):
-        for j in range(i + 1, M):
-            spread += np.abs(ensemble[:, i] - ensemble[:, j]).mean()
-            count += 1
-    spread /= max(count, 1)
-    return float(abs_err - 0.5 * spread)
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +113,9 @@ def load_model(model_type, checkpoint, device, base_features=32):
     ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
     clean = {k.removeprefix("_orig_mod."): v for k, v in ckpt.items()}
     if model_type == "unet":
-        model = DualEncoderUNet(9, 2, 1, base_features)
+        # A masked-input checkpoint (PLAN.md P19) carries its keep vectors.
+        keep = {k: clean[k] for k in ("dyn_keep", "stat_keep") if k in clean}
+        model = DualEncoderUNet(9, 2, 1, base_features, **keep)
     else:
         model = AFMModel(9, 2, 1, base_features, encoder_loss_weight=0.1)
     model.load_state_dict(clean)
@@ -169,14 +166,16 @@ def _load_or_fit_transform(src_path, tgt_path, args, device):
             subset=args.transform_fit_subset,
         )
     else:
-        # QM variants
+        # QM variants. The data are Zarr; fit_qm_from_npy read train_x.npy,
+        # which no longer exists, from the first `subset` samples (one season).
         channel_spec = {"qm_tp": "tp", "qm_precip": "precip", "qm_all": None}[kind]
-        tf = fit_qm_from_npy(
+        tf = fit_qm_from_zarr(
             src_path=src_path,
             tgt_path=tgt_path,
+            src_stats=load_stats(src_path),
             n_quantiles=args.qm_n_quantiles,
             channels=channel_spec,
-            subset=args.transform_fit_subset,
+            n_chunks=max(1, args.transform_fit_subset // 200),
         )
 
     tf.save(cache)
@@ -199,20 +198,34 @@ def evaluate_model(
     are then accumulated as running sums instead, and no example fields can be
     saved for that split."""
     var = "precipitation"
-    all_pred, all_true, all_ens = [], [], []
+    all_pred, all_true = [], []
+    # Ensemble scores, one value per sample, accumulated batch by batch.
+    ens_scores = {"crps_std": [], "spread_std": [], "crps_mm": [], "spread_mm": [],
+                  **{f"crps_log_{f}": [] for f in FLOORS_MM}}
+    rank_hists = []
+    # Fixed generators: the same ensemble noise and rank tie-breaking on every
+    # run, so re-scoring a checkpoint reproduces its row.
+    rank_gen = torch.Generator(device=device).manual_seed(0) if n_ensemble > 0 else None
+    ens_gen = torch.Generator(device=device).manual_seed(1) if n_ensemble > 0 else None
 
     sum_loss = 0.0
+    sum_abs = 0.0
     n_elements = 0
     n_nonfinite_batches = 0
     # Running physical-space accumulators, used when collect_fields=False.
     s_se = s_ae = s_bias = 0.0
     n_phys = 0
     per_sample_mse_mm, per_sample_mae_mm = [], []
+    per_sample_log_floor = {f: [] for f in FLOORS_MM}
     # Per-sample loss in STANDARDISED space, one scalar per test sample.
     # Kept separately from the aggregate because downstream diagnostics
     # (OODiag-style analog matching, regime stratification, error-distribution
     # comparisons) need the sample-wise error, not its mean.
     per_sample_std = []
+    # MAE in standardised space: a point forecast's CRPS, so the UNet's
+    # mae_std is what the AFM's crps_std is compared with (PLAN.md 3.5,
+    # acceptance).
+    per_sample_mae_std = []
 
     for batch in tqdm(loader, desc=desc):
         x, s, y = (t.to(device, non_blocking=True) for t in batch)
@@ -230,16 +243,21 @@ def evaluate_model(
 
         # Accumulate exact MSE in standardized space
         sq = (pred - y) ** 2
+        ab = (pred.float() - y.float()).abs()
         sum_loss += torch.sum(sq).item()
+        sum_abs += torch.sum(ab).item()
         n_elements += pred.numel()
         # Mean over the spatial/channel dims -> one value per sample.
         per_sample_std.append(sq.float().mean(dim=tuple(range(1, sq.ndim))).cpu().numpy())
+        per_sample_mae_std.append(ab.mean(dim=tuple(range(1, ab.ndim))).cpu().numpy())
 
         p_mm = inverse_transform(pred.float().cpu().numpy(), var, stats)
         t_mm = inverse_transform(y.float().cpu().numpy(), var, stats)
         ax = tuple(range(1, p_mm.ndim))
         per_sample_mse_mm.append(np.mean((p_mm - t_mm) ** 2, axis=ax))
         per_sample_mae_mm.append(np.mean(np.abs(p_mm - t_mm), axis=ax))
+        for f, v in FLOORS_MM.items():
+            per_sample_log_floor[f].append(np.mean((np.log(p_mm + v) - np.log(t_mm + v)) ** 2, axis=ax))
         if collect_fields:
             all_pred.append(p_mm)
             all_true.append(t_mm)
@@ -251,11 +269,23 @@ def evaluate_model(
 
         if model_type == "afm" and n_ensemble > 0:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                samples = model.sample(x, s, n_samples=n_ensemble, steps=sample_steps)
-            ens_np = np.stack(
+                samples = model.sample(x, s, n_samples=n_ensemble, steps=sample_steps, generator=ens_gen)
+            # Scored per batch: the ensemble for a whole split does not fit
+            # in memory (~45 GB at 17,520 samples and 16 members).
+            ens_scores["crps_std"].append(crps_fair(samples, y).cpu().numpy())
+            ens_scores["spread_std"].append(ensemble_spread(samples).cpu().numpy())
+            ens_mm = torch.from_numpy(np.stack(
                 [inverse_transform(samples[:, i].float().cpu().numpy(), var, stats) for i in range(n_ensemble)], axis=1
-            )
-            all_ens.append(ens_np)
+            ))
+            t_mm_t = torch.from_numpy(t_mm)
+            ens_scores["crps_mm"].append(crps_fair(ens_mm, t_mm_t).numpy())
+            ens_scores["spread_mm"].append(ensemble_spread(ens_mm).numpy())
+            # Members and truth clipped at 0 mm by inverse_transform, then
+            # put in each raised-floor log space.
+            for f, v in FLOORS_MM.items():
+                ens_scores[f"crps_log_{f}"].append(
+                    crps_fair(torch.log(ens_mm + v), torch.log(t_mm_t + v)).numpy())
+            rank_hists.append(rank_histogram(samples, y, rank_gen).cpu().numpy())
 
     if not per_sample_std:
         raise RuntimeError(
@@ -286,19 +316,29 @@ def evaluate_model(
             "n_samples": int(sum(len(a) for a in per_sample_std)),
         }
     metrics["mse_std"] = float(sum_loss / max(n_elements, 1))
+    metrics["mae_std"] = float(sum_abs / max(n_elements, 1))
 
     # Sample-wise errors, aligned by index (see the ordering note in
     # save_results).
     per_sample = {
         "mse_std": np.concatenate(per_sample_std),
+        "mae_std": np.concatenate(per_sample_mae_std),
         "mse_mm": np.concatenate(per_sample_mse_mm),
         "mae_mm": np.concatenate(per_sample_mae_mm),
     }
+    # Every sample has the same pixel count, so the sample mean is the pixel
+    # mean.
+    for f in FLOORS_MM:
+        per_sample[f"mse_log_{f}"] = np.concatenate(per_sample_log_floor[f])
+        metrics[f"mse_log_{f}"] = float(per_sample[f"mse_log_{f}"].mean())
 
-    if all_ens:
-        ens = np.concatenate(all_ens)
-        metrics["crps_mm"] = compute_crps(ens, true)
-        metrics["spread_mm"] = float(ens.std(axis=1).mean())
+    if ens_scores["crps_std"]:
+        for k, v in ens_scores.items():
+            v = np.concatenate(v)
+            metrics[k] = float(v.mean())
+            per_sample[k] = v
+        # (n, M + 1) pixel counts per sample; not a scalar, so not in metrics.
+        per_sample["rank_hist"] = np.concatenate(rank_hists)
 
     return metrics, pred, true, per_sample
 
@@ -320,7 +360,9 @@ def save_results(metrics, src_pred, src_true, tgt_pred, tgt_true, out_dir, n_sav
             if d is None:
                 continue
             for k, v in d.items():
-                ps[f"{tag}_{k}"] = np.asarray(v, dtype=np.float32)
+                v = np.asarray(v)
+                # Counts (rank_hist) stay integer; losses are stored as float32.
+                ps[f"{tag}_{k}"] = v.astype(np.int32 if v.dtype.kind in "iu" else np.float32)
         if ps:
             # Ordering contract. These arrays are in DataLoader emission order,
             # which equals the Zarr time order ONLY because the evaluation
@@ -546,8 +588,22 @@ def cmd_batch(args):
     data_root = Path(args.data_root)
     csv_path = Path(args.output_dir) / "results.csv"
 
-    experiments = sorted(exp_root.glob("*/best.pt"))
+    experiments = sorted(exp_root.glob(f"*/{args.ckpt_name}"))
     print(f"Found {len(experiments)} checkpoints in {exp_root}")
+
+    # --only: score the named runs and nothing else, one checkpoint per array
+    # task (PLAN.md 3.6 step 5). Each task then writes its row to its own
+    # rows/<tag>.csv, because append_csv rewrites results.csv and concurrent
+    # tasks would lose each other's rows; `evaluate.py merge` builds
+    # results.csv from rows/ once every task is done.
+    if args.only:
+        found = {c.parent.name: c for c in experiments}
+        missing = [t for t in args.only if t not in found]
+        if missing:
+            raise SystemExit(f"--only: no {exp_root}/<tag>/{args.ckpt_name} for {missing}")
+        experiments = [found[t] for t in args.only]
+        csv_path = Path(args.output_dir) / "rows" / f"{'+'.join(args.only)}.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     for ckpt in experiments:
         exp_name = ckpt.parent.stem
@@ -692,6 +748,32 @@ def cmd_batch(args):
     print(f"\nResults -> {csv_path}")
 
 
+def cmd_merge(args):
+    """Build results.csv from the per-task rows/ files of `batch --only`.
+    Refuses to touch an existing results.csv (CLAUDE.md rule 4); move it to a
+    _trash/ folder first if a re-merge is really wanted."""
+    out_dir = Path(args.output_dir)
+    out = out_dir / "results.csv"
+    if out.exists():
+        raise SystemExit(f"{out} exists. Not overwriting.")
+    files = sorted((out_dir / "rows").glob("*.csv"))
+    if not files:
+        raise SystemExit(f"no row files in {out_dir / 'rows'}")
+    header, rows = None, []
+    for f in files:
+        lines = [ln.rstrip("\n") for ln in f.open() if ln.strip()]
+        if header is None:
+            header = lines[0]
+        elif lines[0] != header:
+            raise SystemExit(f"{f}: header differs from {files[0]}")
+        rows += lines[1:]
+    keys = [tuple(r.split(",")[header.split(",").index(k)] for k in _ROW_KEY) for r in rows]
+    if len(set(keys)) != len(keys):
+        raise SystemExit("duplicate (model, source, target, method, transform) rows in rows/")
+    out.write_text("\n".join([header, *rows]) + "\n")
+    print(f"{len(rows)} rows from {len(files)} files -> {out}")
+
+
 # ---------------------------------------------------------------------------
 #  CLI
 # ---------------------------------------------------------------------------
@@ -721,7 +803,8 @@ def _add_common_args(p):
     )
     p.add_argument("--transform_cache_dir", default="./experiments/transforms")
     p.add_argument("--transform_refit", action="store_true")
-    p.add_argument("--transform_fit_subset", type=int, default=2000, help="cap on training samples used for fitting")
+    p.add_argument("--transform_fit_subset", type=int, default=8000,
+                   help="training samples used for fitting; QM reads them as subset/200 chunks spread over the split")
 
     # QM-specific
     p.add_argument("--qm_n_quantiles", type=int, default=1000)
@@ -750,10 +833,18 @@ def main():
     b.add_argument("--data_root", required=True)
     b.add_argument("--output_dir", default="./experiments/results")
     b.add_argument("--force", action="store_true")
+    b.add_argument("--ckpt_name", default="best.pt",
+                   help="checkpoint file in each run directory (last.pt for the few-shot runs, P16)")
+    b.add_argument("--only", nargs="+", default=None, metavar="TAG",
+                   help="score only these run directories under --exp_root; "
+                        "the row goes to <output_dir>/rows/, see `merge`")
     _add_common_args(b)
 
+    m = sub.add_parser("merge", help="results.csv from the rows/ of batch --only")
+    m.add_argument("--output_dir", required=True)
+
     args = p.parse_args()
-    (cmd_single if args.cmd == "single" else cmd_batch)(args)
+    {"single": cmd_single, "batch": cmd_batch, "merge": cmd_merge}[args.cmd](args)
 
 
 if __name__ == "__main__":

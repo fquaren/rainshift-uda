@@ -34,9 +34,19 @@ in-domain `{target}__to__{target}__none`), and every
 `*__to__{target}__none/best.pt` in unet_seed<N>_oracle/, labelled `oracle`.
 Models are grouped by source; each group shares one pass over the test data,
 normalised with that source's stats exactly as evaluate.py does.
+--tree_suffix _mask_geo reads unet_seed<N>_mask_geo/ and its _oracle/ instead
+(input-set ablation, PLAN.md P19); a masked checkpoint loads with its mask.
 
-Output: results/seed<N>/field_mean_check/<target>/ . Refuses to run if it
-exists.
+Input quantile mapping (PLAN.md P15, --input_qm tp precip all): each
+off-diagonal source-only model is scored a second time per arm, on target
+inputs mapped to the source's marginals channel by channel (quantile_map.py,
+fitted on both training splits). Its label gains "+qm_<arm>", method
+"none+qm_<arm>", tree "qm". tp is RainShift's choice, precip adds cp, all maps
+the nine dynamic channels; statics are never mapped. No target labels, no
+training. One all-channel fit per pair; its quantiles go into fields.npz.
+
+Output: results/seed<N>/field_mean_check/<target>/ (with --input_qm:
+field_mean_check_qm/<target>/). Refuses to run if it exists.
 """
 
 import argparse
@@ -49,8 +59,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from data.dataset import DEFAULT_INPUT_VARS
 from data.dataset_zarr import ClimateSRDatasetZarr, _LOG_EPS
 from evaluate import load_model, load_stats, parse_exp_name
+from quantile_map import fit_qm_from_zarr
 
 TARGET_VAR = "precipitation"
 BIN_EDGES_MM = [0.0, 0.01, 0.1, 1.0, 5.0, 20.0, float("inf")]
@@ -139,19 +151,32 @@ def _bins(t_mm):
 # ---------------------------------------------------------------------------
 
 
-def find_models(results_root, seed, target):
-    """[(label, source, method, tree, ckpt)] for every model scored on target."""
+def find_models(results_root, seed, target, qm_arms=(), tree_suffix=""):
+    """[(label, source, method, tree, ckpt, qm_arm)] for every model scored on
+    target; qm_arm is "" except for the QM rescoring of source-only models.
+    tree_suffix reads a side tree instead, e.g. "_mask_geo" for
+    unet_seed<N>_mask_geo/ and its _oracle/ (PLAN.md P19)."""
     out = []
-    phase2 = results_root / f"unet_seed{seed}"
-    oracle = results_root / f"unet_seed{seed}_oracle"
+    phase2 = results_root / f"unet_seed{seed}{tree_suffix}"
+    oracle = results_root / f"unet_seed{seed}{tree_suffix}_oracle"
     for ckpt in sorted(phase2.glob(f"*__to__{target}__*/best.pt")):
         src, tgt, method = parse_exp_name(ckpt.parent.name)
         tree = "in_domain" if src == tgt else "none"
-        out.append((f"{src}->{tgt}:{method}", src, method, tree, ckpt))
+        if method == "adabn":
+            # best.pt is the unadapted model; the target-adapted one is
+            # best_adabn.pt (evaluate.py target_checkpoint()). Scoring best.pt
+            # would repeat source-only.
+            ckpt = ckpt.parent / "best_adabn.pt"
+            if not ckpt.exists():
+                raise FileNotFoundError(f"{ckpt} missing: cannot score AdaBN on its target")
+        out.append((f"{src}->{tgt}:{method}", src, method, tree, ckpt, ""))
+        if method == "none" and src != tgt:
+            for arm in qm_arms:
+                out.append((f"{src}->{tgt}:none+qm_{arm}", src, f"none+qm_{arm}", "qm", ckpt, arm))
     if oracle.is_dir():
         for ckpt in sorted(oracle.glob(f"*__to__{target}__none/best.pt")):
             src, tgt, _ = parse_exp_name(ckpt.parent.name)
-            out.append((f"{src}->{tgt}:oracle", src, "oracle", "oracle", ckpt))
+            out.append((f"{src}->{tgt}:oracle", src, "oracle", "oracle", ckpt, ""))
     return out
 
 
@@ -211,17 +236,26 @@ def main():
                     help="default: <results_root>/results/seed<N>/field_mean_check/<target>")
     ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--max_batches", type=int, default=None, help="smoke test only")
+    ap.add_argument("--input_qm", nargs="*", default=[], choices=["tp", "precip", "all"],
+                    help="also score each off-diagonal source-only model on quantile-mapped target inputs")
+    ap.add_argument("--qm_n_quantiles", type=int, default=1000)
+    ap.add_argument("--qm_fit_chunks", type=int, default=40,
+                    help="training chunks per domain for the QM fit, spread over the split")
+    ap.add_argument("--tree_suffix", default="",
+                    help="score unet_seed<N><suffix>/ and its _oracle/ instead (P19, e.g. _mask_geo); "
+                         "output goes to field_mean_check<suffix>/")
     args = ap.parse_args()
 
     results_root = Path(args.results_root)
     data_root = Path(args.data_root)
+    sub = ("field_mean_check_qm" if args.input_qm else "field_mean_check") + args.tree_suffix
     out_dir = Path(args.output_dir) if args.output_dir else (
-        results_root / "results" / f"seed{args.seed}" / "field_mean_check" / args.target)
+        results_root / "results" / f"seed{args.seed}" / sub / args.target)
     if out_dir.exists():
         raise SystemExit(f"ERROR: {out_dir} exists. Not overwriting; move it to _trash/ first.")
 
     device = torch.device("cuda")
-    models = find_models(results_root, args.seed, args.target)
+    models = find_models(results_root, args.seed, args.target, args.input_qm, args.tree_suffix)
     if not models:
         raise SystemExit(f"ERROR: no checkpoints scored on {args.target} for seed {args.seed}")
     groups = {}
@@ -242,7 +276,7 @@ def main():
         mu, sd = src_stats[TARGET_VAR]
         # The checkpoint's own record of its source stats must agree with the
         # data root's, or evaluate.py's numbers were made in a different space.
-        for label, _, _, _, ckpt in ms:
+        for label, _, _, _, ckpt, _ in ms:
             rec = ckpt.parent / "src_stats.json"
             if rec.exists():
                 rmu, rsd = json.loads(rec.read_text())[TARGET_VAR]
@@ -256,24 +290,49 @@ def main():
             num_workers=1,   # per-sample arrays are in time order only at 1 worker
             pin_memory=True,
         )
-        nets = [load_model("unet", str(m[4]), device) for m in ms]
+        # One net per checkpoint; a QM row reuses its source-only net.
+        nets = {}
+        for m in ms:
+            if m[4] not in nets:
+                nets[m[4]] = load_model("unet", str(m[4]), device)
         accs = [Acc(device, 200) for _ in ms]
         obs = Acc(device, 200)
+
+        # QM for this (source, target) pair: one fit on all channels, then
+        # each arm maps its subset of them.
+        qms = {}
+        arms = sorted({m[5] for m in ms if m[5]})
+        if arms:
+            tq = time.time()
+            full = fit_qm_from_zarr(data_root / src, data_root / args.target, src_stats,
+                                    n_quantiles=args.qm_n_quantiles, channels=None,
+                                    n_chunks=args.qm_fit_chunks)
+            qms = {arm: full.restrict(arm) for arm in arms}
+            pair = f"{src}__to__{args.target}"
+            arrays[f"qm__{pair}__src_quantiles"] = full.src_quantiles
+            arrays[f"qm__{pair}__tgt_quantiles"] = full.tgt_quantiles
+            mid = args.qm_n_quantiles // 2
+            print(f"  {src}: fitted QM in {time.time() - tq:.0f} s. Per channel, in source-z units: "
+                  "median src / tgt, max |quantile gap|")
+            for c, v in enumerate(DEFAULT_INPUT_VARS):
+                sq, tq_ = full.src_quantiles[c], full.tgt_quantiles[c]
+                print(f"    {v:5s} {sq[mid]:7.3f} / {tq_[mid]:7.3f}   {np.abs(sq - tq_).max():7.3f}")
 
         with torch.no_grad():
             for b, (x, s, y) in enumerate(loader):
                 if args.max_batches is not None and b >= args.max_batches:
                     break
                 x, s, y = (t.to(device, non_blocking=True) for t in (x, s, y))
+                xs = {"": x, **{arm: qm.transform(x) for arm, qm in qms.items()}}
                 t_log = y.double() * (sd + 1e-8) + mu
                 t_mm = (torch.exp(t_log) - _LOG_EPS).clamp_min(0.0)
                 t_bin = _bins(t_mm)
                 t_wet = t_mm >= CONTINGENCY_MM
                 obs.update(t_mm, t_log, t_mm, t_log, t_bin, t_wet)
-                for net, acc in zip(nets, accs):
+                for m, acc in zip(ms, accs):
                     # Same forward as evaluate.py: bf16 autocast, then float.
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        pred = net(x, s)
+                        pred = nets[m[4]](xs[m[5]], s)
                     if not torch.isfinite(pred).all():
                         raise RuntimeError(f"non-finite prediction in group {src}")
                     p_log = pred.double() * (sd + 1e-8) + mu
@@ -298,9 +357,11 @@ def main():
         btl2 = obs.bin["true_log2"].cpu().numpy()
         zero_bin_sq = LOG_FLOOR ** 2 * bc - 2 * LOG_FLOOR * btl + btl2
 
-        for (label, _, method, tree, ckpt), acc in zip(ms, accs):
+        for (label, _, method, tree, ckpt, _), acc in zip(ms, accs):
             src_, tgt_, _ = parse_exp_name(ckpt.parent.name)
-            ref = csv_mse_std(results_root, args.seed, tree, src_, tgt_, method)
+            # results.csv describes the main trees only; a side tree has no
+            # evaluate.py row to cross-check against.
+            ref = None if args.tree_suffix else csv_mse_std(results_root, args.seed, tree, src_, tgt_, method)
             row = summarise(label, src, method, tree, acc, sd, obs, ref)
             if ref is not None and args.max_batches is None and abs(row["mse_std"] - ref) > 5e-3:
                 print(f"  WARNING {label}: mse_std {row['mse_std']:.4f} != results.csv {ref:.4f}")
@@ -360,6 +421,8 @@ def main():
         "log_eps": _LOG_EPS, "floors_mm": FLOORS_MM, "bins_mm": BIN_NAMES,
         "wet_thresholds_mm": WET_THRESHOLDS_MM, "contingency_mm": CONTINGENCY_MM,
         "checkpoints": [str(m[4]) for m in models],
+        "input_qm": args.input_qm, "qm_n_quantiles": args.qm_n_quantiles,
+        "qm_fit_chunks": args.qm_fit_chunks, "tree_suffix": args.tree_suffix,
     }, indent=2))
 
     print("\nlabel                                   mean_ratio  pred_wet_0.1  mse_std  csv     "
