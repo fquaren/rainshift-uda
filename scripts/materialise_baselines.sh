@@ -49,6 +49,13 @@ for src in "${DOMAINS[@]}"; do
         missing=1
         continue
     fi
+    # config.json is written only when training ends; best.pt from epoch 1.
+    # Without it the diagonal is a run still training or one that died.
+    if [[ ! -f "${diag}/config.json" ]]; then
+        echo "  ERROR: ${diag} has best.pt but no config.json -- unfinished run."
+        missing=1
+        continue
+    fi
     # The diagonal must be a source-only run, never an oracle.
     if ! grep -q '"joint_training": false' "${diag}/config.json"; then
         echo "  ERROR: ${diag}/config.json is not a source-only run."

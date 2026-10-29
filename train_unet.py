@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data.dataset import inverse_transform, load_domain_stats
-from data.dataset_zarr import DEFAULT_INPUT_VARS, STATIC_VARS, ClimateSRDatasetZarr, JointZarrDataset
+from data.dataset_zarr import DEFAULT_INPUT_VARS, STATIC_VARS, ClimateSRDatasetZarr, JointZarrDataset, half_chunk_ids
 from models.unet import DualEncoderUNet
 from uda import (
     DomainDiscriminator,
@@ -35,9 +35,9 @@ from uda import (
     spectral_density_loss,
 )
 
-# Upper bound on the gradient-matched MMD weight (--uda_grad_ratio). If the
-# alignment gradient is near zero the matched weight would blow up and only
-# amplify noise; hitting the cap is logged.
+# Upper bound on the gradient-matched MMD / DANN weight (--uda_grad_ratio). If
+# the alignment gradient is near zero the matched weight would blow up and
+# only amplify noise; hitting the cap is logged.
 _LAM_CAP = 100.0
 
 _NEEDS_TARGET_FORWARD = {"coral", "mmd", "mmd_ms", "spectral", "dann", "joint_ot"}
@@ -75,7 +75,7 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
     # lives in source-normalized space; normalizing the target by its own stats
     # would silently erase the covariate shift the framework measures.
     def mk(path, split):
-        return ClimateSRDatasetZarr(
+        ds = ClimateSRDatasetZarr(
             path,
             split,
             stats=src_stats,  # <-- source stats everywhere
@@ -83,6 +83,19 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
             shuffle_buffer_chunks=args.shuffle_buffer_chunks,
             subset_chunks=args.subset_chunks,
         )
+        # Split-half null (PLAN.md P2): source train AND validation restricted
+        # to alternate 365-day blocks, so the two halves share no data. Half
+        # runs also pass --seed to the shuffle RNG (ds.seed is read in
+        # __iter__; the validation offset was fixed at construction and stays
+        # seed 42's), so each replicate has its own init AND data order.
+        if args.train_half is not None and path == args.source_path and split != "test":
+            n = len(ds.chunk_ids)
+            ds.chunk_ids = half_chunk_ids(ds.chunk_ids, args.train_half, ds.n_total, args.half_block_hours)
+            if not ds.chunk_ids:
+                raise ValueError(f"train_half {args.train_half} leaves no {split} chunk of {n}")
+            ds.seed = args.seed
+            print(f"train_half {args.train_half}: {split} keeps {len(ds.chunk_ids)} of {n} chunks, shuffle seed {ds.seed}")
+        return ds
 
     if args.joint_training:
         joint = JointZarrDataset(mk(args.source_path, "train"), mk(args.target_path, "train"))  # both use src_stats
@@ -153,20 +166,23 @@ def train_one_epoch(
     lam_state=None,
     diagnostics=False,
 ):
-    """grad_ratio > 0 (mmd / mmd_ms only): instead of lambda_eff, weight the
-    MMD term so that its gradient on the dynamic encoder and bottleneck is
-    grad_ratio times the task gradient. Measured every 50 steps, smoothed
-    (EMA 0.9) and carried across epochs in lam_state. diagnostics: log the
-    unbiased bottleneck MMD under GAP and grid4 pooling, and its null
-    (uda.mmd_diagnostics), every step."""
+    """grad_ratio > 0 (mmd / mmd_ms / dann): instead of lambda_eff (dann:
+    dann_weight), weight the alignment term so that its gradient on the
+    dynamic encoder and bottleneck is grad_ratio times the task gradient.
+    Measured every 50 steps, smoothed (EMA 0.9) and carried across epochs in
+    lam_state. For DANN the measured gradient is divided by the GRL alpha
+    before matching, so the GRL ramp still applies on top and the share
+    achieved is grad_ratio * alpha. diagnostics: log the unbiased bottleneck
+    MMD under GAP and grid4 pooling, and its null (uda.mmd_diagnostics),
+    every step. joint_ot logs the Sinkhorn marginal errors every 50 steps."""
     model.train()
     sum_task, sum_uda, n = 0.0, 0.0, 0
     extra = defaultdict(float)
-    n_probe = n_diag = 0
+    n_probe = n_diag = n_sk = 0
     use_feat = method in _NEEDS_FEATURES
     alpha = dann_grl_schedule(epoch, total_epochs) if method == "dann" else 1.0
     tgt_iter = iter(tgt_loader)
-    matched = grad_ratio > 0 and method in ("mmd", "mmd_ms")
+    matched = grad_ratio > 0 and method in ("mmd", "mmd_ms", "dann")
     if matched:
         probe = [p for name, p in model.named_parameters() if name.startswith(("dyn_enc", "bottleneck"))]
         lam_state = lam_state if lam_state is not None else {}
@@ -214,20 +230,34 @@ def train_one_epoch(
             # features: the label-transfer cost couples source labels to the
             # model's output at target inputs.
             pred_t, feats_t = model(x_t, s_t, extract_features=True)
-            uda_loss = uda_comp["loss_fn"](
+            # Every 50 steps also take the diagnostics, for the Sinkhorn
+            # marginal errors (audit A8); the loss is the same either way.
+            sk_step = step % 50 == 0
+            res = uda_comp["loss_fn"](
                 feats_s["bottleneck"], feats_t["bottleneck"], y_s, pred_t,
-                alpha=jdot_alpha, reg=jdot_reg,
+                alpha=jdot_alpha, reg=jdot_reg, return_diag=sk_step,
             )
+            if sk_step:
+                uda_loss, d = res
+                extra["sk_row_err"] += d["marg_err_row"]
+                extra["sk_col_err"] += d["marg_err_col"]
+                n_sk += 1
+            else:
+                uda_loss = res
         elif method == "spectral":
             pred_t = model(x_t, s_t)
             uda_loss = uda_comp["loss_fn"](pred_s, pred_t)
 
-        # Weighting. DANN uses a SEPARATE small weight: the GRL alpha already
-        # ramps the adversarial reversal 0->1, so the loss-weight on top must
-        # be small (Wang et al. 2026 best alpha ~5e-4, vs the shared 0.1 used
-        # by moment-matching methods). A 0.1 weight on DANN is ~200x too large
-        # and collapses the discriminator to ln(2). Other methods keep lambda_eff.
-        lam = lambda_eff
+        # Weighting. DANN has its own fixed weight, dann_weight (default 5e-4,
+        # Wang et al. 2026); other methods use lambda_eff. Under one AdamW a
+        # fixed 5e-4 does not balance DANN: Adam rescales the discriminator's
+        # gradient to full speed whatever its weight, while the encoder's
+        # reversed gradient is added to the task gradient before Adam's
+        # normalisation and so stays ~5e-4 of it. The discriminator wins
+        # (logged domain loss falls below ln 2) and the encoder is barely
+        # pushed (audit A2). ln 2 is the equilibrium DANN aims for, not a
+        # collapse. grad_ratio > 0 sets the encoder share directly instead.
+        lam = dann_weight if method == "dann" else lambda_eff
         if matched:
             if step % 50 == 0:
                 def _norm(gs):
@@ -237,6 +267,11 @@ def train_one_epoch(
                 # Share actually achieved by the weight in force at this step.
                 extra["share"] += lam_state.get("lam", 0.0) * n_uda / max(n_task, 1e-12)
                 n_probe += 1
+                # DANN: the GRL has already scaled the encoder gradient by
+                # alpha. Match the unreversed gradient, so the GRL ramp
+                # applies on top (achieved share = grad_ratio * alpha).
+                if method == "dann":
+                    n_uda /= max(alpha, 1e-12)
                 if n_uda > 0:
                     new = grad_ratio * n_task / n_uda
                     extra["capped"] += float(new > _LAM_CAP)
@@ -249,10 +284,7 @@ def train_one_epoch(
                 extra[k] += v
             n_diag += 1
 
-        if method == "dann":
-            loss = task_loss + dann_weight * uda_loss
-        else:
-            loss = task_loss + lam * uda_loss
+        loss = task_loss + lam * uda_loss
 
         optimiser.zero_grad(set_to_none=True)
         loss.backward()
@@ -271,6 +303,9 @@ def train_one_epoch(
     if n_diag:
         for k in ("mmd_gap", "null_gap", "mmd_grid4", "null_grid4"):
             out[k] = extra[k] / n_diag
+    if n_sk:
+        out["sk_row_err"] = extra["sk_row_err"] / n_sk
+        out["sk_col_err"] = extra["sk_col_err"] / n_sk
     return out
 
 
@@ -385,7 +420,8 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
             select = val["loss"]
             sel_str = ""
 
-        diag_keys = [k for k in ("share", "capped", "mmd_gap", "null_gap", "mmd_grid4", "null_grid4") if k in tr]
+        diag_keys = [k for k in ("share", "capped", "mmd_gap", "null_gap", "mmd_grid4", "null_grid4",
+                                 "sk_row_err", "sk_col_err") if k in tr]
         diag_str = "".join(f"  {k}={tr[k]:.4g}" for k in diag_keys)
         print(
             f"[{epoch:3d}/{args.epochs}] {time.time()-t0:5.1f}s  "
@@ -498,8 +534,9 @@ def parse_args():
     p.add_argument("--mmd_unbiased", action="store_true",
                    help="Unbiased MMD^2 (drops the kernel diagonal, a batch-size term with no domain signal).")
     p.add_argument("--uda_grad_ratio", type=float, default=0.0,
-                   help="mmd / mmd_ms: weight the MMD so its encoder gradient is this fraction of the "
-                        "task gradient, replacing --lambda_uda (0 = off).")
+                   help="mmd / mmd_ms / dann: weight the alignment term so its encoder gradient is this "
+                        "fraction of the task gradient, replacing --lambda_uda (dann: --dann_weight; the "
+                        "GRL ramp applies on top, share = ratio * alpha). 0 = off.")
     p.add_argument("--uda_diagnostics", action="store_true",
                    help="mmd / mmd_ms: log unbiased bottleneck MMD under GAP and grid4 pooling, with a null.")
     p.add_argument("--fda_beta", type=float, default=0.01)
@@ -511,10 +548,11 @@ def parse_args():
         "--dann_weight",
         type=float,
         default=5e-4,
-        help="Loss weight for the DANN adversarial term. Separate "
-        "from --lambda_uda because the GRL alpha already ramps "
-        "the reversal 0->1; keep this small (Wang et al. 2026 "
-        "best ~5e-4). A large value collapses the discriminator.",
+        help="Fixed loss weight for the DANN adversarial term, used when "
+        "--uda_grad_ratio is 0. Separate from --lambda_uda; the GRL alpha "
+        "ramps the reversal 0->1 on top (Wang et al. 2026 best ~5e-4). Under "
+        "AdamW the discriminator trains at full speed whatever this weight, "
+        "so a small value leaves the encoder barely pushed (audit A2).",
     )
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=256)
@@ -527,6 +565,10 @@ def parse_args():
     p.add_argument("--joint_training", action="store_true", help="Train on concatenated source and target domains")
     p.add_argument("--mask_inputs", nargs="*", default=[], choices=DEFAULT_INPUT_VARS + STATIC_VARS,
                    help="Input-set ablation (PLAN.md P19): zero these channels in every domain")
+    p.add_argument("--train_half", type=int, choices=[0, 1], default=None,
+                   help="Split-half null (PLAN.md P2): train and select on alternate time blocks only; "
+                   "source-only runs (source = target) only")
+    p.add_argument("--half_block_hours", type=int, default=8760)
     p.add_argument(
         "--val_chunks",
         type=int,
@@ -550,7 +592,11 @@ def parse_args():
         default=None,
         help="Cap the number of chunks per split (smoke tests). " "Replaces the old --subset_size.",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.train_half is not None and (args.joint_training or args.uda_method != "none"
+                                        or args.source_path != args.target_path):
+        p.error("--train_half is for single-domain source-only runs (source = target, uda_method none)")
+    return args
 
 
 def main():

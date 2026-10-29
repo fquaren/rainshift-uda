@@ -3,6 +3,7 @@
 (scripts/eval_array.sh runs it before every task)."""
 
 import argparse
+import os
 import tempfile
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import numpy as np
 import torch
 
 from data.dataset import inverse_transform
-from evaluate import FLOORS_MM, append_csv, cmd_merge, evaluate_model, save_results
+from evaluate import FLOORS_MM, append_csv, cmd_merge, evaluate_model, run_finished, save_results
 from models.afm import AFMModel
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -43,6 +44,22 @@ for k in ("crps_std", "spread_std", "crps_mm", *(f"crps_log_{f}" for f in FLOORS
 assert ps["rank_hist"].shape == (4, M + 1) and (ps["rank_hist"].sum(1) == 200 * 200).all()
 assert "rank_hist" not in met
 
+# Spread-skill pair and ratio in every space, M recorded.
+for sp in ("std", *(f"log_{f}" for f in FLOORS_MM)):
+    for k in (f"ens_var_{sp}", f"ensmean_mse_{sp}"):
+        assert ps[k].shape == (4,) and np.isfinite(ps[k]).all() and (ps[k] >= 0).all() and k in met, k
+    r = met[f"ssr_{sp}"]
+    assert np.isfinite(r) and abs(r - np.sqrt((M + 1) / M * met[f"ens_var_{sp}"] / met[f"ensmean_mse_{sp}"])) < 1e-6, sp
+assert met["n_members"] == M
+
+# Floored rank histograms: every pixel once; the wet one counts exactly the
+# pixels whose truth is >= the floor.
+for f, v in FLOORS_MM.items():
+    h, hw = ps[f"rank_hist_{f}"], ps[f"rank_hist_wet_{f}"]
+    assert h.shape == hw.shape == (4, M + 1) and (h.sum(1) == 200 * 200).all(), f
+    assert np.array_equal(hw.sum(1), (t_mm >= v).reshape(4, -1).sum(1)), f
+    assert (hw <= h).all() and f"rank_hist_{f}" not in met, f
+
 # The fixed generators make a re-score identical.
 met2, *_ = evaluate_model(model, "afm", batches, device, stats, n_ensemble=M, sample_steps=2, desc="test")
 assert all(abs(met2[k] - v) <= 1e-5 * abs(v) + 1e-7 for k, v in met.items() if isinstance(v, float)), \
@@ -53,6 +70,19 @@ with tempfile.TemporaryDirectory() as d:
     save_results(met, pred, true, pred, true, d / "res", n_save=0, src_per_sample=ps, tgt_per_sample=ps)
     z = np.load(d / "res" / "per_sample_loss.npz")
     assert z["tgt_rank_hist"].dtype == np.int32 and z["tgt_mae_std"].dtype == np.float32
+    assert z["tgt_rank_hist_wet_e01"].dtype == np.int32
+
+    # Completion marker: config.json present and not older than any .pt.
+    run = d / "run"
+    run.mkdir()
+    (run / "best.pt").write_bytes(b"")
+    assert not run_finished(run), "no config.json"
+    (run / "config.json").write_text("{}")
+    os.utime(run / "best.pt", (1e9, 1e9))
+    os.utime(run / "config.json", (1e9 + 10, 1e9 + 10))
+    assert run_finished(run)
+    os.utime(run / "best.pt", (1e9 + 20, 1e9 + 20))
+    assert not run_finished(run), "checkpoint newer than config.json"
 
     # merge: one file per task, refuses duplicates and an existing results.csv.
     row = lambda tgt: {"model": "afm", "source": "europe_west", "target": tgt, "method": "none",
@@ -60,7 +90,13 @@ with tempfile.TemporaryDirectory() as d:
     (d / "rows").mkdir()
     for tgt in ("horn-of-africa", "melanesia"):
         append_csv(d / "rows" / f"afm_europe_west__to__{tgt}__none.csv", row(tgt))
-    cmd_merge(argparse.Namespace(output_dir=str(d)))
+    try:
+        cmd_merge(argparse.Namespace(output_dir=str(d), expect=3))
+        raise AssertionError("merge accepted 2 rows with --expect 3")
+    except SystemExit:
+        pass
+    assert not (d / "results.csv").exists()
+    cmd_merge(argparse.Namespace(output_dir=str(d), expect=2))
     lines = (d / "results.csv").read_text().splitlines()
     assert len(lines) == 3 and lines[0].startswith("model,source"), lines
     try:

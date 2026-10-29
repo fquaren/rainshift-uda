@@ -17,17 +17,38 @@ Checks:
      linear is monotone from ~0 to lambda_max, sigmoid starts at 0 and
      saturates near lambda_max.
   8. A combined task + lambda * uda loss backpropagates through both terms.
+  9. Sinkhorn (audit A8): the defaults reproduce the original fixed
+     50-iteration loop exactly; column marginals hold, the row-marginal error
+     falls with more iterations; tol stops early below tol; jdot_loss returns
+     the same loss with and without diagnostics, and reports the errors.
 """
 
 import sys
 
 import torch
 
+import numpy as np
+
 from uda import (
+    jdot_loss,
     lambda_uda_schedule,
     mmd_multiscale_loss,
     _median_heuristic_bandwidth,
+    _sinkhorn_log,
 )
+
+
+def _sinkhorn_reference(cost, reg, n_iter=50):
+    """The Sinkhorn loop as every JDOT run used it, before audit A8."""
+    n, m = cost.shape
+    a = torch.full((n,), -np.log(n), dtype=cost.dtype)
+    b = torch.full((m,), -np.log(m), dtype=cost.dtype)
+    f, g = torch.zeros_like(a), torch.zeros_like(b)
+    K = -cost / reg
+    for _ in range(n_iter):
+        f = a - torch.logsumexp(K + g[None, :], dim=1)
+        g = b - torch.logsumexp(K + f[:, None], dim=0)
+    return torch.exp(K + f[:, None] + g[None, :])
 
 
 # Encoder feature shapes for DualEncoderUNet with base_features=32:
@@ -138,6 +159,34 @@ def main():
     check("uda path has gradient at enc2",
           src["enc2"].grad is not None
           and src["enc2"].grad.abs().mean().item() > 0)
+
+    print("test 9: Sinkhorn defaults, marginal errors, tolerance")
+    g = torch.Generator().manual_seed(9)
+    cost = torch.rand(32, 32, generator=g)
+    for reg in (0.1, 0.01, 0.001):
+        check(f"reg={reg}: defaults equal the original loop exactly",
+              torch.equal(_sinkhorn_log(cost, reg=reg), _sinkhorn_reference(cost, reg)))
+    errs = {}
+    for it in (10, 50, 1000):
+        _, e = _sinkhorn_log(cost, reg=0.01, n_iter=it, return_err=True)
+        errs[it] = e["marg_err_row"]
+        check(f"n_iter={it}: column marginals hold (err {e['marg_err_col']:.1e})", e["marg_err_col"] < 1e-5)
+        check(f"n_iter={it}: iterations run = {e['iters']}", e["iters"] == it)
+    check(f"row error falls with iterations {errs[10]:.2e} > {errs[1000]:.2e}",
+          errs[1000] <= errs[50] + 1e-7 and errs[1000] < errs[10])
+    _, e = _sinkhorn_log(cost, reg=0.05, n_iter=5000, tol=1e-4, return_err=True)
+    check(f"tol stops early ({e['iters']} iterations, row err {e['marg_err_row']:.1e})",
+          e["iters"] < 5000 and e["marg_err_row"] < 1e-4)
+
+    fs, ft = torch.randn(8, 16, 3, 3, generator=g), torch.randn(8, 16, 3, 3, generator=g)
+    ys, pt = torch.randn(8, 1, 10, 10, generator=g), torch.randn(8, 1, 10, 10, generator=g)
+    plain = jdot_loss(fs, ft, ys, pt, reg=0.01)
+    with_diag, d = jdot_loss(fs, ft, ys, pt, reg=0.01, return_diag=True)
+    check("jdot_loss: same loss with and without diagnostics", torch.equal(plain, with_diag))
+    check("jdot_loss: diagnostics report marginal errors and feature share",
+          all(k in d for k in ("marg_err_row", "marg_err_col", "sinkhorn_iters", "feat_share_transport")))
+    check(f"jdot_loss: feature share in [0, 1] ({d['feat_share_transport']:.3f})",
+          0.0 <= d["feat_share_transport"] <= 1.0 + 1e-6)
 
     print("\nAll smoke tests passed.")
 

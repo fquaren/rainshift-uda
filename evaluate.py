@@ -2,39 +2,52 @@
 Evaluate trained UNet / AFM models on target domains.
 
 Modes:
-  single:  evaluate one checkpoint on one target domain
-  batch:   scan experiment directory, evaluate all found checkpoints
+  batch:   scan experiment directory, evaluate every FINISHED checkpoint
+           (run_finished); with --only, one named run per array task
+  merge:   build results.csv from the rows/ files of batch --only
+  (single was removed on 2026-10-29: it normalised the target with target
+  stats and read the NPY data; use batch --only <tag>.)
 
 Metrics (physical space, mm):
   Deterministic: RMSE, MAE, bias
   Probabilistic: CRPS, spread (AFM only, when --n_ensemble > 0)
-  Standardized:  mse_std (exact optimizer loss space); crps_std and
-                 spread_std for AFM ensembles. crps_mm is kept as a record
-                 only: like rmse_mm it is dominated by members that blow up
-                 when converted back to mm.
+  Standardized:  mse_std (exact optimizer loss space); crps_std for AFM
+                 ensembles. crps_mm is kept as a record only: like rmse_mm
+                 it is dominated by members that blow up when converted
+                 back to mm.
+  Floored log:   mse_log_<f>, crps_log_<f> in log(mm + floor), FLOORS_MM.
+
+Ensemble calibration (AFM, --n_ensemble > 0), see prob_metrics.py:
+  ens_var_<sp>, ensmean_mse_<sp>, ssr_<sp> for sp in std, log_e01, log_e001:
+      unbiased member variance, ensemble-mean squared error and the
+      spread-skill ratio sqrt((M+1)/M * ens_var) / sqrt(ensmean_mse), which
+      is 1 for a calibrated ensemble. n_members is M.
+  per-sample rank_hist_<f> / rank_hist_wet_<f>: rank histograms after
+      flooring members and truth at <f> mm, all pixels / wet truth only.
+  DEPRECATED, kept so old rows stay reproducible: spread_std / spread_mm
+  (ddof 0, std averaged per pixel, no (M+1)/M) and rank_hist (ranks in
+  standardised log(P + 1e-5), where dry truth sits on the floor constant
+  and its rank measures sub-floor scatter). Both bias towards
+  "over-confident".
 
 Optional test-time input transforms (--input_transform):
   none       no transform (default)
   qm_tp      quantile mapping on total precipitation (RainShift paper baseline)
   qm_precip  quantile mapping on both precipitation channels (tp, cp)
   qm_all     quantile mapping on all 9 input channels
-  ot         joint-distribution Sinkhorn OT on all channels
+The Sinkhorn OT transform (`ot`) was removed on 2026-10-29: it was fitted
+on NPY files that no longer exist, in a different space from the one it
+was applied in.
 
-All transforms require --src_path to fit on source training data.
 The script evaluates the model on both the source domain (no transform)
 and the target domain (with transform, if specified), saving metrics for both.
-
-Usage:
-  # JDOT
-  python evaluate.py single --input_transform ot \
-      --checkpoint experiments/europe_west__to__melanesia__none/best.pt \
-      --src_path /data/rainshift_npy/europe_west \
-      --target_path /data/rainshift_npy/melanesia
 """
 
 import argparse
+import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -42,7 +55,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data.dataset import ClimateSRDatasetNPY, inverse_transform, load_domain_stats
+from data.dataset import inverse_transform
 from data.dataset_zarr import ClimateSRDatasetZarr, _compute_and_cache_stats
 
 
@@ -59,12 +72,15 @@ def load_stats(domain_path):
     return _compute_and_cache_stats(_P(domain_path), None)
 from models.afm import AFMModel
 from models.unet import DualEncoderUNet
-from prob_metrics import crps_fair, ensemble_spread, rank_histogram
+from prob_metrics import (crps_fair, ensemble_mean_se, ensemble_spread, ensemble_var,
+                          floored_rank_histograms, rank_histogram)
 from quantile_map import QuantileMap, fit_qm_from_zarr
-from sinkhorn import SinkhornOTMap, fit_ot_from_npy
 
 
-_TRANSFORM_CHOICES = ["none", "qm_tp", "qm_precip", "qm_all", "ot"]
+_TRANSFORM_CHOICES = ["none", "qm_tp", "qm_precip", "qm_all"]
+# Pixel stride of the QM fit sample (fit_qm_from_zarr's default), part of the
+# cache key.
+_QM_PX_STRIDE = 2
 # Raised dry floors for log(mm + floor), as in field_mean_check.FLOORS_MM
 # (PLAN.md P14, decision D1). Training stays in log(mm + 1e-5).
 FLOORS_MM = {"e001": 0.01, "e01": 0.1}
@@ -127,15 +143,22 @@ def load_model(model_type, checkpoint, device, base_features=32):
 # ---------------------------------------------------------------------------
 
 
-def _transform_cache_path(args, src, tgt):
-    suffix = ".npz"
-    return Path(args.transform_cache_dir) / args.input_transform / f"{src}__to__{tgt}{suffix}"
+def _transform_cache_path(args, src, tgt, src_stats):
+    """Absolute cache file. The key holds every fit setting (quantiles, fit
+    chunks, pixel stride) and a hash of the source stats the fit sample is
+    normalised with, so a changed setting or stats file refits instead of
+    silently loading a map fitted under other settings. The directory is
+    resolved because the default is relative to the job's --chdir."""
+    n_chunks = max(1, args.transform_fit_subset // 200)
+    h = hashlib.sha1(json.dumps(src_stats, sort_keys=True).encode()).hexdigest()[:8]
+    name = f"{src}__to__{tgt}__nq{args.qm_n_quantiles}__nc{n_chunks}__px{_QM_PX_STRIDE}__stats{h}.npz"
+    return Path(args.transform_cache_dir).resolve() / args.input_transform / name
 
 
 def _load_or_fit_transform(src_path, tgt_path, args, device):
     """
     Return a fitted transform object (with .transform(x)->x) or None.
-    Caches per (transform_type, src, tgt).
+    Caches per (transform_type, src, tgt, fit settings, source stats).
     """
     kind = args.input_transform
     if kind == "none":
@@ -143,40 +166,28 @@ def _load_or_fit_transform(src_path, tgt_path, args, device):
 
     src_name = Path(src_path).stem
     tgt_name = Path(tgt_path).stem
-    cache = _transform_cache_path(args, src_name, tgt_name)
+    src_stats = load_stats(src_path)
+    cache = _transform_cache_path(args, src_name, tgt_name, src_stats)
 
     if cache.exists() and not args.transform_refit:
         print(f"  Loading cached {kind}: {cache}")
-        if kind == "ot":
-            return SinkhornOTMap.load(cache, device=device)
         return QuantileMap.load(cache)
 
-    print(f"  Fitting {kind}: {src_name} -> {tgt_name}")
+    print(f"  Fitting {kind}: {src_name} -> {tgt_name} (cache {cache})")
     cache.parent.mkdir(parents=True, exist_ok=True)
 
-    if kind == "ot":
-        tf = fit_ot_from_npy(
-            src_path=src_path,
-            tgt_path=tgt_path,
-            n_anchors=args.ot_n_anchors,
-            reg=args.ot_reg,
-            n_iter=args.ot_n_iter,
-            k=args.ot_k,
-            device=device,
-            subset=args.transform_fit_subset,
-        )
-    else:
-        # QM variants. The data are Zarr; fit_qm_from_npy read train_x.npy,
-        # which no longer exists, from the first `subset` samples (one season).
-        channel_spec = {"qm_tp": "tp", "qm_precip": "precip", "qm_all": None}[kind]
-        tf = fit_qm_from_zarr(
-            src_path=src_path,
-            tgt_path=tgt_path,
-            src_stats=load_stats(src_path),
-            n_quantiles=args.qm_n_quantiles,
-            channels=channel_spec,
-            n_chunks=max(1, args.transform_fit_subset // 200),
-        )
+    # QM variants. The data are Zarr; fit_qm_from_npy read train_x.npy,
+    # which no longer exists, from the first `subset` samples (one season).
+    channel_spec = {"qm_tp": "tp", "qm_precip": "precip", "qm_all": None}[kind]
+    tf = fit_qm_from_zarr(
+        src_path=src_path,
+        tgt_path=tgt_path,
+        src_stats=src_stats,
+        n_quantiles=args.qm_n_quantiles,
+        channels=channel_spec,
+        n_chunks=max(1, args.transform_fit_subset // 200),
+        px_stride=_QM_PX_STRIDE,
+    )
 
     tf.save(cache)
     return tf
@@ -200,13 +211,22 @@ def evaluate_model(
     var = "precipitation"
     all_pred, all_true = [], []
     # Ensemble scores, one value per sample, accumulated batch by batch.
+    # spread_std / spread_mm are deprecated (module docstring); the
+    # spread-skill pair ens_var_* / ensmean_mse_* replaces them.
     ens_scores = {"crps_std": [], "spread_std": [], "crps_mm": [], "spread_mm": [],
-                  **{f"crps_log_{f}": [] for f in FLOORS_MM}}
-    rank_hists = []
+                  **{f"crps_log_{f}": [] for f in FLOORS_MM},
+                  "ens_var_std": [], "ensmean_mse_std": [],
+                  **{f"ens_var_log_{f}": [] for f in FLOORS_MM},
+                  **{f"ensmean_mse_log_{f}": [] for f in FLOORS_MM}}
+    rank_hists = []   # deprecated: standardised log(P + 1e-5) space
+    floor_hists = {f"rank_hist{w}_{f}": [] for f in FLOORS_MM for w in ("", "_wet")}
     # Fixed generators: the same ensemble noise and rank tie-breaking on every
-    # run, so re-scoring a checkpoint reproduces its row.
+    # run, so re-scoring a checkpoint reproduces its row. The floored ranks
+    # are computed on the CPU (the mm members live there), with their own
+    # generator, so the deprecated rank_hist keeps its old random draws.
     rank_gen = torch.Generator(device=device).manual_seed(0) if n_ensemble > 0 else None
     ens_gen = torch.Generator(device=device).manual_seed(1) if n_ensemble > 0 else None
+    floor_gen = torch.Generator().manual_seed(2) if n_ensemble > 0 else None
 
     sum_loss = 0.0
     sum_abs = 0.0
@@ -274,6 +294,8 @@ def evaluate_model(
             # in memory (~45 GB at 17,520 samples and 16 members).
             ens_scores["crps_std"].append(crps_fair(samples, y).cpu().numpy())
             ens_scores["spread_std"].append(ensemble_spread(samples).cpu().numpy())
+            ens_scores["ens_var_std"].append(ensemble_var(samples).cpu().numpy())
+            ens_scores["ensmean_mse_std"].append(ensemble_mean_se(samples, y).cpu().numpy())
             ens_mm = torch.from_numpy(np.stack(
                 [inverse_transform(samples[:, i].float().cpu().numpy(), var, stats) for i in range(n_ensemble)], axis=1
             ))
@@ -283,8 +305,16 @@ def evaluate_model(
             # Members and truth clipped at 0 mm by inverse_transform, then
             # put in each raised-floor log space.
             for f, v in FLOORS_MM.items():
-                ens_scores[f"crps_log_{f}"].append(
-                    crps_fair(torch.log(ens_mm + v), torch.log(t_mm_t + v)).numpy())
+                le, lt = torch.log(ens_mm + v), torch.log(t_mm_t + v)
+                ens_scores[f"crps_log_{f}"].append(crps_fair(le, lt).numpy())
+                ens_scores[f"ens_var_log_{f}"].append(ensemble_var(le).numpy())
+                ens_scores[f"ensmean_mse_log_{f}"].append(ensemble_mean_se(le, lt).numpy())
+                # Ranks with members and truth floored at v mm: dry truth ties
+                # with every dry member instead of being ranked by sub-floor
+                # scatter; the wet histogram counts truth >= v mm only.
+                h_all, h_wet = floored_rank_histograms(ens_mm, t_mm_t, v, floor_gen)
+                floor_hists[f"rank_hist_{f}"].append(h_all.numpy())
+                floor_hists[f"rank_hist_wet_{f}"].append(h_wet.numpy())
             rank_hists.append(rank_histogram(samples, y, rank_gen).cpu().numpy())
 
     if not per_sample_std:
@@ -337,8 +367,18 @@ def evaluate_model(
             v = np.concatenate(v)
             metrics[k] = float(v.mean())
             per_sample[k] = v
+        # Spread-skill ratio from the split means, with the (M + 1) / M
+        # factor of a finite ensemble (prob_metrics.py): 1 when calibrated,
+        # < 1 when over-confident.
+        M = n_ensemble
+        for sp in ("std", *(f"log_{f}" for f in FLOORS_MM)):
+            metrics[f"ssr_{sp}"] = float(np.sqrt((M + 1) / M * metrics[f"ens_var_{sp}"])
+                                         / np.sqrt(metrics[f"ensmean_mse_{sp}"]))
+        metrics["n_members"] = int(M)
         # (n, M + 1) pixel counts per sample; not a scalar, so not in metrics.
         per_sample["rank_hist"] = np.concatenate(rank_hists)
+        for k, v in floor_hists.items():
+            per_sample[k] = np.concatenate(v)
 
     return metrics, pred, true, per_sample
 
@@ -482,99 +522,37 @@ def target_checkpoint(ckpt, method):
 
 
 # ---------------------------------------------------------------------------
-#  Single evaluation
+#  Completion marker
 # ---------------------------------------------------------------------------
 
 
-def cmd_single(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def run_finished(run_dir):
+    """
+    True once a training run has finished. train_unet.py, train_afm.py and
+    finetune_unet.py write config.json as their last step, after best.pt,
+    best_adabn.pt and last.pt, and never during training. A run directory is
+    therefore finished when config.json exists and no checkpoint in it is
+    newer (a newer one means a re-run writing into an old directory).
+    Scoring a best.pt before then scores an intermediate epoch, and the
+    metrics.json skip below would make that score stick.
+    """
+    run_dir = Path(run_dir)
+    cfg = run_dir / "config.json"
+    if not cfg.exists():
+        return False
+    t = cfg.stat().st_mtime
+    return all(p.stat().st_mtime <= t for p in run_dir.glob("*.pt"))
 
-    # Source Setup
-    src_stats = load_domain_stats(args.src_path)
-    src_loader = DataLoader(
-        ClimateSRDatasetNPY(args.src_path, "test", stats=src_stats),
-        args.batch_size,
-        shuffle=False,
-        num_workers=1,   # see note in save_results: >1 permutes sample order
-        pin_memory=True,
-    )
 
-    # Target Setup
-    tgt_stats = load_domain_stats(args.target_path)
-    tgt_loader = DataLoader(
-        ClimateSRDatasetNPY(args.target_path, "test", stats=tgt_stats),
-        args.batch_size,
-        shuffle=False,
-        num_workers=1,   # see note in save_results: >1 permutes sample order
-        pin_memory=True,
-    )
-
-    model = load_model(args.model, args.checkpoint, device, args.base_features)
-    # Same target-checkpoint rule as batch mode (best_adabn.pt for AdaBN).
-    _, _, method = parse_exp_name(Path(args.checkpoint).parent.stem)
-    tgt_ckpt = target_checkpoint(args.checkpoint, method)
-    if tgt_ckpt is None:
-        raise FileNotFoundError(f"adabn run without best_adabn.pt next to {args.checkpoint}")
-    tgt_model = model if tgt_ckpt == Path(args.checkpoint) else load_model(
-        args.model, str(tgt_ckpt), device, args.base_features)
-
-    transform = None
-    if args.input_transform != "none":
-        transform = _load_or_fit_transform(args.src_path, args.target_path, args, device)
-
-    # 1. Evaluate Source (No Transform)
-    src_metrics, src_pred, src_true, src_per_sample = evaluate_model(
-        model,
-        args.model,
-        src_loader,
-        device,
-        src_stats,
-        args.n_ensemble,
-        args.sample_steps,
-        transform=None,
-        desc="Evaluating Source",
-    )
-
-    # 2. Evaluate Target (With Transform)
-    tgt_metrics, tgt_pred, tgt_true, tgt_per_sample = evaluate_model(
-        tgt_model,
-        args.model,
-        tgt_loader,
-        device,
-        tgt_stats,
-        args.n_ensemble,
-        args.sample_steps,
-        transform=transform,
-        desc="Evaluating Target",
-    )
-
-    # Combine Metrics
-    combined_metrics = {f"src_{k}": v for k, v in src_metrics.items()}
-    combined_metrics.update({f"tgt_{k}": v for k, v in tgt_metrics.items()})
-
-    tag_base = Path(args.checkpoint).parent.stem
-    tag = f"{tag_base}____{args.input_transform}" if args.input_transform != "none" else tag_base
-    res_dir = Path(args.output_dir) / "results" / tag
-
-    save_results(combined_metrics, src_pred, src_true, tgt_pred, tgt_true, res_dir, args.save_samples,
-                     src_per_sample=src_per_sample, tgt_per_sample=tgt_per_sample)
-
-    src, tgt, method = parse_exp_name(tag_base)
-    append_csv(
-        Path(args.output_dir) / "results" / "results.csv",
-        {
-            "model": args.model,
-            "source": src,
-            "target": tgt,
-            "method": method,
-            "transform": args.input_transform,
-            **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in combined_metrics.items()},
-        },
-    )
-
-    for k, v in combined_metrics.items():
-        if isinstance(v, float):
-            print(f"  {k}: {v:.4f}")
+def _csv_row(model_type, src, tgt, method, transform, metrics):
+    return {
+        "model": model_type,
+        "source": src,
+        "target": tgt,
+        "method": method,
+        "transform": transform,
+        **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in metrics.items()},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -601,9 +579,20 @@ def cmd_batch(args):
         missing = [t for t in args.only if t not in found]
         if missing:
             raise SystemExit(f"--only: no {exp_root}/<tag>/{args.ckpt_name} for {missing}")
+        # A named run that is still training is an error, not a skip: the
+        # task would otherwise leave a hole in rows/.
+        unfinished = [t for t in args.only if not run_finished(found[t].parent)]
+        if unfinished:
+            raise SystemExit(f"--only: {unfinished} not finished (no config.json newer than every "
+                             f"checkpoint in {exp_root}/<tag>/); not scoring")
         experiments = [found[t] for t in args.only]
         csv_path = Path(args.output_dir) / "rows" / f"{'+'.join(args.only)}.csv"
         csv_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        unfinished = [c for c in experiments if not run_finished(c.parent)]
+        for c in unfinished:
+            print(f"  WARNING: skipping {c.parent.name} (unfinished: no config.json newer than its checkpoints)")
+        experiments = [c for c in experiments if c not in unfinished]
 
     for ckpt in experiments:
         exp_name = ckpt.parent.stem
@@ -623,7 +612,15 @@ def cmd_batch(args):
         tag = f"{exp_name}__{args.input_transform}" if args.input_transform != "none" else exp_name
         res_dir = Path(args.output_dir) / tag
         if (res_dir / "metrics.json").exists() and not args.force:
-            print(f"  Skipping {tag} (already evaluated)")
+            if args.only:
+                # Already scored (a re-submitted task, or a row file lost):
+                # rewrite the row from metrics.json so that rows/ has no hole
+                # and merge sees every run.
+                done = json.loads((res_dir / "metrics.json").read_text())
+                append_csv(csv_path, _csv_row(model_type, src, tgt, method, args.input_transform, done))
+                print(f"  {tag} already evaluated; row rewritten from {res_dir / 'metrics.json'}")
+            else:
+                print(f"  Skipping {tag} (already evaluated)")
             continue
 
         print(f"  Evaluating {tag} ...")
@@ -726,17 +723,7 @@ def cmd_batch(args):
                      src_per_sample=src_per_sample, tgt_per_sample=tgt_per_sample,
                      train_per_sample=train_per_sample)
 
-        append_csv(
-            csv_path,
-            {
-                "model": model_type,
-                "source": src,
-                "target": tgt,
-                "method": method,
-                "transform": args.input_transform,
-                **{k: f"{v:.4f}" if isinstance(v, float) else v for k, v in combined_metrics.items()},
-            },
-        )
+        append_csv(csv_path, _csv_row(model_type, src, tgt, method, args.input_transform, combined_metrics))
 
         for k, v in combined_metrics.items():
             if isinstance(v, float):
@@ -751,7 +738,9 @@ def cmd_batch(args):
 def cmd_merge(args):
     """Build results.csv from the per-task rows/ files of `batch --only`.
     Refuses to touch an existing results.csv (CLAUDE.md rule 4); move it to a
-    _trash/ folder first if a re-merge is really wanted."""
+    _trash/ folder first if a re-merge is really wanted. With --expect N it
+    also refuses unless exactly N rows were found, so a task that left no row
+    cannot pass as a complete table."""
     out_dir = Path(args.output_dir)
     out = out_dir / "results.csv"
     if out.exists():
@@ -770,6 +759,9 @@ def cmd_merge(args):
     keys = [tuple(r.split(",")[header.split(",").index(k)] for k in _ROW_KEY) for r in rows]
     if len(set(keys)) != len(keys):
         raise SystemExit("duplicate (model, source, target, method, transform) rows in rows/")
+    expect = getattr(args, "expect", None)
+    if expect is not None and len(rows) != expect:
+        raise SystemExit(f"{len(rows)} rows in {out_dir / 'rows'}, --expect {expect}; not writing {out}")
     out.write_text("\n".join([header, *rows]) + "\n")
     print(f"{len(rows)} rows from {len(files)} files -> {out}")
 
@@ -801,7 +793,8 @@ def _add_common_args(p):
     p.add_argument(
         "--input_transform", default="none", choices=_TRANSFORM_CHOICES, help="test-time input transform to apply"
     )
-    p.add_argument("--transform_cache_dir", default="./experiments/transforms")
+    p.add_argument("--transform_cache_dir", default="./experiments/transforms",
+                   help="resolved to an absolute path; pass one, the default is relative to the job's --chdir")
     p.add_argument("--transform_refit", action="store_true")
     p.add_argument("--transform_fit_subset", type=int, default=8000,
                    help="training samples used for fitting; QM reads them as subset/200 chunks spread over the split")
@@ -809,24 +802,15 @@ def _add_common_args(p):
     # QM-specific
     p.add_argument("--qm_n_quantiles", type=int, default=1000)
 
-    # OT-specific
-    p.add_argument("--ot_n_anchors", type=int, default=5000)
-    p.add_argument("--ot_reg", type=float, default=0.1)
-    p.add_argument("--ot_n_iter", type=int, default=300)
-    p.add_argument("--ot_k", type=int, default=10)
-
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "single":
+        raise SystemExit(
+            "evaluate.py single was removed on 2026-10-29: it normalised the target with the "
+            "target's own stats and read the NPY data. Use `evaluate.py batch --exp_root <tree> "
+            "--only <tag>`, which scores both splits with SOURCE stats on the Zarr data.")
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
-
-    s = sub.add_parser("single")
-    s.add_argument("--model", required=True, choices=["unet", "afm"])
-    s.add_argument("--checkpoint", required=True)
-    s.add_argument("--target_path", required=True)
-    s.add_argument("--src_path", required=True, help="source dataset dir (now required to compute source metrics)")
-    s.add_argument("--output_dir", default="./experiments")
-    _add_common_args(s)
 
     b = sub.add_parser("batch")
     b.add_argument("--exp_root", required=True)
@@ -842,9 +826,11 @@ def main():
 
     m = sub.add_parser("merge", help="results.csv from the rows/ of batch --only")
     m.add_argument("--output_dir", required=True)
+    m.add_argument("--expect", type=int, default=None, metavar="N",
+                   help="fail unless rows/ holds exactly N rows (the array's N_RUNS)")
 
     args = p.parse_args()
-    {"single": cmd_single, "batch": cmd_batch, "merge": cmd_merge}[args.cmd](args)
+    {"batch": cmd_batch, "merge": cmd_merge}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 """
 Precompute per-domain normalization statistics for the RainShift Zarr stores.
 
-Writes {domain}/normalization_stats.json with per-variable [mean, std] computed
-in the SAME transformed space the training loss uses:
+Writes a normalization_stats.json-format file (--out) with per-variable
+[mean, std] computed in the SAME transformed space the training loss uses:
     units (tp, cp x1000) -> log(clip(x, 0) + 1e-5) for _LOG_VARS -> mean/std.
 
 Design notes
@@ -19,6 +19,15 @@ Design notes
   DOES get a stat entry.
 
 Run one domain per SLURM array task (see compute_stats.sh).
+
+Output location
+---------------
+The stats training actually uses are {domain}/normalization_stats.json inside
+the lab's shared RainShift copy (raw_data/rainshift), which is read-only for
+this project (CLAUDE.md rule 3). This script therefore never writes into
+raw_data: --out must point into your own tree, and an existing file is never
+overwritten. A recomputed file is for comparison with the shared one;
+replacing the shared stats is a lab decision, not something to script.
 """
 
 import argparse
@@ -39,6 +48,9 @@ _UNIT_SCALE = {"tp": 1000.0, "cp": 1000.0}
 _LOG_EPS = 1e-5
 
 _CHUNK = 200  # time-chunk size in the RainShift stores
+
+# The lab's shared data tree; nothing below it may be written.
+_RAW_DATA_ROOT = Path("/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data")
 
 
 def _transform_block(a: np.ndarray, var: str) -> np.ndarray:
@@ -149,18 +161,24 @@ def main():
     p = argparse.ArgumentParser(description="Precompute RainShift normalization stats (streaming, scrubbed).")
     p.add_argument("--domain_path", required=True, help="path to one domain dir")
     p.add_argument("--input_vars", nargs="+", default=DEFAULT_INPUT_VARS)
-    p.add_argument("--force", action="store_true", help="overwrite an existing normalization_stats.json")
+    p.add_argument("--out", required=True,
+                   help="output JSON path in your own tree; never under raw_data, never overwritten")
     args = p.parse_args()
 
     root = Path(args.domain_path)
-    out = root / "normalization_stats.json"
-    if out.exists() and not args.force:
-        print(f"{out} exists; use --force to overwrite. Skipping.")
-        return
+    out = Path(args.out).resolve()
+    raw = _RAW_DATA_ROOT.resolve()
+    if out == raw or raw in out.parents:
+        p.error(f"{out} is inside the shared {raw} tree, which is read-only (CLAUDE.md rule 3)")
+    if out.exists():
+        p.error(f"{out} exists; not overwriting. Move it to a _trash/ folder first.")
 
     print(f"Computing stats for {root.name} ...", flush=True)
     stats = compute_domain(root, args.input_vars)
-    out.write_text(json.dumps(stats, indent=2))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # "x": fail rather than overwrite if the file appeared while computing.
+    with open(out, "x") as f:
+        f.write(json.dumps(stats, indent=2))
     print(f"Wrote {out}")
 
 

@@ -4,7 +4,8 @@
 #  checkpoint per task, through `evaluate.py batch --only <tag>`. Each task
 #  writes its CSV row to <out>/rows/; `evaluate.py merge` builds results.csv
 #  once every task is done. evaluate.py skips a run that already has
-#  metrics.json, so a re-submitted task never overwrites.
+#  metrics.json, so a re-submitted task never overwrites; it rewrites its
+#  rows/ file from that metrics.json instead, so merge sees no hole.
 #
 #    MODEL=afm TREE=none     afm_seed<N>/          all runs
 #    MODEL=afm TREE=oracle   afm_seed<N>_oracle/   all runs
@@ -18,7 +19,10 @@
 #      (mae_std, the point-forecast CRPS the AFM acceptance compares with;
 #      a new directory, so the existing unet/none rows are untouched)
 #
-#  The task list is the sorted run directories holding best.pt. Print it,
+#  The task list is the sorted FINISHED run directories holding best.pt:
+#  config.json present and no checkpoint newer than it (the trainers write
+#  config.json last; evaluate.py run_finished applies the same rule).
+#  Unfinished runs are left out with a warning on stderr. Print the list,
 #  and its length, without python (safe on the login node):
 #      SEED=42 MODEL=afm TREE=none LIST=1 bash scripts/eval_array.sh
 #  then submit with that length, which every task checks against the tree
@@ -28,7 +32,7 @@
 #      sbatch --dependency=afterok:<array> --partition cpu --time 00:10:00 \
 #          --mem 4G --account tbeucler_downscaling --chdir /scratch/fquareng \
 #          --output outputs/%j --error job_errors/%j --wrap \
-#          'source <CODE_ROOT>/scripts/python_env.sh; run_python <CODE_ROOT>/evaluate.py merge --output_dir <out>'
+#          'source <CODE_ROOT>/scripts/python_env.sh; run_python <CODE_ROOT>/evaluate.py merge --output_dir <out> --expect <N_RUNS>'
 #  (one merge per output directory: afm/<TREE> and afm_prob/<TREE>, or
 #  unet_accept).
 # ===========================================================================
@@ -74,6 +78,15 @@ case "${MODEL}|${TREE}" in
 esac
 [[ -d "${EXP_ROOT}" ]] || { echo "ERROR: ${EXP_ROOT} does not exist."; exit 1; }
 
+run_finished() {
+    local d="$1" p
+    [[ -e "${d}/config.json" ]] || return 1
+    for p in "${d}"/*.pt; do
+        [[ "${p}" -nt "${d}/config.json" ]] && return 1
+    done
+    return 0
+}
+
 TAGS=()
 for ckpt in "${EXP_ROOT}"/*/best.pt; do
     [[ -e "${ckpt}" ]] || continue
@@ -84,6 +97,9 @@ for ckpt in "${EXP_ROOT}"/*/best.pt; do
     else
         [[ "${tag}" == afm_* ]] || continue
     fi
+    run_finished "$(dirname "${ckpt}")" || {
+        echo "WARNING: ${tag} is unfinished (no config.json newer than its checkpoints); not listed." >&2
+        continue; }
     TAGS+=("${tag}")
 done
 

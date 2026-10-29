@@ -42,9 +42,6 @@
 #SBATCH --mem 200G
 #SBATCH --time 12:00:00
 
-# singularity is only needed on gpu-gh; load the module only if it is missing.
-command -v singularity >/dev/null || module load singularityce/4.1.0
-
 set -euo pipefail
 
 CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
@@ -120,6 +117,17 @@ JDOT_REG=0.001
 EXTRA=()
 if [[ -n "${SUBSET_CHUNKS:-}" ]]; then
     EXTRA+=(--subset_chunks "${SUBSET_CHUNKS}")
+fi
+
+# Optional phase-2 variants, all off by default: UDA_GRAD_RATIO (gradient-
+# matched weight for mmd / mmd_ms / dann), MMD_POOL=grid4, MMD_UNBIASED=1.
+# The run tag does not record them, so they need their own side tree.
+UDA_EXTRA=()
+[[ -n "${UDA_GRAD_RATIO:-}" ]] && UDA_EXTRA+=(--uda_grad_ratio "${UDA_GRAD_RATIO}")
+[[ -n "${MMD_POOL:-}" ]] && UDA_EXTRA+=(--mmd_pool "${MMD_POOL}")
+[[ -n "${MMD_UNBIASED:-}" ]] && UDA_EXTRA+=(--mmd_unbiased)
+if (( ${#UDA_EXTRA[@]} )) && [[ -z "${OUTPUT_SUFFIX:-}" ]]; then
+    echo "ERROR: UDA_GRAD_RATIO / MMD_POOL / MMD_UNBIASED need an OUTPUT_SUFFIX side tree."; exit 1
 fi
 
 common_args() {
@@ -242,7 +250,7 @@ elif [[ "${PHASE}" == "2" ]]; then
             --dann_weight "${DANN_WEIGHT}" \
             --jdot_reg    "${JDOT_REG}" \
             --patience    "${PATIENCE}" \
-            $(common_args) "${EXTRA[@]}" \
+            $(common_args) "${EXTRA[@]}" "${UDA_EXTRA[@]}" \
             2>&1 | tee "${OUTPUT_DIR}/afm_phase2_${src}__to__${tgt}__${method}.log"
     done
 

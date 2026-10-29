@@ -340,7 +340,7 @@ A read of `report/main.tex` against the code and `tables.md` found the items bel
 | id | check | blocks | where |
 | --- | --- | --- | --- |
 | P1 | Recompute the matched-input null with a split by blocks of time (for example by year), not by random pixel. The current null (`conditional_shift_binned.py`, `null_baseline`, `rng.permutation(p.size)`) leaves neighbours in both halves. Restate the 86.9× and 14.5× factors. *Scripted 2026-10-29*: `null_baseline` takes `mode` pixel (the old split; repetition 0 reproduces the Aug 10 value), week (168-h blocks assigned at random, 20 repetitions) or year (test year 1 against year 2, which also carries interannual variability). The verdict uses the larger block-null mean of the two domains. Same sample as Table 1 (600 frames, seed 42, 5 × 5 bins); writes `unet/conditional_shift_binned_p1.json` and leaves the Aug 10 file alone. `scripts/run_cond_binned_test.sh` now uses `python_env.sh`. Submitted 2026-10-29: job 66685373. **Result (read 2026-10-29).** W1\_cond is identical to Aug 10, so it is the same sample. The block nulls are 5–10× the pixel null: week 0.29 ± 0.13 (europe), 0.17 ± 0.05 (horn), 0.17 ± 0.05 (melanesia); year 0.34 / 0.19 / 0.21. Excess over the larger block null of the pair is 6.2× (europe↔horn, week 7.4×), 1.9× (horn↔melanesia, week 2.3×, 1.5× the melanesia week p95), and 6.3× for europe↔melanesia, which is still uninterpretable at 44 % support. The 86.9× and 14.5× factors are withdrawn. Only europe↔horn is a clear excess. horn↔melanesia, the pair with full support, is weak. Two weeks of the same domain differ in P(log P \| CAPE, TCW) by 0.17–0.29, so two binned inputs leave much of the conditional unexplained. That makes P2 (9-D) necessary for claim 1, not just corroboration | claim 1 | CPU or GPU job, `scripts/run_cond_binned_test.sh` |
-| P2 | Model-based 9-D diagnostic from `conditional_shift.py`, as corroboration. Needed because the binned test conditions on CAPE and TCW only and is a bound in neither direction | claim 1 | Stage 1 job |
+| P2 | Model-based 9-D diagnostic from `conditional_shift.py`, as corroboration. Needed because the binned test conditions on CAPE and TCW only and is a bound in neither direction. *Scripted 2026-10-29; `conditional_shift.py` rewritten.* The old version never produced a result and could not have been read: it fed model A inputs normalised with B's statistics, compared outputs in two different std spaces, and had no null. The new test runs every source-only model on every domain's test split, each model in its own input space, and scores in log(P + 0.1) and log(P + 0.01) mm. For estimates with independent, centred errors, E d(f\_A, f\_B) = (N\_A + N\_B)/2, so R = D\_AB / mean(N\_A, N\_B) is 1 under a shared conditional, and b2 = D\_AB − mean(N\_A, N\_B) estimates the squared difference of the conditional means. The primary null is split-half models: `train_unet.py --train_half` trains and selects on alternate 365-day blocks, seed 42, six runs (`scripts/run_half_split.sh`). The seed null (42/43/44) is initialisation only and is reported as liberal. Support: a cross-fitted logistic classifier on 4 × 4 block means of the dynamic inputs, with folds by chunk. The overlap is B's samples with P(A\|x) ≥ 0.1 on dyn7 (no sp, tisr); the dyn9 AUC is reported. Chunk bootstrap. The test is asymmetric: R ≈ 1 on the overlap is evidence of a shared conditional; R ≫ 1 is necessary for conditional shift but not sufficient, because approximation error is weighted by each model's own inputs, and statics, sp and tisr are outside the overlap. CPU checks: `test_conditional_shift.py`. Launch: `scripts/run_cond_test.sh`, `afterok` on the half-split array | claim 1 | 6 training runs (~1–2 A100-h each) + one inference job |
 | P3 | Field-mean (zero-rain) check of the seeded methods into europe_west, after pointing `field_mean_check.py` line 147 at `best_adabn.pt`. Decides whether the horn→europe and melanesia→europe gains, and above all AdaBN and FDA on horn→europe, are a drier-prediction artefact | claim 3, abstract | done 2026-10-05, read 2026-10-27; see "P3 result" below |
 | P14 | Choose the headline log floor. Training and every `mse_std` number use log(P + 1e-5 mm), where values below 0.01 mm carry most of the europe\_west target error. Re-score the transfer matrix, oracle decomposition and method table with a 0.01 mm floor (as in `field_mean_check.py`, `FLOORS_MM`) for every target, not just europe\_west, and decide which floor is the headline (decision D1) | claims 2 and 3, AFM selection | job: generalise `field_mean_check.py` to all targets, or add the floored metric to `evaluate.py` |
 | P4 | Time-block null and oracle capacity: horn→melanesia leaves λ̂ = 0.41 ± 0.15 (18 ± 9 % of the gap). Either a stronger oracle closes it, or it is reported as irreducible | claim 2 | one oracle run |
@@ -389,6 +389,70 @@ What changes against the 1e-5 headline:
 - *D2* is re-decided from this table.
 
 Not yet scored at 0.1 mm/h: the all-zero and trivial-wet references (`field_mean_check.py` reports only `mse_log`/`mse_std` for them), and seed sd of the paired λ̂.
+
+**Code audit (2026-10-29): `report/audit_2026-10-29.md`.** Results it invalidates or qualifies:
+- FDA sign-flips the target mean, so all 18 FDA runs are void (A1).
+- DANN never aligns (A2).
+- λ̂ is one-sided (A3).
+- The P1 binned null misses the within-bin covariate mismatch (A4).
+- NGG uses own-domain normalisation (A5).
+- Phase-2 patience was 5, not −1 as stated above (A6).
+- P16 re-estimates BatchNorm on the few-shot subset (B1).
+- `aggregate_seeds` mis-scales the D1 metrics (C).
+- P2 needs replicated, decorrelated half models before it is run (D).
+
+**Audit fixes written 2026-10-29.** `scripts/run_tests.sh` (job 66698749) passed all 11 test files; no fix has yet run on real data.
+
+Training and P16:
+- FDA uses the target's full DC coefficient and a symmetric window (A1).
+- DANN takes `--uda_grad_ratio`; at 0 it is bit-identical to before (A2).
+- Sinkhorn reports its marginal errors, and `diagnose_jdot.py` covers 8 batches in train-mode BatchNorm (A8).
+- P16 freezes BatchNorm and clips gradients (B1). The P16 jobs 66685374–80 are cancelled and not yet resubmitted.
+
+Aggregation and NGG:
+- `aggregate_seeds`:
+  - scales only `*_std` metrics;
+  - renames λ̂ to `lambda_tgt`;
+  - adds `lambda_joint = lambda_tgt + oracle_src` (A3).
+- NGG takes W1 from the raw cube ÷ s_S into `ngg_v3/` (A5). The cube predates Zarr: its inputs were upsampled before the log.
+
+Evaluation:
+- `evaluate.py` scores only finished runs (config.json newer than every .pt), and `merge` takes `--expect`.
+- New metrics:
+  - floored and wet-only rank histograms;
+  - `ens_var`, `ensmean_mse` and `ssr`.
+- `single` and `ot` are removed.
+
+AFM arm:
+- Discriminator LR and wd match the UNet arm.
+- `--uda_grad_ratio`, `--mmd_pool` and `--mmd_unbiased` are added.
+- AdaBN re-estimates on the sampler's trajectories.
+- Target batches are drawn only when a method uses them, and the target-test pass is gone. The phase-1 path is unchanged.
+
+Launchers:
+- patience 5/8 by default, and abort if a `base_hp` is missing;
+- `compute_stats` cannot write into `raw_data`;
+- `compute_shift` refuses normalized mode;
+- `copy.sh` and `run_conversion.sh` are moved to `_trash/`.
+
+Shift tests:
+- P1b: the binned test gets a conditional-permutation null, the D1 floors, wet fraction and wet amount, support counted in weeks, a week bootstrap and a p-value. It writes `_p1b.json`; `_p1.json` is kept.
+- P2:
+  - 18 half models (seeds 42–44 for half 0, 45–47 for half 1);
+  - D from cross-year pairs only, with three Latin quadruples;
+  - overlap at 0.1, 0.3 and 0.5;
+  - 4-chunk bootstrap blocks;
+  - a positive control and a `--from_npz` mode;
+  - per-domain npz files written as each domain finishes;
+  - an optional masked-statics arm.
+
+AFM phase 1 (66685381) and the acceptance pass (66685371) were released after the tests passed.
+
+Retraining and re-scoring needed:
+- FDA: 18 runs.
+- DANN with `--uda_grad_ratio`: 18 runs, if kept.
+- Re-score the main and GAP-ablation trees for `mse_log_*`, including the oracle source side at 0.1 mm/h.
+- Regenerate `ngg_v3/`.
 
 ## Dependencies
 

@@ -44,6 +44,8 @@ raw
     already log-transforms tp, cp, precipitation (and mm-scales tp, cp), so
     "raw" here is pre-z-score, not pre-preprocessing.
 normalized
+    DISABLED (audit 2026-10-29, A5): refused at argument parsing, see
+    _NORMALIZED_REFUSAL. The description below is kept for the record.
     Each domain is z-scored channel-wise by its own ``stats.json`` before
     comparison. This matches the transformation applied by
     ``ClimateSRDatasetNPY`` at training time exactly: log on precip channels
@@ -376,6 +378,17 @@ def run(args: argparse.Namespace) -> None:
         )
 
 
+_NORMALIZED_REFUSAL = (
+    "--mode normalized z-scores EACH domain by its OWN stats.json. Training does not: "
+    "source stats normalise every dataset, target included (CLAUDE.md), and per-domain "
+    "z-scoring erases exactly the location and scale shift this matrix is meant to measure "
+    "(audit 2026-10-29, A5: NGG inflated 2-5x, pair ranking reversed). For W1 in the "
+    "model's source-normalised space use --mode raw and divide W1(S, T) by the SOURCE "
+    "std of that channel (W1 ignores the common shift and scales with the common factor). "
+    "The result is not symmetric: row = source domain."
+)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Per-variable W1 shift matrices on RainShift .npy data.",
@@ -403,11 +416,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split", default="test", choices=["train", "test"])
     p.add_argument(
         "--mode",
-        default="normalized",
+        default="raw",
         choices=["raw", "normalized"],
         help="'raw' uses .npy values as-is (log for precip already "
-        "baked in); 'normalized' adds per-domain z-score from "
-        "stats.json, matching training-time normalisation",
+        "baked in); 'normalized' (per-domain z-score) is refused, see "
+        "_NORMALIZED_REFUSAL",
     )
     p.add_argument("--n_samples", type=int, default=1000, help="number of 2D frames per domain (all pixels used)")
     p.add_argument("--seed", type=int, default=42)
@@ -424,7 +437,10 @@ def parse_args() -> argparse.Namespace:
         help="root output dir; mode subdir is created inside",
     )
     p.add_argument("--no_plots", action="store_true", help="skip saving per-variable heatmap PNGs")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.mode == "normalized":
+        p.error(_NORMALIZED_REFUSAL)
+    return args
 
 
 if __name__ == "__main__":

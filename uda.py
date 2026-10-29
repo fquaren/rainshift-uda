@@ -265,7 +265,8 @@ class DomainDiscriminator(nn.Module):
         # Single hidden layer, small hidden_dim (64). Wang et al. 2026
         # (arXiv:2607.05645) found a shallow classifier gives a more stable
         # alignment signal for climate downscaling DA; a heavy discriminator
-        # wins outright and collapses the domain loss to ln(2) (chance).
+        # wins outright and drives the domain loss towards 0. A domain loss
+        # held near ln(2) (chance) is the DANN equilibrium, not a failure.
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -410,26 +411,9 @@ def spectral_density_loss(
 # ================================================================
 
 
-@torch.no_grad()
-def fda_transfer(
-    src_img: torch.Tensor,
-    tgt_img: torch.Tensor,
-    beta: float = 0.01,
-) -> torch.Tensor:
-    """
-    Fourier Domain Adaptation: replace low-frequency amplitude of source
-    with that of target.
-
-    Yang & Soatto, CVPR 2020. arXiv:2004.05498
-
-    Args:
-        src_img: (B, C, H, W) source input
-        tgt_img: (B, C, H, W) target input (randomly sampled)
-        beta: fraction of spectrum to swap (0.0 = no change, 1.0 = full swap)
-
-    Returns:
-        adapted source image with target low-frequency style
-    """
+def _fda_spectrum(src_img: torch.Tensor, tgt_img: torch.Tensor, beta: float) -> torch.Tensor:
+    """The adapted spectrum of fda_transfer, before the inverse FFT. Separate
+    so the tests can check that its inverse is real."""
     src_f = torch.fft.fft2(src_img.float(), dim=(-2, -1))
     tgt_f = torch.fft.fft2(tgt_img.float(), dim=(-2, -1))
 
@@ -442,10 +426,58 @@ def fda_transfer(
     h = max(int(H * beta), 1)
     w = max(int(W * beta), 1)
 
-    src_amp[:, :, cy - h : cy + h, cx - w : cx + w] = tgt_amp[:, :, cy - h : cy + h, cx - w : cx + w]
+    # Window symmetric about the shifted zero frequency, frequencies -h..+h.
+    ys, xs = slice(max(cy - h, 0), cy + h + 1), slice(max(cx - w, 0), cx + w + 1)
+    src_amp[:, :, ys, xs] = tgt_amp[:, :, ys, xs]
 
     src_amp = torch.fft.ifftshift(src_amp, dim=(-2, -1))
     result = src_amp * torch.exp(1j * src_phase)
+    # DC: the target's full complex coefficient, i.e. the target mean.
+    result[..., 0, 0] = tgt_f[..., 0, 0]
+    return result
+
+
+@torch.no_grad()
+def fda_transfer(
+    src_img: torch.Tensor,
+    tgt_img: torch.Tensor,
+    beta: float = 0.01,
+) -> torch.Tensor:
+    """
+    Fourier Domain Adaptation: replace low-frequency amplitude of source
+    with that of target.
+
+    Yang & Soatto, CVPR 2020. arXiv:2004.05498
+
+    Two departures from a literal amplitude swap, both needed here:
+
+    - DC. The inputs are z-scored, so a channel's spatial mean is negative
+      about half the time, and then its DC coefficient is real and negative
+      (phase pi). Swapping only the amplitude and keeping the source phase
+      gives a mean of sign(source mean) * |target mean|: a europe sample at
+      tcw -0.3 adapted towards melanesia (+4.4) came out at -4.4, outside both
+      domains. The DC therefore takes the target's complex coefficient, so
+      the output mean is the target mean. For the image RGB inputs of the
+      paper the mean is positive and the two coincide.
+    - Window. The swap covers frequencies -h..+h about the shifted centre
+      (the reference code's c-b:c+b+1). The old window cy-h:cy+h held -h..h-1,
+      so at 80x80 and beta 0.01 it swapped the -1 frequencies but not their
+      Hermitian partners +1, and .real then applied half of that swap. With a
+      symmetric window the spectrum stays Hermitian and the inverse is real up
+      to round-off.
+
+    h = max(int(H * beta), 1) as before, so beta = 0 still swaps the mean and
+    the +-1 frequencies; beta >= 0.5 swaps every amplitude.
+
+    Args:
+        src_img: (B, C, H, W) source input
+        tgt_img: (B, C, H, W) target input (randomly sampled)
+        beta: half-width of the swapped window as a fraction of the size
+
+    Returns:
+        adapted source image with target low-frequency style
+    """
+    result = _fda_spectrum(src_img, tgt_img, beta)
     return torch.fft.ifft2(result, dim=(-2, -1)).real.to(src_img.dtype)
 
 
@@ -524,7 +556,13 @@ def apply_quantile_mapping(
 # ================================================================
 
 
-def _sinkhorn_log(cost: torch.Tensor, reg: float = 0.1, n_iter: int = 50) -> torch.Tensor:
+def _sinkhorn_log(
+    cost: torch.Tensor,
+    reg: float = 0.1,
+    n_iter: int = 50,
+    tol: Optional[float] = None,
+    return_err: bool = False,
+):
     """
     Log-domain Sinkhorn for uniform marginals. Returns the coupling gamma.
 
@@ -532,6 +570,18 @@ def _sinkhorn_log(cost: torch.Tensor, reg: float = 0.1, n_iter: int = 50) -> tor
     cost matrix here mixes a feature term and a full-field label term whose
     scale varies by orders of magnitude across pairs; the naive form
     underflows to zero coupling and silently yields a zero loss.
+
+    Each iteration ends on the column update, so the column marginals hold
+    exactly and the row marginals only once the iteration has converged. At
+    small reg 50 iterations may not be enough (audit A8): a row-marginal
+    error left over means some source samples carry more than 1/n of the
+    mass. n_iter = 50 and tol = None are what every JDOT run used.
+
+    Args:
+        n_iter: maximum number of iterations.
+        tol:    if given, stop once the row-marginal L1 error is below it.
+        return_err: also return {"marg_err_row", "marg_err_col", "iters"},
+            the L1 errors sum_i |gamma_i. - 1/n| and sum_j |gamma_.j - 1/m|.
     """
     n, m = cost.shape
     a = torch.full((n,), -np.log(n), device=cost.device, dtype=cost.dtype)
@@ -539,10 +589,23 @@ def _sinkhorn_log(cost: torch.Tensor, reg: float = 0.1, n_iter: int = 50) -> tor
     f = torch.zeros_like(a)
     g = torch.zeros_like(b)
     K = -cost / reg
-    for _ in range(n_iter):
+    it = 0
+    for it in range(1, n_iter + 1):
         f = a - torch.logsumexp(K + g[None, :], dim=1)
         g = b - torch.logsumexp(K + f[:, None], dim=0)
-    return torch.exp(K + f[:, None] + g[None, :])
+        if tol is not None:
+            row = torch.exp(f + torch.logsumexp(K + g[None, :], dim=1))
+            if float((row - 1.0 / n).abs().sum()) < tol:
+                break
+    gamma = torch.exp(K + f[:, None] + g[None, :])
+    if not return_err:
+        return gamma
+    err = {
+        "marg_err_row": float((gamma.sum(1) - 1.0 / n).abs().sum()),
+        "marg_err_col": float((gamma.sum(0) - 1.0 / m).abs().sum()),
+        "iters": it,
+    }
+    return gamma, err
 
 
 def jdot_loss(
@@ -554,6 +617,7 @@ def jdot_loss(
     reg: float = 0.1,
     n_iter: int = 50,
     return_diag: bool = False,
+    tol: Optional[float] = None,
 ):
     """
     Minibatch DeepJDOT loss (Courty et al., NeurIPS 2017; Damodaran et al.,
@@ -585,7 +649,11 @@ def jdot_loss(
         pred_tgt: (B, 1, H', W') model prediction on target inputs.
         alpha:    weight on the feature term relative to the label term.
         reg:      Sinkhorn entropic regularisation.
-        n_iter:   Sinkhorn iterations.
+        n_iter:   Sinkhorn iterations (the maximum when tol is given).
+        tol:      optional Sinkhorn stopping tolerance on the row-marginal L1
+                  error (_sinkhorn_log). None, the default, runs n_iter.
+        return_diag: also return a dict of diagnostics, including the
+                  Sinkhorn marginal errors. The loss is the same either way.
     """
     gs = F.adaptive_avg_pool2d(src_feat, 1).flatten(1)      # (Bs, C)
     gt = F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1)      # (Bt, C)
@@ -602,7 +670,10 @@ def jdot_loss(
 
     # Coupling solved with the network held fixed (alternating optimisation).
     with torch.no_grad():
-        gamma = _sinkhorn_log(cost.detach(), reg=reg, n_iter=n_iter)
+        if return_diag:
+            gamma, sk = _sinkhorn_log(cost.detach(), reg=reg, n_iter=n_iter, tol=tol, return_err=True)
+        else:
+            gamma = _sinkhorn_log(cost.detach(), reg=reg, n_iter=n_iter, tol=tol)
 
     loss = (gamma * cost).sum()
 
@@ -639,8 +710,16 @@ def jdot_loss(
             "cost_feat_mean": cf,
             "cost_label_mean": cl,
             "feat_over_label": cf * alpha / (cl + 1e-12),
+            # share of the transport cost <gamma, C> carried by the feature
+            # term, i.e. weighted by the coupling rather than averaged
+            "feat_share_transport": float((gamma * alpha * c_feat).sum()) / (float(loss) + 1e-12),
             "cost_mean": inert_loss,
             "cost_std": float(cost.std()),
             "reg_over_cost_std": reg / (float(cost.std()) + 1e-12),
+            # Sinkhorn convergence: the row marginal is the one left unenforced
+            # when the iteration stops early (_sinkhorn_log).
+            "marg_err_row": sk["marg_err_row"],
+            "marg_err_col": sk["marg_err_col"],
+            "sinkhorn_iters": sk["iters"],
         }
     return loss, diag

@@ -10,7 +10,12 @@ target validation split would make the run an oracle:
   season), normalised with SOURCE statistics like every other dataset;
 - a fixed budget of --steps optimiser steps at the pair's base LR / --lr_div,
   constant, AdamW with the base weight decay, batch as in phase 1, fp32, MSE
-  in the training space;
+  in the training space, gradient norm clipped at 1.0 as in training;
+- BatchNorm keeps the SOURCE running statistics (BN layers in eval mode; their
+  affine weights still train). In train mode 500 steps at momentum 0.1 would
+  replace them with statistics of the N-sample subset, one 200-hour window at
+  N = 1 chunk, and the small-N end of the curve would measure AdaBN on that
+  window plus labels (audit 2026-10-29, B1);
 - the weights after the last step are saved as last.pt and scored by
   `evaluate.py batch --only <tag> --ckpt_name last.pt`.
 RainShift's own fine-tuning used 2,000 samples at LR / 5 (Harder et al. 2026).
@@ -88,6 +93,11 @@ def main():
 
     out.mkdir(parents=True)
     model.train()
+    # Freeze BatchNorm running statistics at the source values (see docstring).
+    for m in model.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            m.eval()
+    bn_before = {k: v.clone() for k, v in model.state_dict().items() if k.endswith(("running_mean", "running_var"))}
     step, passes, t0, log, run = 0, 0, time.time(), [], 0.0
     while step < args.steps:
         passes += 1
@@ -96,6 +106,7 @@ def main():
             loss = crit(model(x, s), y)
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             step += 1
             run += loss.item()
@@ -108,6 +119,9 @@ def main():
                 break
     if not np.isfinite(log[-1]["train_loss"]):
         raise RuntimeError(f"{tag}: non-finite training loss; last.pt not written")
+    sd = model.state_dict()
+    if any(not torch.equal(sd[k], v) for k, v in bn_before.items()):
+        raise RuntimeError(f"{tag}: BatchNorm running statistics changed; last.pt not written")
 
     torch.save(model.state_dict(), out / "last.pt")
     with open(out / "history.csv", "w") as f:
@@ -116,7 +130,8 @@ def main():
             f.write(",".join(str(v) for v in h.values()) + "\n")
     cfg = {**vars(args), "init": str(init), "lr": lr, "weight_decay": wd, "batch_size": bs,
            "chunk_ids": ds.chunk_ids, "n_samples": 200 * len(ds.chunk_ids), "passes": passes,
-           "selection": "none (last step)"}
+           "selection": "none (last step)", "batchnorm": "frozen source running statistics",
+           "grad_clip": 1.0}
     (out / "config.json").write_text(json.dumps(cfg, indent=2))
     print(f"{tag}: done, {passes} passes over the subset, {time.time() - t0:.0f} s")
 

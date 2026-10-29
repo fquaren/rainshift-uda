@@ -17,9 +17,14 @@ melanesia, seeds 42/43/44. Decision rules fixed before any result exists:
    inflation of the target-forward methods is BatchNorm running-stat mixing,
    not alignment.
 
-All risks are rescaled to log-precipitation MSE (x s_S^2, see
-aggregate_seeds.py, Units); with one pair the factor is common, so only the
-budget threshold depends on it.
+All risks are read in --metric (default mse_std, the 1e-5 floor) and
+rescaled by aggregate_seeds.py's rule (Units): a standardised metric by
+s_S^p (x s_S^2 for mse_std, log-precipitation MSE), a physical one such as
+mse_log_e01 (MSE of log(mm + 0.1), decision D1) by 1. With one pair the
+factor is common, so only the budget threshold depends on it. Every
+results.csv read must carry src_/tgt_<metric>; the GAP-ablation trees and
+unet/{none,oracle} written before 2026-10-29 have no mse_log_* columns and
+must be re-scored first.
 """
 
 import argparse
@@ -30,13 +35,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from aggregate_seeds import metric_power, units_label
+
 SRC, TGT = "europe_west", "melanesia"
 ARMS = {"tgtfwd": ("mmd", None), "gap": ("mmd", "mmd_gap"), "grid4": ("mmd", "mmd_grid4"),
         "grid4ms": ("mmd_ms", "mmd_grid4")}
 
 
-def row(csv, method):
+def row(csv, method, metric):
     df = pd.read_csv(csv)
+    absent = [c for c in (f"src_{metric}", f"tgt_{metric}") if c not in df.columns]
+    if absent:
+        sys.exit(f"{csv}: no column(s) {absent}; re-score this tree before reading it in {metric}")
     r = df[(df.source == SRC) & (df.target == TGT) & (df.method == method) & (df["transform"] == "none")]
     if len(r) != 1:
         sys.exit(f"{csv}: expected one {SRC}->{TGT} {method} row, found {len(r)}")
@@ -53,29 +63,34 @@ def main():
     p.add_argument("--root", default="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda")
     p.add_argument("--stats_root", default="/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift")
     p.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
+    p.add_argument("--metric", default="mse_std",
+                   help="base column (src_/tgt_ prefix added); e.g. mse_log_e01 for the D1 floor")
     p.add_argument("--output_dir", required=True)
     args = p.parse_args()
     out = Path(args.output_dir)
     if out.exists():
         sys.exit(f"{out} exists; not overwriting.")
     root = Path(args.root)
-    s2 = json.loads((Path(args.stats_root) / SRC / "normalization_stats.json").read_text())["precipitation"][1] ** 2
+    m = args.metric
+    E_S, E_T = f"src_{m}", f"tgt_{m}"
+    s2 = json.loads((Path(args.stats_root) / SRC / "normalization_stats.json").read_text())["precipitation"][1] \
+        ** metric_power(m)
 
     recs = []
     for seed in args.seeds:
         base = root / "results" / f"seed{seed}" / "unet"
-        none, ref = row(base / "none" / "results.csv", "none"), row(base / "none" / "results.csv", "mmd")
-        orc = row(base / "oracle" / "results.csv", "none")
-        budget = (none.tgt_mse_std - orc.tgt_mse_std) * s2
+        none, ref = row(base / "none" / "results.csv", "none", m), row(base / "none" / "results.csv", "mmd", m)
+        orc = row(base / "oracle" / "results.csv", "none", m)
+        budget = (none[E_T] - orc[E_T]) * s2
         arms = {}
         for arm, (method, _) in ARMS.items():
-            r = row(root / "results" / "gap_ablation" / f"seed{seed}" / arm / "results.csv", method)
+            r = row(root / "results" / "gap_ablation" / f"seed{seed}" / arm / "results.csv", method, m)
             h = pd.read_csv(root / "gap_ablation" / f"seed{seed}" / arm / f"{SRC}__to__{TGT}__{method}" / "history.csv")
             arms[arm] = (r, h)
         for name, r in [("reference_mmd", ref)] + [(a, arms[a][0]) for a in ARMS]:
             recs.append(dict(seed=seed, arm=name, budget=budget,
-                             d_tgt=(r.tgt_mse_std - none.tgt_mse_std) * s2,
-                             d_src=(r.src_mse_std - none.src_mse_std) * s2))
+                             d_tgt=(r[E_T] - none[E_T]) * s2,
+                             d_src=(r[E_S] - none[E_S]) * s2))
         _, hc = arms["tgtfwd"]
         for arm, (method, key) in ARMS.items():
             if key is None:
@@ -95,7 +110,7 @@ def main():
     chk = df[is_chk][["seed", "arm", "epoch", "aligned", "control", "null", "share", "capped", "lam"]]
 
     md = [f"# GAP ablation, {SRC} → {TGT}, seeds {args.seeds}", "",
-          "Log-precipitation MSE; Δ against source-only of the same seed; mean ± sd over seeds.", "",
+          f"{m} in {units_label(m, 'log')}; Δ against source-only of the same seed; mean ± sd over seeds.", "",
           "## Risks", "", "| arm | Δtgt | Δsrc | per seed Δtgt |", "| --- | --- | --- | --- |"]
     for arm in ["reference_mmd"] + list(ARMS):
         e = eff[eff.arm == arm].sort_values("seed")
