@@ -111,4 +111,12 @@ on the inputs.
 - MAE on Melanesia is not a usable skill metric (the zero predictor is within
   5 % of the in-domain model). This supports not reporting MAE in mm as a
   headline anywhere, and it bears on the D1 floor choice.
-- Pending: seeds 43 and 44 of P19, and Tom's run of the zero-predictor game.
+- Seeds 43 and 44 of P19 (read 2026-11-02): `mask_shift` source-only
+  `mse_log` 15.98 / 15.88 / 15.92 against 16.47 / 16.55 / 16.55 with all
+  inputs, so the lower source-only risk replicates; the λ̂ rise does not
+  (0.33 / 0.29 / 0.09). The field plots show `mask_shift` source-only is
+  wetter (5.2 % wet pixels against 1.4 %), which is most of what improves.
+  Still pending: Tom's run of the zero-predictor game.
+- Our own source-only model into europe_west (from melanesia) is exactly the
+  zero predictor (field mean 0.0000 mm/h on 1,752 test timesteps), which
+  reinforces the point above for any MAE- or log-based attribution there.

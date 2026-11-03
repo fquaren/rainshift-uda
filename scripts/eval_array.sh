@@ -69,9 +69,24 @@ TREE="${TREE:?TREE=none, oracle (afm) or diag (unet)}"
 N_ENSEMBLE="${N_ENSEMBLE:-8}"
 STEPS="${STEPS:-10}"
 RESULTS="${OUTPUT_ROOT}/results/seed${SEED}"
+# Optional subset of the tree, e.g. AFM phase 2 (PLAN.md 3.7):
+#   TAGS_RE='__(fda|mmd)$' OUT_SUFFIX=_p2  -> afm_p2/<TREE>, afm_prob_p2/<TREE>
+# so phase 2 merges into its own results.csv; merge refuses an existing one.
+TAGS_RE="${TAGS_RE:-}"
+OUT_SUFFIX="${OUT_SUFFIX:-}"
+if [[ -n "${TAGS_RE}" && -z "${OUT_SUFFIX}" ]]; then
+    echo "ERROR: TAGS_RE selects a subset; set OUT_SUFFIX so it does not mix with the full tree's results."; exit 1
+fi
+
+# Side tree of run_exp_afm.sh (its OUTPUT_SUFFIX), e.g. EXP_SUFFIX=_mmdgr05
+# -> afm_seed<N>_mmdgr05/; needs OUT_SUFFIX so its rows stay apart.
+EXP_SUFFIX="${EXP_SUFFIX:-}"
+if [[ -n "${EXP_SUFFIX}" && ( "${MODEL}|${TREE}" != "afm|none" || -z "${OUT_SUFFIX}" ) ]]; then
+    echo "ERROR: EXP_SUFFIX applies to MODEL=afm TREE=none and needs OUT_SUFFIX."; exit 1
+fi
 
 case "${MODEL}|${TREE}" in
-    afm\|none)   EXP_ROOT="${OUTPUT_ROOT}/afm_seed${SEED}" ;;
+    afm\|none)   EXP_ROOT="${OUTPUT_ROOT}/afm_seed${SEED}${EXP_SUFFIX}" ;;
     afm\|oracle) EXP_ROOT="${OUTPUT_ROOT}/afm_seed${SEED}_oracle" ;;
     unet\|diag)  EXP_ROOT="${OUTPUT_ROOT}/unet_seed${SEED}" ;;
     *) echo "ERROR: MODEL=${MODEL} TREE=${TREE} is not a known combination."; exit 1 ;;
@@ -97,6 +112,7 @@ for ckpt in "${EXP_ROOT}"/*/best.pt; do
     else
         [[ "${tag}" == afm_* ]] || continue
     fi
+    [[ -z "${TAGS_RE}" || "${tag}" =~ ${TAGS_RE} ]] || continue
     run_finished "$(dirname "${ckpt}")" || {
         echo "WARNING: ${tag} is unfinished (no config.json newer than its checkpoints); not listed." >&2
         continue; }
@@ -131,12 +147,12 @@ if [[ "${MODEL}" == "unet" ]]; then
     run_python "${CODE_ROOT}/evaluate.py" "${COMMON[@]}" \
         --output_dir "${RESULTS}/unet_accept" --save_samples 0
 else
-    echo "=== deterministic (mu), with the training split -> afm/${TREE} ==="
+    echo "=== deterministic (mu), with the training split -> afm${OUT_SUFFIX}/${TREE} ==="
     run_python "${CODE_ROOT}/evaluate.py" "${COMMON[@]}" \
-        --output_dir "${RESULTS}/afm/${TREE}" --save_samples 10 --eval_train
-    echo "=== probabilistic, M=${N_ENSEMBLE}, ${STEPS} steps -> afm_prob/${TREE} ==="
+        --output_dir "${RESULTS}/afm${OUT_SUFFIX}/${TREE}" --save_samples 10 --eval_train
+    echo "=== probabilistic, M=${N_ENSEMBLE}, ${STEPS} steps -> afm_prob${OUT_SUFFIX}/${TREE} ==="
     run_python "${CODE_ROOT}/evaluate.py" "${COMMON[@]}" \
-        --output_dir "${RESULTS}/afm_prob/${TREE}" --save_samples 5 \
+        --output_dir "${RESULTS}/afm_prob${OUT_SUFFIX}/${TREE}" --save_samples 5 \
         --n_ensemble "${N_ENSEMBLE}" --sample_steps "${STEPS}"
 fi
 echo "=== eval task ${TASK} (${TAG}) complete ==="

@@ -20,6 +20,28 @@ Never take numbers from these:
 - `results/seed<N>/ngg/`: the old NGG definition.
 - Any AdaBN row dated before 2026-10-02.
 
+## Status of the TODOs (2026-11-02)
+
+The draft's numbers predate D1 (headline floor 0.1 mm/h, `mse_log_e01`). Tables
+2–5 must be regenerated from `results/seed<S>_v3/` (main tree, all floors),
+`results/seed<S>_fdafix/` (FDA rows; the main-tree FDA rows are void) and the
+oracle trees, with a mm-space or wet-fraction column beside every log-floor
+number. PLAN.md's claims table is current; in short:
+- Item 2 (field-mean check into europe_west): done; the gains are a floor
+  artefact, and the melanesia source-only model into europe_west is the
+  all-zero predictor (`results/plots/compare_fields_seed42/`).
+- Item 3 (AFM): phase 1 trained and scored (acceptance passed), oracle trained,
+  oracle scoring running; phase 2 waits on D2.
+- Item 6 (model-based claim 1): ran (P2), inconclusive for lack of support and
+  power. With P1b, claim 1 holds for europe↔horn and europe↔melanesia (58 %
+  support) and is undetermined for horn↔melanesia. Table 1 must come from
+  `unet/conditional_shift_binned_p1b.json`, not the Aug 10 file.
+- Item 10 (horn→melanesia 18 %): at 0.1 mm λ̂ there is −0.045 to 0.020; the
+  18 % was a 1e-5-floor number. The europe_west-target λ̂ (22–39 % of the
+  gap) is the one to discuss.
+- New: P16 few-shot (2,000 target labels reach the oracle) for the claim-2
+  section; P19 3-seed result for the inputs discussion.
+
 ## What fills the TODOs
 
 1. **GAP ablation and BatchNorm control**, from `results/gap_ablation/summary/summary.md`. This rewrites the mechanism paragraph of the methods section and the abstract's claim-3 sentence. The first attempt ran out of memory in smoke; see PLAN.md.

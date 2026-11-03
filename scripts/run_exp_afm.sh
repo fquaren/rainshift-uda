@@ -216,6 +216,12 @@ elif [[ "${PHASE}" == "2" ]]; then
             [[ "$src" == "$tgt" ]] && continue
             [[ -n "${PAIR_ENV}" && "${src}|${tgt}" != "${PAIR_ENV}" ]] && continue
             HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
+            # A side tree (OUTPUT_SUFFIX) reuses the seed's own phase-1 HPs,
+            # as in run_exp_unet.sh.
+            MAIN_HP="${OUTPUT_ROOT}/afm_seed${SEED}/base_hp/${src}__to__${tgt}.json"
+            if [[ ! -f "${HP_FILE}" && -n "${OUTPUT_SUFFIX:-}" && -f "${MAIN_HP}" ]]; then
+                cp "${MAIN_HP}" "${HP_FILE}"
+            fi
             if [[ ! -f "${HP_FILE}" ]]; then
                 echo "ERROR: missing base HPs ${HP_FILE}; run PHASE=1 first."
                 exit 1
