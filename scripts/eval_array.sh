@@ -1,0 +1,158 @@
+#!/bin/bash -l
+# ===========================================================================
+#  Per-checkpoint evaluation as a job array (PLAN.md 3.6 step 5): one
+#  checkpoint per task, through `evaluate.py batch --only <tag>`. Each task
+#  writes its CSV row to <out>/rows/; `evaluate.py merge` builds results.csv
+#  once every task is done. evaluate.py skips a run that already has
+#  metrics.json, so a re-submitted task never overwrites; it rewrites its
+#  rows/ file from that metrics.json instead, so merge sees no hole.
+#
+#    MODEL=afm TREE=none     afm_seed<N>/          all runs
+#    MODEL=afm TREE=oracle   afm_seed<N>_oracle/   all runs
+#      deterministic pass (mu: mse_std, mae_std, floored log MSE, training
+#      split) -> results/seed<N>/afm/<TREE>/
+#      probabilistic pass (M members, STEPS midpoint steps: crps_std,
+#      spread_std, floored log CRPS, rank histograms; no training split)
+#      -> results/seed<N>/afm_prob/<TREE>/
+#    MODEL=unet TREE=diag    unet_seed<N>/ diagonal runs X__to__X__none
+#      deterministic pass on the test splits -> results/seed<N>/unet_accept/
+#      (mae_std, the point-forecast CRPS the AFM acceptance compares with;
+#      a new directory, so the existing unet/none rows are untouched)
+#
+#  The task list is the sorted FINISHED run directories holding best.pt:
+#  config.json present and no checkpoint newer than it (the trainers write
+#  config.json last; evaluate.py run_finished applies the same rule).
+#  Unfinished runs are left out with a warning on stderr. Print the list,
+#  and its length, without python (safe on the login node):
+#      SEED=42 MODEL=afm TREE=none LIST=1 bash scripts/eval_array.sh
+#  then submit with that length, which every task checks against the tree
+#  so that a run added after submission cannot shift the indices:
+#      SEED=42 MODEL=afm TREE=none N_RUNS=3 sbatch --array=0-2 scripts/eval_array.sh
+#  and merge once all tasks are done (CPU, a few seconds):
+#      sbatch --dependency=afterok:<array> --partition cpu --time 00:10:00 \
+#          --mem 4G --account tbeucler_downscaling --chdir /scratch/fquareng \
+#          --output outputs/%j --error job_errors/%j --wrap \
+#          'source <CODE_ROOT>/scripts/python_env.sh; run_python <CODE_ROOT>/evaluate.py merge --output_dir <out> --expect <N_RUNS>'
+#  (one merge per output directory: afm/<TREE> and afm_prob/<TREE>, or
+#  unet_accept).
+# ===========================================================================
+
+#SBATCH --account tbeucler_downscaling
+#SBATCH --mail-type FAIL
+#SBATCH --mail-user filippo.quarenghi@unil.ch
+
+#SBATCH --chdir /scratch/fquareng/
+#SBATCH --job-name evalarr
+#SBATCH --output outputs/%A_%a
+#SBATCH --error  job_errors/%A_%a
+
+#SBATCH --partition gpu
+#SBATCH --gres gpu:1
+#SBATCH --gres-flags enforce-binding
+#SBATCH --nodes 1
+#SBATCH --ntasks 1
+#SBATCH --cpus-per-task 12
+#SBATCH --mem 100G
+#SBATCH --time 12:00:00
+
+set -euo pipefail
+# Byte-order sorting of the run directories, the same on every node.
+export LC_ALL=C
+
+CODE_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/rainshift-uda"
+OUTPUT_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda"
+DATA_ROOT="/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift"
+SEED="${SEED:?SEED must be set}"
+MODEL="${MODEL:?MODEL=afm or unet}"
+TREE="${TREE:?TREE=none, oracle (afm) or diag (unet)}"
+# Ensemble settings of PLAN.md 3.5 step 5 and 3.6 (10 steps within 1 % of 40).
+N_ENSEMBLE="${N_ENSEMBLE:-8}"
+STEPS="${STEPS:-10}"
+RESULTS="${OUTPUT_ROOT}/results/seed${SEED}"
+# Optional subset of the tree, e.g. AFM phase 2 (PLAN.md 3.7):
+#   TAGS_RE='__(fda|mmd)$' OUT_SUFFIX=_p2  -> afm_p2/<TREE>, afm_prob_p2/<TREE>
+# so phase 2 merges into its own results.csv; merge refuses an existing one.
+TAGS_RE="${TAGS_RE:-}"
+OUT_SUFFIX="${OUT_SUFFIX:-}"
+if [[ -n "${TAGS_RE}" && -z "${OUT_SUFFIX}" ]]; then
+    echo "ERROR: TAGS_RE selects a subset; set OUT_SUFFIX so it does not mix with the full tree's results."; exit 1
+fi
+
+# Side tree of run_exp_afm.sh (its OUTPUT_SUFFIX), e.g. EXP_SUFFIX=_mmdgr05
+# -> afm_seed<N>_mmdgr05/; needs OUT_SUFFIX so its rows stay apart.
+EXP_SUFFIX="${EXP_SUFFIX:-}"
+if [[ -n "${EXP_SUFFIX}" && ( "${MODEL}|${TREE}" != "afm|none" || -z "${OUT_SUFFIX}" ) ]]; then
+    echo "ERROR: EXP_SUFFIX applies to MODEL=afm TREE=none and needs OUT_SUFFIX."; exit 1
+fi
+
+case "${MODEL}|${TREE}" in
+    afm\|none)   EXP_ROOT="${OUTPUT_ROOT}/afm_seed${SEED}${EXP_SUFFIX}" ;;
+    afm\|oracle) EXP_ROOT="${OUTPUT_ROOT}/afm_seed${SEED}_oracle" ;;
+    unet\|diag)  EXP_ROOT="${OUTPUT_ROOT}/unet_seed${SEED}" ;;
+    *) echo "ERROR: MODEL=${MODEL} TREE=${TREE} is not a known combination."; exit 1 ;;
+esac
+[[ -d "${EXP_ROOT}" ]] || { echo "ERROR: ${EXP_ROOT} does not exist."; exit 1; }
+
+run_finished() {
+    local d="$1" p
+    [[ -e "${d}/config.json" ]] || return 1
+    for p in "${d}"/*.pt; do
+        [[ "${p}" -nt "${d}/config.json" ]] && return 1
+    done
+    return 0
+}
+
+TAGS=()
+for ckpt in "${EXP_ROOT}"/*/best.pt; do
+    [[ -e "${ckpt}" ]] || continue
+    tag="$(basename "$(dirname "${ckpt}")")"
+    if [[ "${MODEL}" == "unet" ]]; then
+        # Diagonal only: X__to__X__none.
+        [[ "${tag}" =~ ^(.+)__to__(.+)__none$ && "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] || continue
+    else
+        [[ "${tag}" == afm_* ]] || continue
+    fi
+    [[ -z "${TAGS_RE}" || "${tag}" =~ ${TAGS_RE} ]] || continue
+    run_finished "$(dirname "${ckpt}")" || {
+        echo "WARNING: ${tag} is unfinished (no config.json newer than its checkpoints); not listed." >&2
+        continue; }
+    TAGS+=("${tag}")
+done
+
+if [[ -n "${LIST:-}" ]]; then
+    for i in "${!TAGS[@]}"; do echo "${i} ${TAGS[$i]}"; done
+    echo "N_RUNS=${#TAGS[@]}  (${EXP_ROOT})"
+    exit 0
+fi
+
+source "${CODE_ROOT}/scripts/python_env.sh"
+require_cuda
+
+N_RUNS="${N_RUNS:?pass N_RUNS from LIST=1}"
+(( N_RUNS == ${#TAGS[@]} )) || {
+    echo "ERROR: ${EXP_ROOT} has ${#TAGS[@]} runs, the submission expected ${N_RUNS}. Re-list and resubmit."; exit 1; }
+TASK="${SLURM_ARRAY_TASK_ID:?submit with --array}"
+(( TASK < N_RUNS )) || { echo "ERROR: task ${TASK} >= ${N_RUNS} runs"; exit 1; }
+TAG="${TAGS[$TASK]}"
+echo "SEED ${SEED}  ${MODEL}/${TREE}  task ${TASK}/${N_RUNS}: ${TAG}"
+
+echo "=== test_evaluate_metrics.py ==="
+run_python "${CODE_ROOT}/test_evaluate_metrics.py"
+
+COMMON=(batch --exp_root "${EXP_ROOT}" --data_root "${DATA_ROOT}" --only "${TAG}"
+        --input_transform none --transform_cache_dir "${RESULTS}/../transforms")
+
+if [[ "${MODEL}" == "unet" ]]; then
+    echo "=== deterministic, test splits -> unet_accept ==="
+    run_python "${CODE_ROOT}/evaluate.py" "${COMMON[@]}" \
+        --output_dir "${RESULTS}/unet_accept" --save_samples 0
+else
+    echo "=== deterministic (mu), with the training split -> afm${OUT_SUFFIX}/${TREE} ==="
+    run_python "${CODE_ROOT}/evaluate.py" "${COMMON[@]}" \
+        --output_dir "${RESULTS}/afm${OUT_SUFFIX}/${TREE}" --save_samples 10 --eval_train
+    echo "=== probabilistic, M=${N_ENSEMBLE}, ${STEPS} steps -> afm_prob${OUT_SUFFIX}/${TREE} ==="
+    run_python "${CODE_ROOT}/evaluate.py" "${COMMON[@]}" \
+        --output_dir "${RESULTS}/afm_prob${OUT_SUFFIX}/${TREE}" --save_samples 5 \
+        --n_ensemble "${N_ENSEMBLE}" --sample_steps "${STEPS}"
+fi
+echo "=== eval task ${TASK} (${TAG}) complete ==="

@@ -143,7 +143,7 @@ Seeds: 42, 43, 44.
 - **Oracle and source-only checkpoints share the name `{src}__to__{tgt}__none`.** There
   is no `__oracle` tag. The oracle (`PHASE=oracle`, i.e. `--uda_method none
   --joint_training`) is kept apart only by its directory: `unet_seed<N>_oracle/` beside
-  `unet_seed<N>/` (afm: `afm_oracle/`, tag `afm_{src}__to__{tgt}____none`). Once the
+  `unet_seed<N>/` (afm: `afm_seed<N>_oracle/`, tag `afm_{src}__to__{tgt}__none`). Once the
   baselines are materialised, the source-only tree has the same six off-diagonal names
   as the oracle tree, so anything that globs `*__none` (`conditional_shift.py`,
   `evaluate.py --exp_root`) silently accepts whichever tree it is
@@ -155,13 +155,20 @@ Seeds: 42, 43, 44.
 An evaluation framework for unsupervised domain adaptation in precipitation
 super-resolution on RainShift. It is a diagnosis paper, not a method paper. Four claims:
 
-1. The three domain pairs differ in P(Y|X), not only P(X). Established.
+1. The three domain pairs differ in P(Y|X), not only P(X). Holds for the two
+   pairs with europe_west; undetermined for horn↔melanesia (PLAN.md, 2026-11-02).
 2. The gap is reducible in principle but not identifiable from unlabelled target data —
-   the oracle recovers target in-domain risk, so λ̂ ≈ 0. Needs error bars over seeds.
+   the oracle recovers target in-domain risk, so λ̂ ≈ 0. Seeded: holds into the tropics,
+   not into europe_west (λ̂ 22–39 % of the gap at the 0.1 mm floor).
 3. Methods fail by trading the source conditional for target risk; feature alignment is
-   structurally blocked by global average pooling at the bottleneck.
-4. The failure is a property of the task, not of the MSE objective. Needs the
-   flow-matching arm.
+   structurally blocked by global average pooling at the bottleneck (wording under
+   review, see PLAN.md).
+4. The failure is a property of the task, not of the MSE objective. AFM phase 1 done;
+   oracle and phase 2 pending.
+
+Headline metric is `mse_log_e01` (log(P + 0.1 mm/h)). Every UNet, in-domain included,
+is far too dry, so always check a log-floor result against mm-space bias, maximum or
+wet fraction: DANN models with 10⁶ mm/h pixels score well in the log floor.
 
 If a result would make a UDA method look good, check it twice before telling me — the
 prior is that it does not.

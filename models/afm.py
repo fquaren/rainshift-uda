@@ -156,24 +156,30 @@ class AFMModel(nn.Module):
         return x_dyn
 
     @torch.no_grad()
-    def sample(self, x_dyn, x_stat, n_samples=1, steps=20, method="midpoint"):
+    def sample(self, x_dyn, x_stat, n_samples=1, steps=20, method="midpoint", generator=None):
+        """generator: an optional torch.Generator on the model's device, so a
+        validation score can draw the same noise every epoch and every run."""
         was_training = self.training
         self.eval()
         x_dyn = self._match_dyn(x_dyn, x_stat)
         mu = self.encoder(x_dyn, x_stat)
         all_s = []
         for _ in range(n_samples):
-            x = mu + self.sigma_z * torch.randn_like(mu)
+            # The ODE state stays float32. Under evaluate.py's bf16 autocast
+            # the network outputs are bf16, and integrating in bf16 would add
+            # a rounding error at every step.
+            noise = torch.randn(mu.shape, generator=generator, device=mu.device, dtype=torch.float32)
+            x = mu.float() + self.sigma_z * noise
             dt = 1.0 / steps
             for i in range(steps):
                 tv = i * dt
                 t = torch.full((mu.shape[0],), tv, device=mu.device)
                 if method == "euler":
-                    x = x + self.flow_net(x, t, x_dyn, x_stat) * dt
+                    x = x + self.flow_net(x, t, x_dyn, x_stat).float() * dt
                 else:  # midpoint
-                    v1 = self.flow_net(x, t, x_dyn, x_stat)
+                    v1 = self.flow_net(x, t, x_dyn, x_stat).float()
                     tm = torch.full_like(t, tv + dt / 2)
-                    v2 = self.flow_net(x + v1 * dt / 2, tm, x_dyn, x_stat)
+                    v2 = self.flow_net(x + v1 * dt / 2, tm, x_dyn, x_stat).float()
                     x = x + v2 * dt
             all_s.append(x)
         if was_training:

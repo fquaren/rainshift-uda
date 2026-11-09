@@ -281,26 +281,18 @@ def _knn_barycentric(query, anchors, mapped, k=10, chunk=8192):
 def fit_ot_from_npy(src_path, tgt_path, n_anchors=5000, reg=0.1,
                     n_iter=300, k=10, device="cuda", subset=None):
     """
-    Load training-split inputs from two .npy dataset dirs and fit the OT map.
+    Disabled on 2026-10-29. It read train_x.npy from the NPY conversion,
+    which no longer exists, and those arrays were in the NPY pipeline's
+    space (inputs bicubic-upsampled before the log, z-scored by each domain's
+    own stats.json), not in the source-normalised Zarr space the map would be
+    applied in at test time. evaluate.py no longer offers `ot`.
 
-    Args:
-        src_path, tgt_path: region directories produced by convert_zarr_to_npy.py
-        subset: cap on number of samples loaded from each (None = all)
+    SinkhornOTMap itself is unchanged; a Zarr-based fit must sample both
+    domains' TRAINING splits normalised with the SOURCE stats, as
+    quantile_map.fit_qm_from_zarr does.
     """
-    src_x = np.load(Path(src_path) / "train_x.npy", mmap_mode="r")
-    tgt_x = np.load(Path(tgt_path) / "train_x.npy", mmap_mode="r")
-
-    if subset is not None:
-        src_x = np.asarray(src_x[:subset])
-        tgt_x = np.asarray(tgt_x[:subset])
-    else:
-        src_x = np.asarray(src_x)
-        tgt_x = np.asarray(tgt_x)
-
-    src_t = torch.from_numpy(src_x)
-    tgt_t = torch.from_numpy(tgt_x)
-
-    mapper = SinkhornOTMap(n_anchors=n_anchors, reg=reg, n_iter=n_iter,
-                           k=k, device=device)
-    mapper.fit(src_t, tgt_t)
-    return mapper
+    raise RuntimeError(
+        "sinkhorn.fit_ot_from_npy is disabled: the NPY files are gone and their space differs "
+        "from the source-normalised Zarr space the map is applied in. Write a Zarr fit with "
+        "SOURCE stats for both domains (see quantile_map.fit_qm_from_zarr)."
+    )

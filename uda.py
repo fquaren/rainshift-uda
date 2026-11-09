@@ -55,19 +55,65 @@ def coral_loss(src_feat: torch.Tensor, tgt_feat: torch.Tensor) -> torch.Tensor:
     return (cov_s - cov_t).pow(2).sum() / d
 
 
+def pool_features(feat: torch.Tensor, pool: str = "gap") -> torch.Tensor:
+    """
+    (B, C, H, W) feature map -> (B, D) vector for a feature-alignment loss.
+
+    gap    global average pooling, D = C. What every feature loss here used
+           originally: it keeps which channels fire and discards where.
+    grid4  per-channel mean and standard deviation over a 4 x 4 grid of cells
+           (3 x 3 cells at the 12 x 12 bottleneck), D = 32 C. Keeps coarse
+           geometry; the GAP ablation (PLAN.md, Stage 2 panel c). The std
+           rather than the variance keeps both halves in feature units, so
+           neither dominates the RBF distance.
+    """
+    if pool == "gap":
+        return F.adaptive_avg_pool2d(feat, 1).flatten(1)
+    if pool == "grid4":
+        m = F.adaptive_avg_pool2d(feat, 4)
+        v = (F.adaptive_avg_pool2d(feat * feat, 4) - m * m).clamp_min(0.0)
+        return torch.cat([m.flatten(1), (v + 1e-6).sqrt().flatten(1)], dim=1)
+    raise ValueError(f"unknown pool '{pool}'")
+
+
+def _mmd_from_vectors(src, tgt, bandwidths, unbiased=False):
+    """Multi-kernel MMD^2 between two (B, D) sets. The biased estimator keeps
+    the kernel diagonal, which adds ~2/B times (1 - mean off-diagonal kernel)
+    regardless of the domains; the unbiased one drops it (and can be < 0)."""
+    d_ss = torch.cdist(src, src, p=2.0).pow(2)
+    d_tt = torch.cdist(tgt, tgt, p=2.0).pow(2)
+    d_st = torch.cdist(src, tgt, p=2.0).pow(2)
+
+    def _within(k):
+        if not unbiased:
+            return k.mean()
+        n = k.size(0)
+        return (k.sum() - k.diagonal().sum()) / (n * (n - 1))
+
+    loss = torch.tensor(0.0, device=src.device, dtype=src.dtype)
+    for bw in bandwidths:
+        gamma = 1.0 / (2.0 * bw * bw)
+        loss = loss + _within(torch.exp(-gamma * d_ss)) + _within(torch.exp(-gamma * d_tt)) \
+            - 2.0 * torch.exp(-gamma * d_st).mean()
+    return loss / len(bandwidths)
+
+
 def mmd_loss(
     src_feat: torch.Tensor,
     tgt_feat: torch.Tensor,
     bandwidths: Optional[list] = None,
+    pool: str = "gap",
+    unbiased: bool = False,
 ) -> torch.Tensor:
     """
     Multi-kernel Maximum Mean Discrepancy with Gaussian RBF kernels, on
-    single-level GAP-pooled features.
+    single-level pooled features (pool_features). The defaults, GAP and the
+    biased estimator, are what every seeded MMD run used.
 
     Gretton et al., JMLR 2012; Long et al., ICML 2015 (DAN).
     """
-    src = F.adaptive_avg_pool2d(src_feat, 1).flatten(1)
-    tgt = F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1)
+    src = pool_features(src_feat, pool)
+    tgt = pool_features(tgt_feat, pool)
 
     # Bandwidths. A FIXED ladder (the old default [0.01..100]) is wrong here:
     # GAP-pooled 512-d bottleneck features have median pairwise distance ~70,
@@ -76,27 +122,32 @@ def mmd_loss(
     # a batch-size artefact carrying no domain signal (this is why single-scale
     # MMD logged a near-constant 0.0115). We therefore default to the median
     # heuristic (Gretton et al. 2012) with the standard DAN 2^{-2..2} ladder,
-    # matching what mmd_multiscale_loss already did.
+    # matching what mmd_multiscale_loss already did. The median is taken on the
+    # pooled vectors, so it follows the pooling.
     if bandwidths is None:
-        bw = _median_heuristic_bandwidth(src_feat, tgt_feat)
+        bw = _median_pairwise_distance(src, tgt)
         bandwidths = [bw * (2.0**k) for k in (-2, -1, 0, 1, 2)]
 
-    def _pairwise_sq_dist(a, b):
-        return torch.cdist(a, b, p=2.0).pow(2)
+    return _mmd_from_vectors(src, tgt, bandwidths, unbiased)
 
-    d_ss = _pairwise_sq_dist(src, src)
-    d_tt = _pairwise_sq_dist(tgt, tgt)
-    d_st = _pairwise_sq_dist(src, tgt)
 
-    loss = torch.tensor(0.0, device=src.device, dtype=src.dtype)
-    for bw in bandwidths:
-        gamma = 1.0 / (2.0 * bw * bw)
-        k_ss = torch.exp(-gamma * d_ss)
-        k_tt = torch.exp(-gamma * d_tt)
-        k_st = torch.exp(-gamma * d_st)
-        loss = loss + k_ss.mean() + k_tt.mean() - 2.0 * k_st.mean()
-
-    return loss / len(bandwidths)
+@torch.no_grad()
+def mmd_diagnostics(src_feat: torch.Tensor, tgt_feat: torch.Tensor) -> Dict[str, float]:
+    """
+    Logging only: unbiased MMD^2 source vs target under both poolings, and a
+    within-batch null (first vs second half of the source batch) with the
+    same bandwidths. The null halves come from one shuffle buffer, so they
+    are closer than independent draws and the null is a lower reference.
+    """
+    out = {}
+    for pool in ("gap", "grid4"):
+        s, t = pool_features(src_feat, pool), pool_features(tgt_feat, pool)
+        bw = _median_pairwise_distance(s, t)
+        bws = [bw * (2.0**k) for k in (-2, -1, 0, 1, 2)]
+        h = s.size(0) // 2
+        out[f"mmd_{pool}"] = _mmd_from_vectors(s, t, bws, unbiased=True).item()
+        out[f"null_{pool}"] = _mmd_from_vectors(s[:h], s[h:2 * h], bws, unbiased=True).item()
+    return out
 
 
 def mmd_multiscale_loss(
@@ -105,6 +156,8 @@ def mmd_multiscale_loss(
     levels: Iterable[str] = ("enc2", "enc3", "enc4", "bottleneck"),
     bandwidths: Optional[list] = None,
     median_heuristic: bool = True,
+    pool: str = "gap",
+    unbiased: bool = False,
 ) -> torch.Tensor:
     """
     Multi-scale MMD: average single-scale MMD losses across several encoder
@@ -130,14 +183,12 @@ def mmd_multiscale_loss(
             f"Requested {list(levels)}, available {list(src_feats)}."
         )
 
+    # With the median heuristic, mmd_loss derives each level's bandwidth from
+    # that level's pooled vectors, so it follows --pool.
     losses = []
     for lvl in active_levels:
-        if median_heuristic:
-            bw = _median_heuristic_bandwidth(src_feats[lvl], tgt_feats[lvl])
-            bws = [bw * (2.0**k) for k in (-2, -1, 0, 1, 2)]
-        else:
-            bws = bandwidths
-        losses.append(mmd_loss(src_feats[lvl], tgt_feats[lvl], bandwidths=bws))
+        bws = None if median_heuristic else bandwidths
+        losses.append(mmd_loss(src_feats[lvl], tgt_feats[lvl], bandwidths=bws, pool=pool, unbiased=unbiased))
 
     return torch.stack(losses).mean()
 
@@ -155,9 +206,17 @@ def _median_heuristic_bandwidth(
     not receive gradient. Capped at max_samples per domain to avoid O(n^2)
     memory on large batches.
     """
-    src = F.adaptive_avg_pool2d(src_feat, 1).flatten(1)
-    tgt = F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1)
+    return _median_pairwise_distance(
+        F.adaptive_avg_pool2d(src_feat, 1).flatten(1),
+        F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1),
+        max_samples,
+    )
 
+
+@torch.no_grad()
+def _median_pairwise_distance(src: torch.Tensor, tgt: torch.Tensor, max_samples: int = 512) -> float:
+    """Median pairwise Euclidean distance over the stacked (B, D) source and
+    target vectors; a scalar constant, so it carries no gradient."""
     if src.size(0) > max_samples:
         src = src[:max_samples]
     if tgt.size(0) > max_samples:
@@ -206,7 +265,8 @@ class DomainDiscriminator(nn.Module):
         # Single hidden layer, small hidden_dim (64). Wang et al. 2026
         # (arXiv:2607.05645) found a shallow classifier gives a more stable
         # alignment signal for climate downscaling DA; a heavy discriminator
-        # wins outright and collapses the domain loss to ln(2) (chance).
+        # wins outright and drives the domain loss towards 0. A domain loss
+        # held near ln(2) (chance) is the DANN equilibrium, not a failure.
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -351,26 +411,9 @@ def spectral_density_loss(
 # ================================================================
 
 
-@torch.no_grad()
-def fda_transfer(
-    src_img: torch.Tensor,
-    tgt_img: torch.Tensor,
-    beta: float = 0.01,
-) -> torch.Tensor:
-    """
-    Fourier Domain Adaptation: replace low-frequency amplitude of source
-    with that of target.
-
-    Yang & Soatto, CVPR 2020. arXiv:2004.05498
-
-    Args:
-        src_img: (B, C, H, W) source input
-        tgt_img: (B, C, H, W) target input (randomly sampled)
-        beta: fraction of spectrum to swap (0.0 = no change, 1.0 = full swap)
-
-    Returns:
-        adapted source image with target low-frequency style
-    """
+def _fda_spectrum(src_img: torch.Tensor, tgt_img: torch.Tensor, beta: float) -> torch.Tensor:
+    """The adapted spectrum of fda_transfer, before the inverse FFT. Separate
+    so the tests can check that its inverse is real."""
     src_f = torch.fft.fft2(src_img.float(), dim=(-2, -1))
     tgt_f = torch.fft.fft2(tgt_img.float(), dim=(-2, -1))
 
@@ -383,10 +426,58 @@ def fda_transfer(
     h = max(int(H * beta), 1)
     w = max(int(W * beta), 1)
 
-    src_amp[:, :, cy - h : cy + h, cx - w : cx + w] = tgt_amp[:, :, cy - h : cy + h, cx - w : cx + w]
+    # Window symmetric about the shifted zero frequency, frequencies -h..+h.
+    ys, xs = slice(max(cy - h, 0), cy + h + 1), slice(max(cx - w, 0), cx + w + 1)
+    src_amp[:, :, ys, xs] = tgt_amp[:, :, ys, xs]
 
     src_amp = torch.fft.ifftshift(src_amp, dim=(-2, -1))
     result = src_amp * torch.exp(1j * src_phase)
+    # DC: the target's full complex coefficient, i.e. the target mean.
+    result[..., 0, 0] = tgt_f[..., 0, 0]
+    return result
+
+
+@torch.no_grad()
+def fda_transfer(
+    src_img: torch.Tensor,
+    tgt_img: torch.Tensor,
+    beta: float = 0.01,
+) -> torch.Tensor:
+    """
+    Fourier Domain Adaptation: replace low-frequency amplitude of source
+    with that of target.
+
+    Yang & Soatto, CVPR 2020. arXiv:2004.05498
+
+    Two departures from a literal amplitude swap, both needed here:
+
+    - DC. The inputs are z-scored, so a channel's spatial mean is negative
+      about half the time, and then its DC coefficient is real and negative
+      (phase pi). Swapping only the amplitude and keeping the source phase
+      gives a mean of sign(source mean) * |target mean|: a europe sample at
+      tcw -0.3 adapted towards melanesia (+4.4) came out at -4.4, outside both
+      domains. The DC therefore takes the target's complex coefficient, so
+      the output mean is the target mean. For the image RGB inputs of the
+      paper the mean is positive and the two coincide.
+    - Window. The swap covers frequencies -h..+h about the shifted centre
+      (the reference code's c-b:c+b+1). The old window cy-h:cy+h held -h..h-1,
+      so at 80x80 and beta 0.01 it swapped the -1 frequencies but not their
+      Hermitian partners +1, and .real then applied half of that swap. With a
+      symmetric window the spectrum stays Hermitian and the inverse is real up
+      to round-off.
+
+    h = max(int(H * beta), 1) as before, so beta = 0 still swaps the mean and
+    the +-1 frequencies; beta >= 0.5 swaps every amplitude.
+
+    Args:
+        src_img: (B, C, H, W) source input
+        tgt_img: (B, C, H, W) target input (randomly sampled)
+        beta: half-width of the swapped window as a fraction of the size
+
+    Returns:
+        adapted source image with target low-frequency style
+    """
+    result = _fda_spectrum(src_img, tgt_img, beta)
     return torch.fft.ifft2(result, dim=(-2, -1)).real.to(src_img.dtype)
 
 
@@ -465,7 +556,13 @@ def apply_quantile_mapping(
 # ================================================================
 
 
-def _sinkhorn_log(cost: torch.Tensor, reg: float = 0.1, n_iter: int = 50) -> torch.Tensor:
+def _sinkhorn_log(
+    cost: torch.Tensor,
+    reg: float = 0.1,
+    n_iter: int = 50,
+    tol: Optional[float] = None,
+    return_err: bool = False,
+):
     """
     Log-domain Sinkhorn for uniform marginals. Returns the coupling gamma.
 
@@ -473,6 +570,18 @@ def _sinkhorn_log(cost: torch.Tensor, reg: float = 0.1, n_iter: int = 50) -> tor
     cost matrix here mixes a feature term and a full-field label term whose
     scale varies by orders of magnitude across pairs; the naive form
     underflows to zero coupling and silently yields a zero loss.
+
+    Each iteration ends on the column update, so the column marginals hold
+    exactly and the row marginals only once the iteration has converged. At
+    small reg 50 iterations may not be enough (audit A8): a row-marginal
+    error left over means some source samples carry more than 1/n of the
+    mass. n_iter = 50 and tol = None are what every JDOT run used.
+
+    Args:
+        n_iter: maximum number of iterations.
+        tol:    if given, stop once the row-marginal L1 error is below it.
+        return_err: also return {"marg_err_row", "marg_err_col", "iters"},
+            the L1 errors sum_i |gamma_i. - 1/n| and sum_j |gamma_.j - 1/m|.
     """
     n, m = cost.shape
     a = torch.full((n,), -np.log(n), device=cost.device, dtype=cost.dtype)
@@ -480,10 +589,23 @@ def _sinkhorn_log(cost: torch.Tensor, reg: float = 0.1, n_iter: int = 50) -> tor
     f = torch.zeros_like(a)
     g = torch.zeros_like(b)
     K = -cost / reg
-    for _ in range(n_iter):
+    it = 0
+    for it in range(1, n_iter + 1):
         f = a - torch.logsumexp(K + g[None, :], dim=1)
         g = b - torch.logsumexp(K + f[:, None], dim=0)
-    return torch.exp(K + f[:, None] + g[None, :])
+        if tol is not None:
+            row = torch.exp(f + torch.logsumexp(K + g[None, :], dim=1))
+            if float((row - 1.0 / n).abs().sum()) < tol:
+                break
+    gamma = torch.exp(K + f[:, None] + g[None, :])
+    if not return_err:
+        return gamma
+    err = {
+        "marg_err_row": float((gamma.sum(1) - 1.0 / n).abs().sum()),
+        "marg_err_col": float((gamma.sum(0) - 1.0 / m).abs().sum()),
+        "iters": it,
+    }
+    return gamma, err
 
 
 def jdot_loss(
@@ -495,6 +617,7 @@ def jdot_loss(
     reg: float = 0.1,
     n_iter: int = 50,
     return_diag: bool = False,
+    tol: Optional[float] = None,
 ):
     """
     Minibatch DeepJDOT loss (Courty et al., NeurIPS 2017; Damodaran et al.,
@@ -526,7 +649,11 @@ def jdot_loss(
         pred_tgt: (B, 1, H', W') model prediction on target inputs.
         alpha:    weight on the feature term relative to the label term.
         reg:      Sinkhorn entropic regularisation.
-        n_iter:   Sinkhorn iterations.
+        n_iter:   Sinkhorn iterations (the maximum when tol is given).
+        tol:      optional Sinkhorn stopping tolerance on the row-marginal L1
+                  error (_sinkhorn_log). None, the default, runs n_iter.
+        return_diag: also return a dict of diagnostics, including the
+                  Sinkhorn marginal errors. The loss is the same either way.
     """
     gs = F.adaptive_avg_pool2d(src_feat, 1).flatten(1)      # (Bs, C)
     gt = F.adaptive_avg_pool2d(tgt_feat, 1).flatten(1)      # (Bt, C)
@@ -543,7 +670,10 @@ def jdot_loss(
 
     # Coupling solved with the network held fixed (alternating optimisation).
     with torch.no_grad():
-        gamma = _sinkhorn_log(cost.detach(), reg=reg, n_iter=n_iter)
+        if return_diag:
+            gamma, sk = _sinkhorn_log(cost.detach(), reg=reg, n_iter=n_iter, tol=tol, return_err=True)
+        else:
+            gamma = _sinkhorn_log(cost.detach(), reg=reg, n_iter=n_iter, tol=tol)
 
     loss = (gamma * cost).sum()
 
@@ -580,8 +710,16 @@ def jdot_loss(
             "cost_feat_mean": cf,
             "cost_label_mean": cl,
             "feat_over_label": cf * alpha / (cl + 1e-12),
+            # share of the transport cost <gamma, C> carried by the feature
+            # term, i.e. weighted by the coupling rather than averaged
+            "feat_share_transport": float((gamma * alpha * c_feat).sum()) / (float(loss) + 1e-12),
             "cost_mean": inert_loss,
             "cost_std": float(cost.std()),
             "reg_over_cost_std": reg / (float(cost.std()) + 1e-12),
+            # Sinkhorn convergence: the row marginal is the one left unenforced
+            # when the iteration stops early (_sinkhorn_log).
+            "marg_err_row": sk["marg_err_row"],
+            "marg_err_col": sk["marg_err_col"],
+            "sinkhorn_iters": sk["iters"],
         }
     return loss, diag

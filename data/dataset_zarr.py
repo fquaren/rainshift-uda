@@ -89,6 +89,33 @@ def _transform_channel(arr: np.ndarray, var: str, mean: float, std: float) -> np
     return ((a - mean) / (std + 1e-8)).astype(np.float32)
 
 
+def half_chunk_ids(chunk_ids, half, n_total, block_hours=8760):
+    """Keep the chunks that lie wholly inside alternate time blocks of
+    `block_hours` (365-day blocks from the start of the record): blocks
+    0, 2, 4, ... for half 0, blocks 1, 3, ... for half 1. Used for the
+    split-half null of the model-based conditional-shift test (PLAN.md P2).
+
+    Purge: a chunk is dropped from both halves if it straddles a block
+    boundary OR touches one (its first hour opens a block, or its last hour
+    closes one; the start and end of the record do not count). Where a
+    chunk straddles the boundary, dropping it leaves 200 h between the
+    halves; where a boundary falls exactly between two chunks (every fifth
+    year, 5 x 8760 = 219 x 200), both neighbours go and the gap is 400 h.
+    Either way the halves never touch, matching purge_gap=1 of the
+    train/validation split. Raises if nothing is left."""
+    keep = []
+    for c in chunk_ids:
+        t0, t1 = c * _CHUNK, min((c + 1) * _CHUNK, n_total) - 1
+        lo, hi = max(t0 - 1, 0), min(t1 + 1, n_total - 1)
+        b0, b1 = lo // block_hours, hi // block_hours
+        if b0 == b1 and b0 % 2 == half:
+            keep.append(c)
+    if chunk_ids and not keep:
+        raise ValueError(f"half {half}: no chunk of {len(chunk_ids)} lies inside a "
+                         f"{block_hours}-h block of that parity (n_total={n_total})")
+    return keep
+
+
 def _compute_and_cache_stats(root: Path, input_vars=None) -> dict:
     """Compute per-variable (mean, std) from a domain's TRAINING Zarr, matching
     compute_domain_stats: units (tp,cp x1000) -> log(clip+eps) for _LOG_VARS ->

@@ -16,8 +16,8 @@
 #
 #  Run this AFTER Phase 1 finishes and BEFORE evaluate.sh.
 #
-#  Works on ONE seed's tree, unet_seed${SEED}/, which is where
-#  run_exp_unet.sh writes. SEED is required: the old default wrote into the
+#  Works on ONE seed's tree, ${MODEL}_seed${SEED}/ (MODEL=unet default, or afm), which is where
+#  run_exp_unet.sh / run_exp_afm.sh write. SEED is required: the old default wrote into the
 #  unseeded unet/ tree for every seed. An existing pair-named directory is
 #  never overwritten -- identical copies are skipped, anything else aborts.
 # ===========================================================================
@@ -25,7 +25,16 @@ set -euo pipefail
 
 SEED="${SEED:?SEED must be set, e.g. SEED=42}"
 OUTPUT_DIR="${OUTPUT_DIR:-/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/results_rainshift_uda}"
-MODEL_DIR="${OUTPUT_DIR}/unet_seed${SEED}"
+# MODEL=afm handles the AFM tree, whose tags are afm_{src}__to__{tgt}__none.
+MODEL="${MODEL:-unet}"
+case "${MODEL}" in
+    unet) PFX="" ;;
+    afm)  PFX="afm_" ;;
+    *) echo "ERROR: MODEL must be unet or afm"; exit 1 ;;
+esac
+# OUTPUT_SUFFIX selects a side tree, e.g. _smoke.
+MODEL_DIR="${OUTPUT_DIR}/${MODEL}_seed${SEED}${OUTPUT_SUFFIX:-}"
+run_dir() { echo "${MODEL_DIR}/${PFX}$1__to__$2__none"; }
 
 DOMAINS=("europe_west" "horn-of-africa" "melanesia")
 
@@ -34,9 +43,16 @@ echo "=== materialising pair-named source-only checkpoints in ${MODEL_DIR} ==="
 
 missing=0
 for src in "${DOMAINS[@]}"; do
-    diag="${MODEL_DIR}/${src}__to__${src}__none"
+    diag="$(run_dir "${src}" "${src}")"
     if [[ ! -f "${diag}/best.pt" ]]; then
         echo "  ERROR: missing ${diag}/best.pt -- run PHASE=1 first."
+        missing=1
+        continue
+    fi
+    # config.json is written only when training ends; best.pt from epoch 1.
+    # Without it the diagonal is a run still training or one that died.
+    if [[ ! -f "${diag}/config.json" ]]; then
+        echo "  ERROR: ${diag} has best.pt but no config.json -- unfinished run."
         missing=1
         continue
     fi
@@ -48,7 +64,7 @@ for src in "${DOMAINS[@]}"; do
     fi
     for tgt in "${DOMAINS[@]}"; do
         [[ "$src" == "$tgt" ]] && continue
-        dst="${MODEL_DIR}/${src}__to__${tgt}__none"
+        dst="$(run_dir "${src}" "${tgt}")"
         if [[ -e "${dst}" ]]; then
             if cmp -s "${diag}/best.pt" "${dst}/best.pt"; then
                 echo "  ${src} -> ${tgt}  (already present, identical, skipped)"
@@ -67,9 +83,9 @@ done
 
 echo
 echo "=== verification ==="
-n_diag=$(ls -d "${MODEL_DIR}"/*__to__*__none 2>/dev/null | wc -l)
+n_diag=$(ls -d "${MODEL_DIR}"/${PFX}*__to__*__none 2>/dev/null | wc -l)
 echo "  checkpoint dirs found: ${n_diag} (expect 9 = 3 diagonal + 6 off-diagonal)"
-for d in "${MODEL_DIR}"/*__to__*__none; do
+for d in "${MODEL_DIR}"/${PFX}*__to__*__none; do
     [[ -f "$d/best.pt" ]] || echo "  WARNING: $(basename "$d") has no best.pt"
 done
 
@@ -77,10 +93,10 @@ done
 echo "  byte-identity of copies:"
 fail=0
 for src in "${DOMAINS[@]}"; do
-    ref="${MODEL_DIR}/${src}__to__${src}__none/best.pt"
+    ref="$(run_dir "${src}" "${src}")/best.pt"
     for tgt in "${DOMAINS[@]}"; do
         [[ "$src" == "$tgt" ]] && continue
-        if cmp -s "${ref}" "${MODEL_DIR}/${src}__to__${tgt}__none/best.pt"; then
+        if cmp -s "${ref}" "$(run_dir "${src}" "${tgt}")/best.pt"; then
             echo "    OK  ${src}__to__${tgt}"
         else
             echo "    FAIL ${src}__to__${tgt} differs from diagonal"

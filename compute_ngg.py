@@ -24,7 +24,8 @@ to the source-only model on the same (S, T) cell:
     delta_tgt(S, T) = E_T(f_m) - E_T(f_S^none)    (target change; < 0 is a gain)
 
 E is MSE (the training loss family), W1 is the per-variable 1D
-Wasserstein distance computed on domain-normalised pixel distributions, and
+Wasserstein distance in the SOURCE-normalised space the model lives in
+(--w1_space source_norm, the default), and
 
     eps = 0.1 * min_{S != T, W1(S, T) > 0} W1(S, T)
 
@@ -49,11 +50,35 @@ required.
 For backwards compatibility with the older evaluate.py schema (unprefixed
 columns and a (S, S) row giving E_S), pass ``--legacy_schema``.
 
+W1 space
+--------
+source_norm (default)
+    --w1_matrix must be compute_shift.py's RAW cube (covariate_shift_analysis/
+    raw/): log(mm + 1e-5) for tp, cp and precipitation (tp, cp x1000 first),
+    physical units otherwise, no z-score -- the same transformed space as
+    normalization_stats.json. W1 is translation invariant and scales
+    linearly, so for the ordered pair S -> T in source-normalised space
+
+        W1_v(S, T) = W1_raw,v(S, T) / s_S,v
+
+    per channel v, with s_S,v from <stats_root>/<S>/normalization_stats.json.
+    The matrix is therefore asymmetric. Caveat: the raw cube was computed from
+    the (since deleted) NPY conversion, whose inputs were bicubic-upsampled
+    80 -> 200 in physical space before the log; the Zarr pipeline keeps them
+    at 80 x 80. The cube cannot be regenerated without the NPY files.
+own_norm (DEPRECATED, ngg_v2)
+    The normalized/ cube, which z-scores each domain by its OWN stats. That
+    erases the very shift the denominator is meant to measure (CLAUDE.md
+    normalisation trap; audit 2026-10-29 A5). Kept only to reproduce ngg_v2.
+
+The cube's directory name (raw / normalized) must match --w1_space, so the
+two cannot be mixed up.
+
 Inputs
 ------
 --w1_matrix, --w1_variables
-    The (V, D, D) .npy and its JSON sidecar produced by compute_shift.py in
-    --mode normalized.
+    The (V, D, D) .npy and its JSON sidecar produced by compute_shift.py,
+    raw/ for source_norm, normalized/ for own_norm.
 --results_csv
     results.csv produced by evaluate.py.
 --error_metric
@@ -64,9 +89,10 @@ Inputs
 --w1_agg
     Collapses the (V, D, D) cube to a (D, D) scalar W1 matrix.
 
-Outputs
+Outputs (--output_dir is refused if it exists)
 -------
 {output_dir}/ngg_matrix.npy       (D', D') with NaN on the diagonal
+{output_dir}/w1_matrix.npy        (D', D') the aggregated W1 denominator
 {output_dir}/ngg_meta.json        domain ordering, epsilon, all filter choices
 {output_dir}/ngg_heatmap.png      divergent colourmap centred at 0
 """
@@ -84,6 +110,30 @@ import seaborn as sns
 
 # Must match data/convert_zarr_to_npy.py
 DEFAULT_INPUT_VARS = ["cape", "cp", "sp", "tclw", "tcw", "tisr", "tp", "u", "v"]
+# compute_shift.py writes {output_dir}/{mode}/Wasserstein_1D_*.npy.
+_CUBE_DIR = {"source_norm": "raw", "own_norm": "normalized"}
+
+
+def _source_normalise(w1: np.ndarray, variables: list, domains: list, stats_root: Path) -> tuple:
+    """
+    Raw (V, D, D) cube -> W1 in each ROW's source-normalised space:
+    w1[v, i, j] / s_{domains[i], v}. The 1e-8 matches _transform_channel's
+    z-score. Returns (cube, {domain: [s_v per variable]}).
+    """
+    out = np.empty(w1.shape, dtype=np.float64)
+    used = {}
+    for i, d in enumerate(domains):
+        path = stats_root / d / "normalization_stats.json"
+        if not path.exists():
+            raise SystemExit(f"--w1_space source_norm: {path} not found")
+        stats = json.loads(path.read_text())
+        missing = [v for v in variables if v not in stats]
+        if missing:
+            raise SystemExit(f"{path}: no stats for {missing}")
+        s = np.array([float(stats[v][1]) for v in variables], dtype=np.float64)
+        out[:, i, :] = w1[:, i, :] / (s[:, None] + 1e-8)
+        used[d] = s.tolist()
+    return out, used
 
 
 # --------------------------------------------------------------------------
@@ -363,9 +413,26 @@ def plot_heatmap(matrix: np.ndarray, domains: list, title: str, path: Path):
 
 
 def run(args: argparse.Namespace) -> None:
+    out = Path(args.output_dir)
+    if out.exists():
+        raise SystemExit(f"{out} exists; not overwriting (CLAUDE.md rule 4).")
+    cube_dir = Path(args.w1_matrix).resolve().parent.name
+    if cube_dir != _CUBE_DIR[args.w1_space] or Path(args.w1_variables).resolve().parent.name != cube_dir:
+        raise SystemExit(
+            f"--w1_space {args.w1_space} needs the {_CUBE_DIR[args.w1_space]}/ cube and its sidecar; "
+            f"got {args.w1_matrix} and {args.w1_variables}.")
     w1_all = np.load(args.w1_matrix)
     meta = json.loads(Path(args.w1_variables).read_text())
     variables, w1_domains = meta["variables"], meta["domains"]
+    if w1_all.shape != (len(variables), len(w1_domains), len(w1_domains)):
+        raise SystemExit(f"{args.w1_matrix}: shape {w1_all.shape} does not match {args.w1_variables}")
+
+    source_std = None
+    if args.w1_space == "source_norm":
+        w1_all, source_std = _source_normalise(w1_all, variables, w1_domains, Path(args.stats_root))
+    else:
+        print("WARNING: --w1_space own_norm is DEPRECATED: each domain is z-scored by its own stats, "
+              "which removes the shift W1 is meant to measure. Use only to reproduce ngg_v2.")
 
     w1_full = _aggregate_w1(w1_all, variables, args.w1_agg, args.input_vars)
 
@@ -437,9 +504,9 @@ def run(args: argparse.Namespace) -> None:
                 f"(S, T) pairs absent from the CSV; those NGG entries are NaN."
             )
 
-    out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True)
     np.save(out / "ngg_matrix.npy", ngg)
+    np.save(out / "w1_matrix.npy", w1)
     if baseline is not None:
         d_src, d_tgt = compute_deltas(domains, errors, baseline)
         np.save(out / "delta_src.npy", d_src)
@@ -451,6 +518,9 @@ def run(args: argparse.Namespace) -> None:
                 "epsilon": eps,
                 "e_s_ref": None if args.legacy_schema else args.e_s_ref,
                 "w1_agg": args.w1_agg,
+                "w1_space": args.w1_space,
+                "w1_source_std": source_std,
+                "stats_root": str(Path(args.stats_root).resolve()) if source_std else None,
                 "error_metric": args.error_metric,
                 "error_is_mse_like": _squared(args.error_metric),
                 "legacy_schema": bool(args.legacy_schema),
@@ -468,7 +538,7 @@ def run(args: argparse.Namespace) -> None:
     title = (
         f"NGG  model={args.model}  method={args.method}  "
         f"transform={args.transform}\n"
-        f"W1 agg = {args.w1_agg}   error from {args.error_metric}   "
+        f"W1 agg = {args.w1_agg} ({args.w1_space})   error from {args.error_metric}   "
         f"E_S ref = {'legacy' if args.legacy_schema else args.e_s_ref}"
     )
     plot_heatmap(ngg, domains, title, out / "ngg_heatmap.png")
@@ -503,7 +573,20 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
-        "--w1_matrix", required=True, help="Wasserstein_1D_{split}.npy from compute_shift.py " "(normalized mode)"
+        "--w1_matrix", required=True, help="Wasserstein_1D_{split}.npy from compute_shift.py "
+        "(raw/ for --w1_space source_norm, normalized/ for own_norm)"
+    )
+    p.add_argument(
+        "--w1_space",
+        default="source_norm",
+        choices=["source_norm", "own_norm"],
+        help="source_norm: raw cube / s_S per channel, the space the model lives in (asymmetric). "
+        "own_norm: DEPRECATED own-stats cube of ngg_v2",
+    )
+    p.add_argument(
+        "--stats_root",
+        default="/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/rainshift",
+        help="read-only; <stats_root>/<domain>/normalization_stats.json gives s_S for source_norm",
     )
     p.add_argument("--w1_variables", required=True, help="JSON sidecar written alongside the W1 matrix")
     p.add_argument("--results_csv", required=True, help="results.csv produced by evaluate.py")
@@ -546,7 +629,8 @@ def parse_args() -> argparse.Namespace:
         "'last' (default) discards stale rows from prior runs",
     )
     p.add_argument(
-        "--output_dir", default="./ngg_analysis", help="directory for ngg_matrix.npy, ngg_meta.json, ngg_heatmap.png"
+        "--output_dir", default="./ngg_analysis",
+        help="directory for ngg_matrix.npy, ngg_meta.json, ngg_heatmap.png; refused if it exists"
     )
     return p.parse_args()
 

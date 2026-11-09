@@ -6,11 +6,16 @@ calls compute_ngg.py once per pair, and collects a summary table.
 
 Usage:
     python compute_ngg_all.py \\
-        --w1_matrix    covariate_shift_analysis/normalized/Wasserstein_1D_test.npy \\
-        --w1_variables covariate_shift_analysis/normalized/Wasserstein_1D_test_variables.json \\
+        --w1_matrix    covariate_shift_analysis/raw/Wasserstein_1D_test.npy \\
+        --w1_variables covariate_shift_analysis/raw/Wasserstein_1D_test_variables.json \\
         --results_csv  /path/to/results.csv \\
         --model        unet \\
-        --output_root  /path/to/ngg
+        --output_root  /path/to/ngg_v3/unet_none
+
+W1 is taken in source-normalised space (compute_ngg.py --w1_space
+source_norm, the default): the raw cube divided by s_S per channel. The
+normalized/ cube (own-stats z-score, ngg_v2) is deprecated; it is reachable
+only with --w1_space own_norm. --output_root is refused if it exists.
 
 Per-method outputs land in {output_root}/{model}__{method}__{transform}/,
 containing ngg_matrix.npy, ngg_meta.json, ngg_heatmap.png (the usual outputs
@@ -77,7 +82,9 @@ def _summarise(ngg_path: Path, domains: list) -> dict:
 def run(args: argparse.Namespace) -> None:
     results_csv = Path(args.results_csv)
     out_root = Path(args.output_root)
-    out_root.mkdir(parents=True, exist_ok=True)
+    if out_root.exists():
+        raise SystemExit(f"{out_root} exists; not overwriting (CLAUDE.md rule 4). Use a new directory.")
+    out_root.mkdir(parents=True)
 
     combos = _discover_combos(results_csv, args.model)
     if not combos:
@@ -98,6 +105,10 @@ def run(args: argparse.Namespace) -> None:
         passthrough += ["--dedup", args.dedup]
     if args.legacy_schema:
         passthrough += ["--legacy_schema"]
+    if args.w1_space:
+        passthrough += ["--w1_space", args.w1_space]
+    if args.stats_root:
+        passthrough += ["--stats_root", args.stats_root]
 
     summary_rows = []
     for method, transform in combos:
@@ -187,6 +198,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--e_s_ref", default=None, choices=[None, "baseline", "own"])
     p.add_argument("--dedup", default=None, choices=[None, "mean", "last", "first"])
     p.add_argument("--legacy_schema", action="store_true")
+    p.add_argument("--w1_space", default=None, choices=[None, "source_norm", "own_norm"],
+                   help="compute_ngg.py's default is source_norm; own_norm is deprecated")
+    p.add_argument("--stats_root", default=None)
     return p.parse_args()
 
 

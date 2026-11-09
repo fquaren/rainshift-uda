@@ -1,19 +1,23 @@
 #!/bin/bash -l
 # ===========================================================================
-#  RainShift UDA — Two-phase experiment launcher
+#  RainShift UDA — UNet experiments, per seed (run_exp_afm.sh is the AFM twin).
 #
-#  PHASE 1: Optuna search for base HPs (lr, batch_size, wd) on vanilla model.
-#           One job per (source, target) pair.
-#           Results saved to {OUTPUT_DIR}/base_hp/{src}__to__{tgt}.json
+#    PHASE=1       source-only baselines, one run per SOURCE domain (3 runs,
+#                  looped in one job), fixed HPs (no search). Writes
+#                  base_hp/{src}__to__{src}.json and fans it out to the pair
+#                  names. Then run materialise_baselines.sh.
+#    PHASE=2       UDA methods, base HPs read back from base_hp/. As a job
+#                  array, one run per task: 6 pairs x |METHODS|, src-major.
+#    PHASE=oracle  joint source+target training (6 pairs, looped), in the
+#                  separate unet_seed<N>_oracle/ tree.
 #
-#  PHASE 2: Standard training for UDA methods. (Method A: No UDA HP tuning).
-#           One job per (source, target, method) triple.
-#           Loads base HPs from phase 1 automatically.
+#  Early stopping as in every existing config.json: PATIENCE (phase 2) and
+#  PATIENCE_P1 default to 5, PATIENCE_ORACLE to 8.
 #
-#  Usage:
-#    PHASE=1 sbatch run_experiments.sh
-#    # After completion:
-#    PHASE=2 sbatch run_experiments.sh
+#  Usage (launch_sbatch.sh chains all three per seed):
+#    SEED=42 PHASE=1 sbatch --time 72:00:00 scripts/run_exp_unet.sh
+#    SEED=42 PHASE=2 sbatch --array=0-29 scripts/run_exp_unet.sh
+#    SEED=42 PHASE=oracle sbatch --time 72:00:00 scripts/run_exp_unet.sh
 # ===========================================================================
 
 #SBATCH --account tbeucler_downscaling
@@ -39,9 +43,6 @@
 #SBATCH --cpus-per-task 24
 #SBATCH --mem 200G
 #SBATCH --time 12:00:00
-
-# singularity is on PATH on the GPU nodes; load the module only if it is not.
-command -v singularity >/dev/null || module load singularityce/4.1.0
 
 set -euo pipefail
 
@@ -99,7 +100,10 @@ PAIR_ENV="${PAIR_ENV:-}"
 # can address conditional shift.
 
 EPOCHS=25
-PATIENCE="${PATIENCE:--1}"
+# Every phase-2 config.json says 5 and every oracle 8; the old default of -1
+# (no early stopping) applied only to hand-submitted runs and matched none.
+PATIENCE="${PATIENCE:-5}"
+PATIENCE_ORACLE="${PATIENCE_ORACLE:-8}"
 NUM_WORKERS=12
 BATCH_SIZE=128
 
@@ -109,6 +113,14 @@ LAMBDA_UDA=0.1
 # ramps the reversal 0->1). ~5e-4 per Wang et al. 2026; a large value
 # collapses the discriminator to ln(2). Ignored by non-DANN methods.
 DANN_WEIGHT=5e-4
+
+# Optional gradient-matched weight for mmd / mmd_ms / dann (audit A2), off by
+# default. The run tag does not record it, so it needs its own side tree.
+UDA_EXTRA=()
+[[ -n "${UDA_GRAD_RATIO:-}" ]] && UDA_EXTRA+=(--uda_grad_ratio "${UDA_GRAD_RATIO}")
+if (( ${#UDA_EXTRA[@]} )) && [[ -z "${OUTPUT_SUFFIX:-}" ]]; then
+    echo "ERROR: UDA_GRAD_RATIO needs an OUTPUT_SUFFIX side tree."; exit 1
+fi
 
 # --------------------------------------------------------------------------
 
@@ -134,6 +146,18 @@ DANN_WEIGHT=5e-4
 #  three domains, so 25 epochs spends ~80% of the wall clock past the
 #  checkpoint that is actually selected.
 # ===========================================================================
+# A run directory holding best.pt but no completion marker (best_hp/ or
+# base_hp/ JSON, or config.json, all written only after training ends) is a
+# run that died part-way: time limit, OOM, node drain. Retraining would
+# overwrite that checkpoint, so stop instead (CLAUDE.md rules 4 and 7).
+refuse_partial() {
+    if [[ -e "$1/best.pt" ]]; then
+        echo "ERROR: $1 holds a checkpoint from an unfinished run."
+        echo "       Move it to a _trash/ folder in the same tree, then rerun."
+        exit 1
+    fi
+}
+
 if [[ "${PHASE}" == "1" ]]; then
     PATIENCE_P1="${PATIENCE_P1:-5}"
 
@@ -148,6 +172,7 @@ if [[ "${PHASE}" == "1" ]]; then
         if [[ -f "${HP_FILE}" ]]; then
             echo "  Base HPs already exist: ${HP_FILE}, skipping training."
         else
+            refuse_partial "${OUTPUT_DIR}/${src}__to__${src}__none"
             run_python "${CODE_ROOT}/train_unet.py" \
                 --source_path "${DATA_ROOT}/${src}" \
                 --target_path "${DATA_ROOT}/${src}" \
@@ -158,7 +183,7 @@ if [[ "${PHASE}" == "1" ]]; then
                 --batch_size  "${BATCH_SIZE}" \
                 --patience    "${PATIENCE_P1}" \
                 --num_workers "${NUM_WORKERS}" \
-            --seed        "${SEED}" \
+                --seed        "${SEED}" \
                 2>&1 | tee "${OUTPUT_DIR}/phase1_${src}.log"
         fi
 
@@ -194,9 +219,11 @@ elif [[ "${PHASE}" == "2" ]]; then
             if [[ ! -f "${HP_FILE}" && -n "${OUTPUT_SUFFIX:-}" && -f "${MAIN_HP}" ]]; then
                 cp "${MAIN_HP}" "${HP_FILE}"
             fi
+            # Abort rather than skip: a skipped pair shifts every later array
+            # index onto the wrong run.
             if [[ ! -f "${HP_FILE}" ]]; then
-                echo "WARNING: Missing base HPs for ${src} -> ${tgt}, skipping."
-                continue
+                echo "ERROR: missing base HPs ${HP_FILE}; run PHASE=1 first."
+                exit 1
             fi
 
             for method in "${METHODS[@]}"; do
@@ -205,7 +232,7 @@ elif [[ "${PHASE}" == "2" ]]; then
         done
     done
 
-    echo "=== PHASE 2: Fixed UDA training (${#RUNS[@]} runs: ${METHODS[*]}) ==="
+    echo "=== PHASE 2: Fixed UDA training (${#RUNS[@]} runs: ${METHODS[*]}), patience=${PATIENCE} ==="
 
     # As a job array, each task trains exactly one run, RUNS[task id]. The
     # order is fixed (source, target, method), so --array=0-$((N-1)) with
@@ -226,6 +253,7 @@ elif [[ "${PHASE}" == "2" ]]; then
             echo "  Run completed previously, skipping."
             continue
         fi
+        refuse_partial "${OUTPUT_DIR}/${src}__to__${tgt}__${method}"
 
         run_python "${CODE_ROOT}/train_unet.py" \
             --source_path "${DATA_ROOT}/${src}" \
@@ -241,7 +269,8 @@ elif [[ "${PHASE}" == "2" ]]; then
             --patience    "${PATIENCE}" \
             --num_workers "${NUM_WORKERS}" \
             --seed        "${SEED}" \
-	    --jdot_reg 0.001 \
+            --jdot_reg    0.001 \
+            "${UDA_EXTRA[@]}" \
             2>&1 | tee "${OUTPUT_DIR}/phase2_${src}__to__${tgt}__${method}.log"
     done
 
@@ -261,33 +290,34 @@ elif [[ "${PHASE}" == "oracle" ]]; then
     for src in "${SOURCE_REGIONS[@]}"; do
         for tgt in "${TARGET_REGIONS[@]}"; do
             [[ "$src" == "$tgt" ]] && continue
+            [[ -n "${PAIR_ENV}" && "${src}|${tgt}" != "${PAIR_ENV}" ]] && continue
             PAIRS+=("${src}|${tgt}")
         done
     done
 
     echo "=== PHASE oracle: joint source+target training ==="
-    echo "Domain pairs: ${#PAIRS[@]}   output: ${ORACLE_DIR}"
+    echo "Domain pairs: ${#PAIRS[@]}   patience: ${PATIENCE_ORACLE}   output: ${ORACLE_DIR}"
 
     for i in "${!PAIRS[@]}"; do
         IFS='|' read -r src tgt <<< "${PAIRS[$i]}"
         echo "--- [$((i+1))/${#PAIRS[@]}] ${src} + ${tgt} (joint) ---"
 
-        # Oracle completion marker: the source-only base HPs are reused as the
-        # base-HP source, but the oracle checkpoint lives under ORACLE_DIR.
-        DONE_MARKER="${ORACLE_DIR}/${src}__to__${tgt}__none/best.pt"
-        if [[ -f "${DONE_MARKER}" ]]; then
-            echo "  Oracle checkpoint exists, skipping."
+        # Oracle completion marker: config.json, written only after training
+        # ends. best.pt alone is written from the first epoch on, so an oracle
+        # killed part-way used to be skipped as if complete.
+        RUN_DIR="${ORACLE_DIR}/${src}__to__${tgt}__none"
+        if [[ -f "${RUN_DIR}/config.json" ]]; then
+            echo "  Oracle run complete, skipping."
             continue
         fi
+        refuse_partial "${RUN_DIR}"
 
-        # Reuse the Phase 1 base HPs for this pair if present, so lr/bs/wd
-        # match the source-only baseline (fair oracle comparison).
+        # The Phase 1 base HPs for this pair, so lr/bs/wd match the
+        # source-only baseline (fair oracle comparison). Without them the
+        # oracle would silently train on the argparse defaults.
         HP_FILE="${OUTPUT_DIR}/base_hp/${src}__to__${tgt}.json"
-        if [[ -f "${HP_FILE}" ]]; then
-            cp "${HP_FILE}" "${ORACLE_DIR}/base_hp/${src}__to__${tgt}.json"
-        else
-            echo "  WARNING: no base HPs for ${src}->${tgt}; oracle uses argparse defaults."
-        fi
+        [[ -f "${HP_FILE}" ]] || { echo "ERROR: missing ${HP_FILE}; run PHASE=1 first."; exit 1; }
+        cp "${HP_FILE}" "${ORACLE_DIR}/base_hp/${src}__to__${tgt}.json"
 
         run_python "${CODE_ROOT}/train_unet.py" \
             --source_path "${DATA_ROOT}/${src}" \
@@ -298,7 +328,7 @@ elif [[ "${PHASE}" == "oracle" ]]; then
             --joint_training \
             --epochs      "${EPOCHS}" \
             --batch_size  "${BATCH_SIZE}" \
-            --patience    "${PATIENCE}" \
+            --patience    "${PATIENCE_ORACLE}" \
             --num_workers "${NUM_WORKERS}" \
             --seed        "${SEED}" \
             2>&1 | tee "${ORACLE_DIR}/oracle_${src}__to__${tgt}.log"
