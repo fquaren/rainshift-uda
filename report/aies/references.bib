@@ -1,0 +1,358 @@
+% ---------------------------------------------------------------------
+%  References for "Diagnosing failure modes of unsupervised domain
+%  adaptation in precipitation super-resolution".
+%
+%  Converted from the previous inline thebibliography environment.
+%  Fields reproduce exactly what that environment recorded; no
+%  bibliographic detail has been reconstructed from memory. Entries added
+%  after the conversion are grouped at the end and flagged.
+% ---------------------------------------------------------------------
+
+% ---- Foundational UDA theory ----
+
+@article{bendavid2010theory,
+  author  = {Ben-David, Shai and Blitzer, John and Crammer, Koby and
+             Kulis, Alex and Pereira, Fernando and Vaughan, Jennifer Wortman},
+  title   = {A theory of learning from different domains},
+  journal = {Machine Learning},
+  volume  = {79},
+  number  = {1--2},
+  pages   = {151--175},
+  year    = {2010}
+}
+
+@inproceedings{redko2017theoretical,
+  author    = {Redko, Ievgen and Habrard, Amaury and Sebban, Marc},
+  title     = {Theoretical analysis of domain adaptation with optimal transport},
+  booktitle = {ECML PKDD},
+  pages     = {737--753},
+  year      = {2017},
+  eprint    = {1610.04420},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{mansour2008domain,
+  author    = {Mansour, Yishay and Mohri, Mehryar and Rostamizadeh, Afshin},
+  title     = {Domain adaptation with multiple sources},
+  booktitle = {NeurIPS},
+  year      = {2008}
+}
+
+@book{quinonero2009dataset,
+  editor    = {Qui{\~n}onero-Candela, Joaquin and Sugiyama, Masashi and
+               Schwaighofer, Anton and Lawrence, Neil D.},
+  title     = {Dataset Shift in Machine Learning},
+  publisher = {MIT Press},
+  year      = {2009}
+}
+
+@inproceedings{bartlett2017spectrally,
+  author    = {Bartlett, Peter L. and Foster, Dylan J. and Telgarsky, Matus},
+  title     = {Spectrally-normalized margin bounds for neural networks},
+  booktitle = {NeurIPS},
+  year      = {2017},
+  eprint    = {1706.08498},
+  archivePrefix = {arXiv}
+}
+
+@article{fournier2015rate,
+  author  = {Fournier, Nicolas and Guillin, Arnaud},
+  title   = {On the rate of convergence in {W}asserstein distance of the
+             empirical measure},
+  journal = {Probability Theory and Related Fields},
+  volume  = {162},
+  number  = {3--4},
+  pages   = {707--738},
+  year    = {2015}
+}
+
+@inproceedings{germain2013pac,
+  author    = {Germain, Pascal and Habrard, Amaury and
+               Laviolette, Fran{\c{c}}ois and Morvant, Emilie},
+  title     = {A {PAC}-{B}ayesian approach for domain adaptation with
+               specialization to linear classifiers},
+  booktitle = {ICML},
+  year      = {2013}
+}
+
+@inproceedings{dziugaite2017computing,
+  author    = {Dziugaite, Gintare Karolina and Roy, Daniel M.},
+  title     = {Computing nonvacuous generalization bounds for deep
+               (stochastic) neural networks with many more parameters than
+               training data},
+  booktitle = {UAI},
+  year      = {2017},
+  eprint    = {1703.11008},
+  archivePrefix = {arXiv}
+}
+
+% ---- Identifiability assumptions ----
+
+@inproceedings{sugiyama2007direct,
+  author    = {Sugiyama, Masashi and Nakajima, Shinichi and Kashima, Hisashi
+               and von B{\"u}nau, Paul and Kawanabe, Motoaki},
+  title     = {Direct importance estimation with model selection and its
+               application to covariate shift adaptation},
+  booktitle = {NeurIPS},
+  year      = {2007}
+}
+
+@inproceedings{lipton2018detecting,
+  author    = {Lipton, Zachary C. and Wang, Yu-Xiang and Smola, Alexander J.},
+  title     = {Detecting and correcting for label shift with black box
+               predictors},
+  booktitle = {ICML},
+  year      = {2018},
+  eprint    = {1802.03916},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{scholkopf2012causal,
+  author    = {Sch{\"o}lkopf, Bernhard and Janzing, Dominik and Peters, Jonas
+               and Sgouritsa, Eleni and Zhang, Kun and Mooij, Joris},
+  title     = {On causal and anticausal learning},
+  booktitle = {ICML},
+  year      = {2012},
+  eprint    = {1206.6471},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{koh2021wilds,
+  author    = {Koh, Pang Wei and others},
+  title     = {{WILDS}: A benchmark of in-the-wild distribution shifts},
+  booktitle = {ICML},
+  year      = {2021},
+  eprint    = {2012.07421},
+  archivePrefix = {arXiv}
+}
+
+% ---- UDA methods ----
+
+@inproceedings{sun2016deep,
+  author    = {Sun, Baochen and Saenko, Kate},
+  title     = {Deep {CORAL}: Correlation alignment for deep domain adaptation},
+  booktitle = {ECCV Workshops},
+  year      = {2016},
+  eprint    = {1607.01719},
+  archivePrefix = {arXiv}
+}
+
+@article{gretton2012kernel,
+  author  = {Gretton, Arthur and Borgwardt, Karsten M. and Rasch, Malte J. and
+             Sch{\"o}lkopf, Bernhard and Smola, Alexander},
+  title   = {A kernel two-sample test},
+  journal = {Journal of Machine Learning Research},
+  volume  = {13},
+  pages   = {723--773},
+  year    = {2012}
+}
+
+@inproceedings{long2015learning,
+  author    = {Long, Mingsheng and Cao, Yue and Wang, Jianmin and
+               Jordan, Michael I.},
+  title     = {Learning transferable features with deep adaptation networks},
+  booktitle = {ICML},
+  year      = {2015},
+  eprint    = {1502.02791},
+  archivePrefix = {arXiv}
+}
+
+@article{ganin2016domain,
+  author  = {Ganin, Yaroslav and Ustinova, Evgeniya and Ajakan, Hana and
+             Germain, Pascal and Larochelle, Hugo and
+             Laviolette, Fran{\c{c}}ois and Marchand, Mario and
+             Lempitsky, Victor},
+  title   = {Domain-adversarial training of neural networks},
+  journal = {Journal of Machine Learning Research},
+  volume  = {17},
+  number  = {59},
+  pages   = {1--35},
+  year    = {2016}
+}
+
+@inproceedings{yang2020fda,
+  author    = {Yang, Yanchao and Soatto, Stefano},
+  title     = {{FDA}: {F}ourier domain adaptation for semantic segmentation},
+  booktitle = {CVPR},
+  year      = {2020},
+  eprint    = {2004.05498},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{cuturi2013sinkhorn,
+  author    = {Cuturi, Marco},
+  title     = {{S}inkhorn distances: Lightspeed computation of optimal transport},
+  booktitle = {NeurIPS},
+  year      = {2013}
+}
+
+@inproceedings{courty2017jdot,
+  author    = {Courty, Nicolas and Flamary, R{\'e}mi and Habrard, Amaury and
+               Rakotomamonjy, Alain},
+  title     = {Joint distribution optimal transportation for domain adaptation},
+  booktitle = {NeurIPS},
+  year      = {2017},
+  eprint    = {1705.08848},
+  archivePrefix = {arXiv}
+}
+
+@article{li2018adabn,
+  author  = {Li, Yanghao and Wang, Naiyan and Shi, Jianping and Hou, Xiaodi
+             and Liu, Jiaying},
+  title   = {Adaptive batch normalization for practical domain adaptation},
+  journal = {Pattern Recognition},
+  volume  = {80},
+  pages   = {109--117},
+  year    = {2018},
+  eprint  = {1603.04779},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{lakshminarayanan2017simple,
+  author    = {Lakshminarayanan, Balaji and Pritzel, Alexander and
+               Blundell, Charles},
+  title     = {Simple and scalable predictive uncertainty estimation using
+               deep ensembles},
+  booktitle = {NeurIPS},
+  year      = {2017},
+  eprint    = {1612.01474},
+  archivePrefix = {arXiv}
+}
+
+% ---- Architectures and downscaling ----
+
+@inproceedings{lipman2023flow,
+  author    = {Lipman, Yaron and Chen, Ricky T. Q. and Ben-Hamu, Heli and
+               Nickel, Maximilian and Le, Matthew},
+  title     = {Flow matching for generative modeling},
+  booktitle = {ICLR},
+  year      = {2023},
+  eprint    = {2210.02747},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{fotiadis2025adaptive,
+  author    = {Fotiadis, Spyros and others},
+  title     = {Adaptive flow matching for resolving small-scale physics in
+               super-resolution},
+  booktitle = {ICML},
+  year      = {2025},
+  eprint    = {2410.19814},
+  archivePrefix = {arXiv}
+}
+
+@misc{mardani2024corrdiff,
+  author  = {Mardani, Morteza and others},
+  title   = {Generative residual diffusion modeling for km-scale atmospheric
+             downscaling},
+  year    = {2024},
+  eprint  = {2309.15214},
+  archivePrefix = {arXiv}
+}
+
+% ---------------------------------------------------------------------
+%  Entries added after the conversion.
+% ---------------------------------------------------------------------
+
+% RainShift: the inline bibliography recorded the 2025 arXiv preprint. The
+% journal version is now out; both identifiers are kept.
+@article{harder2025rainshift,
+  author  = {Harder, Paula and Schmidt, Luca and Pelletier, Francis and
+             Ludwig, Nicole and Chantry, Matthew and Lessig, Christian and
+             Hernandez-Garcia, Alex and Rolnick, David},
+  title   = {Benchmarking the geographic generalization of deep learning
+             models for precipitation downscaling},
+  journal = {Scientific Reports},
+  volume  = {16},
+  number  = {1},
+  pages   = {3733},
+  year    = {2026},
+  eprint  = {2507.04930},
+  archivePrefix = {arXiv}
+}
+
+% DeepJDOT: the minibatch deep formulation of JDOT that the joint_ot
+% implementation follows. Venue and year only -- the arXiv identifier was
+% not verified and is deliberately omitted rather than reconstructed.
+@inproceedings{damodaran2018deepjdot,
+  author    = {Damodaran, Bharath Bhushan and Kellenberger, Benjamin and
+               Flamary, R{\'e}mi and Tuia, Devis and Courty, Nicolas},
+  title     = {{DeepJDOT}: Deep joint distribution optimal transport for
+               unsupervised domain adaptation},
+  booktitle = {ECCV},
+  year      = {2018}
+}
+% ---- merged from report/refs.bib (2026-11-09) ----
+@article{qian2026,
+  author  = {Qian, {TODO} and others},
+  title   = {Evaluating Cross-region Generalization for Wavelet-Diffusion Precipitation Downscaling},
+  journal = {arXiv preprint arXiv:2609.28749},
+  year    = {2026},
+  doi     = {10.48550/arXiv.2609.28749},
+  note    = {TODO verify: author list missing; title and identifiers from the old-account memory export}
+}
+
+@article{glawion2025,
+  author  = {Glawion, {TODO} and others},
+  title   = {Global spatio-temporal {ERA5} precipitation downscaling to km and sub-hourly scale using generative {AI}},
+  journal = {npj Climate and Atmospheric Science},
+  volume  = {8},
+  pages   = {219},
+  year    = {2025},
+  doi     = {10.1038/s41612-025-01103-y},
+  note    = {TODO verify: author list missing; title and identifiers from the old-account memory export}
+}
+
+@inproceedings{zhao2019invariant,
+  author    = {Zhao, Han and Tachet des Combes, Remi and Zhang, Kun and Gordon, Geoffrey},
+  title     = {On Learning Invariant Representations for Domain Adaptation},
+  booktitle = {Proceedings of the 36th International Conference on Machine Learning (ICML)},
+  pages     = {7523--7532},
+  year      = {2019}
+}
+
+@inproceedings{johansson2019support,
+  author    = {Johansson, Fredrik D. and Sontag, David and Ranganath, Rajesh},
+  title     = {Support and Invertibility in Domain-Invariant Representations},
+  booktitle = {Proceedings of the 22nd International Conference on Artificial Intelligence and Statistics (AISTATS)},
+  pages     = {527--536},
+  year      = {2019}
+}
+
+@article{gneiting2007scoring,
+  author  = {Gneiting, Tilmann and Raftery, Adrian E.},
+  title   = {Strictly Proper Scoring Rules, Prediction, and Estimation},
+  journal = {Journal of the American Statistical Association},
+  volume  = {102},
+  number  = {477},
+  pages   = {359--378},
+  year    = {2007}
+}
+
+@article{ferro2014fair,
+  author  = {Ferro, Christopher A. T.},
+  title   = {Fair scores for ensemble forecasts},
+  journal = {Quarterly Journal of the Royal Meteorological Society},
+  volume  = {140},
+  number  = {683},
+  pages   = {1917--1923},
+  year    = {2014}
+}
+
+@article{hersbach2020era5,
+  author  = {Hersbach, Hans and Bell, Bill and Berrisford, Paul and others},
+  title   = {The {ERA5} global reanalysis},
+  journal = {Quarterly Journal of the Royal Meteorological Society},
+  volume  = {146},
+  number  = {730},
+  pages   = {1999--2049},
+  year    = {2020}
+}
+
+@misc{huffman2023imerg,
+  author = {Huffman, George J. and {TODO}},
+  title  = {{TODO}: {IMERG} V07 algorithm theoretical basis document},
+  year   = {2023},
+  note   = {TODO verify: full reference missing}
+}
+
