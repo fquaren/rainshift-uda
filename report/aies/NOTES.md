@@ -54,10 +54,20 @@ From overview §6. Do not reuse them:
 AMS lists "Lessons Learned" as an AIES submission type: short papers on insights into how well
 AI methods work for a whole class of Earth-system applications
 (https://www.ametsoc.org/ams/publications/author-information/choosing-a-journal-and-submission-type/).
-The AMS site refuses automated fetches from the cluster, so the length, abstract and
-significance-statement limits are **not verified**. Check them in a browser. The draft
-already has the AMS components (significance statement, data availability, acknowledgments,
-appendices). Moving to the AMS LaTeX class is left for submission.
+**Template (2026-11-09):** AMS LaTeX Package 6.2 (`ametsocV6.2.cls`, `ametsocV6.bst`,
+supplied by the user). It is the same package for every AMS journal: there is no journal
+option and no keywords command. From the template:
+- abstract at most 250 words, in `\abstract{}` before `\begin{document}`;
+- significance statement at most 120 words, `\sigstatement`;
+- `\acknowledgments` and `\availstatement`, after a `\clearpage`;
+- appendices with `\appendix[A]` + `\appendixtitle{}`, numbered from `\subsection`;
+- table captions above the tabular, AMS rules `\topline`/`\midline`/`\botline` (no booktabs),
+  no colour or shading in tables; cite only with `\citet`/`\citep`;
+- submit in the default 1.5-spaced format; `[twocol]` is for our own reading only.
+
+The total length limit for Lessons Learned is still unverified.
+
+The arxiv.sty version is in `_trash/` (`main_arxiv_2026-11-09.tex`, `arxiv.sty`).
 
 An example of the type in review: arXiv:2607.18416 (hard conservation correctors in
 autoregressive emulators). Worth reading for length and tone.

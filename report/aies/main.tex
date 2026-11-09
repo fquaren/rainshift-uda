@@ -1,47 +1,44 @@
-% =====================================================================
-%  Lessons-learned restructure, 2026-11-09.
-%  Target: AMS Artificial Intelligence for the Earth Systems (AIES),
-%  "Lessons Learned" type: short papers on insights into how well AI
-%  methods work for a whole class of Earth-system applications.
-%
-%  Still on the arxiv.sty template so it compiles in the existing Overleaf
-%  project. At submission, move to the AMS LaTeX template (ametsoc class,
-%  AIES option); the AMS components it needs are already here as sections:
-%  significance statement, data availability, acknowledgments, appendices.
-%  Check current AIES limits (abstract, significance statement, length)
-%  on the AMS author pages before submitting: they were not verifiable
-%  from the cluster.
-%
-%  Conventions:
-%    \todo{}  = text or number still to write / measure (red)
-%    \ev{}    = evidence pointer: where the number comes from (blue,
-%               delete before submission). Paths are relative to
-%               rainshift-uda/ or results_rainshift_uda/.
-%  No result numbers are carried over from the previous draft: most were
-%  withdrawn (see NOTES.md "Graveyard"). Fill from the sources in \ev{}.
-% =====================================================================
+%% AMS LaTeX Package Version 6.2 (ametsocV6.2.cls, ametsocV6.bst).
+%% Target: Artificial Intelligence for the Earth Systems (AIES), submission
+%% type "Lessons Learned": short papers on insights into how well AI methods
+%% work for a whole class of Earth-system applications.
+%%
+%% Ported from the arxiv.sty skeleton (kept in _trash/main_arxiv_2026-11-09.tex)
+%% on 2026-11-09. The class has no journal option and no keywords command;
+%% keywords are entered in the submission system.
+%%
+%% Conventions:
+%%   \todo{}  text or number still to write or measure (red)
+%%   \ev{}    where the number comes from (blue). Paths are relative to
+%%            rainshift-uda/ or results_rainshift_uda/. Delete before
+%%            submission: \renewcommand{\ev}[1]{} below hides them all.
+%% No result numbers are carried over from the old project description:
+%% most were withdrawn (NOTES.md, "Graveyard").
+%%
+%% Keywords (for the submission system): domain adaptation; precipitation
+%% downscaling; super-resolution; distribution shift; evaluation.
 
-\documentclass{article}
-\usepackage{arxiv}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% PREAMBLE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{hyperref}
-\usepackage{url}
-\usepackage{booktabs}
+% 1.5-spaced peer-review format (the only format AMS accepts for submission)
+\documentclass{ametsocV6.2}
+% Two-column journal layout, for our own reading only:
+% \documentclass[twocol]{ametsocV6.2}
+
+% The class already loads graphicx, amsmath/amssymb, natbib, url, xcolor.
+% Tables use the class rules \topline, \midline, \botline (no booktabs).
 \usepackage{tabularx}
-\usepackage{amsfonts,amsmath,amssymb}
-\usepackage{nicefrac}
-\usepackage{microtype}
-\usepackage{graphicx}
-\usepackage{xcolor}
-\usepackage{natbib}
 
 \newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
 \newcommand{\ev}[1]{\textcolor{blue}{[Evidence: #1]}}
+% \renewcommand{\ev}[1]{}   % uncomment to hide evidence pointers
 \newcommand{\lamhat}{\hat{\lambda}}
 
-\title{What unlabelled target data cannot fix: lessons from domain
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\title{What unlabelled target data cannot fix: lessons from domain\\
 adaptation for cross-region precipitation downscaling}
 % Alternative titles:
 %  - Lessons learned from unsupervised domain adaptation for precipitation
@@ -49,66 +46,57 @@ adaptation for cross-region precipitation downscaling}
 %  - Before adapting, measure: lessons from domain adaptation for
 %    precipitation downscaling
 
-\author{
-    Filippo Quarenghi \\
-    Faculty of Geosciences and Environment (FGSE)\\
-    Expertise Center for Climate Extremes (ECCE)\\
-    University of Lausanne \\
-    Lausanne, Switzerland \\
-    \texttt{filippo.quarenghi@unil.ch} \\
-        \And
-    Tom Beucler \\
-    Faculty of Geosciences and Environment (FGSE)\\
-    Expertise Center for Climate Extremes (ECCE)\\
-    University of Lausanne\\
-    Lausanne, Switzerland\\
-}
+\authors{Filippo Quarenghi\aff{a}\correspondingauthor{Filippo Quarenghi, filippo.quarenghi@unil.ch}
+and Tom Beucler\aff{a}}
 
-\date{}
+\affiliation{\aff{a}{Faculty of Geosciences and Environment and Expertise Center for
+Climate Extremes, University of Lausanne, Lausanne, Switzerland}}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ABSTRACT (no more than 250 words; no citations)
+% Shape: problem -> what we did -> the lessons -> the takeaway.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\abstract{Neural downscaling of precipitation is trained where
+high-resolution observations exist and applied where they do not.
+Unsupervised domain adaptation (UDA) promises to close the resulting
+transfer gap with unlabelled predictors from the target region. We report
+what we learned testing that promise on \todo{N} UDA methods, a
+deterministic U-Net and a flow-matching generative model, on three
+RainShift regions (ERA5 to IMERG) and on a perfect-model COSMO-CLM
+setting. \todo{One sentence per lesson, five sentences, written last.}
+The common thread is that UDA can only help when the
+precipitation-given-atmosphere relation is shared between regions, and
+that this, together with what labelled data could achieve, can and should
+be measured before any adaptation is trained.}
 
 \begin{document}
+
+%% Necessary!
 \maketitle
 
-% =====================================================================
-\begin{abstract}
-% AMS abstract: one paragraph, no citations. Check the word limit.
-% Shape: problem -> what we did -> the lessons -> the one-line takeaway.
-Neural downscaling of precipitation is trained where high-resolution
-observations exist and applied where they do not. Unsupervised domain
-adaptation (UDA) promises to close the resulting transfer gap with
-unlabelled predictors from the target region. We report what we learned
-testing that promise on \todo{N} UDA methods, a deterministic U-Net and a
-flow-matching generative model, on three RainShift regions (ERA5 to
-IMERG) and on a perfect-model COSMO-CLM setting. \todo{One sentence per
-lesson, five sentences, written last.} The common thread is that UDA can
-only help when the precipitation-given-atmosphere relation is shared
-between regions, and that this, together with what labelled data could
-achieve, can and should be measured before any adaptation is trained.
-\end{abstract}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SIGNIFICANCE STATEMENT (no more than 120 words, plain language)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-\keywords{domain adaptation \and precipitation downscaling \and
-super-resolution \and distribution shift \and evaluation \and
-lessons learned}
+\sigstatement{Machine-learning models that sharpen coarse rainfall
+fields are trained where dense observations exist, mostly in Europe and
+North America, but are needed most where observations are sparse. A
+family of techniques claims to adapt such models to a new region using
+only its weather data, without its rainfall observations. We find that
+these techniques rarely help, and we explain when they cannot: if the
+same weather produces different rainfall in the two regions, no amount of
+unlabelled weather data reveals the difference. We give practitioners
+checks to run before investing in adaptation, and list the evaluation and
+implementation pitfalls that made failing methods look successful in our
+own experiments.}
 
-% =====================================================================
-\section*{Significance Statement}
-% AMS requirement: plain language, for a non-specialist. Check limit
-% (about 120 words).
-Machine-learning models that sharpen coarse rainfall fields are trained
-where dense observations exist, mostly in Europe and North America, but
-are needed most where observations are sparse. A family of techniques
-claims to adapt such models to a new region using only its weather data,
-without its rainfall observations. We find that these techniques rarely
-help, and we explain when they cannot: if the same weather produces
-different rainfall in the two regions, no amount of unlabelled weather
-data reveals the difference. We give practitioners checks to run before
-investing in adaptation, and list the evaluation and implementation
-pitfalls that made failing methods look successful in our own
-experiments.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% MAIN BODY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-% =====================================================================
 \section{Introduction}\label{sec:intro}
-% Target: ~1 page. Three paragraphs + the lesson list.
+% Target: ~1 page. Four paragraphs and the lesson list.
 
 % P1 -- The deployment problem.
 High-resolution precipitation observations are dense over Europe, North
@@ -138,39 +126,39 @@ Reports on cross-region transfer in downscaling disagree. We argue that
 they sort by one property of the experimental design: whether the
 conditional is shared by construction. Perfect-model and same-product
 designs, in which the coarse input is derived from the high-resolution
-target, share it, and transfer works
-\citep{qian2026}. \todo{cite Singh et al. 2026 GMD; CORDEX-ML-Bench
-arXiv:2606.29172; our EGU26-19396 abstract.} Reanalysis-to-observation
-designs such as RainShift do not share it by construction, and transfer
-fails \citep{harder2025rainshift}. We test both kinds of design with the
-same models and methods.
+target, share it, and transfer works \citep{qian2026}. \todo{cite Singh
+et al. 2026 GMD; CORDEX-ML-Bench arXiv:2606.29172; our EGU26-19396
+abstract.} Reanalysis-to-observation designs such as RainShift do not
+share it by construction, and transfer fails
+\citep{harder2025rainshift}. We test both kinds of design with the same
+models and methods.
 
 % P4 -- What this paper is, and the lessons.
 This is a lessons-learned paper, not a method paper. We trained \todo{N}
 models across \todo{N} transfer directions, two architectures and
 \todo{N} UDA methods, and audited our own pipeline when results looked
-too good. The lessons, each developed in Section~\ref{sec:lessons} and
-summarised as a checklist in Table~\ref{tab:checklist}, are:
+too good. The lessons, developed in section~\ref{sec:lessons} and
+collected as a checklist in Table~\ref{tab:checklist}, are:
 \begin{enumerate}
   \item Measure whether the conditional shifts before choosing to adapt,
         and calibrate that measurement against a null that keeps the
-        data's dependence structure (Section~\ref{sec:L1}).
+        data's dependence structure (section~\ref{sec:L1}).
   \item Bound the problem with labels first: a jointly trained oracle and
         a few-shot curve say what any adaptation could gain, and at what
-        price in labels (Section~\ref{sec:L2}).
+        price in labels (section~\ref{sec:L2}).
   \item Check that the adaptation term acts as intended; inert losses,
         mixed normalisation statistics and sign errors are silent
-        (Section~\ref{sec:L3}).
+        (section~\ref{sec:L3}).
   \item Evaluation choices can manufacture recovery: report trivial
         references, physical-unit diagnostics and seed spread beside every
-        transformed-space score (Section~\ref{sec:L4}).
+        transformed-space score (section~\ref{sec:L4}).
   \item A probabilistic objective does not change the diagnosis, but it
-        changes what the score rewards (Section~\ref{sec:L5}).
+        changes what the score rewards (section~\ref{sec:L5}).
 \end{enumerate}
 
-% =====================================================================
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{Setting}\label{sec:setting}
-% Target: ~1.5 pages. Only what the lessons need; details to Appendix A.
+% Target: ~1.5 pages. Only what the lessons need; details to appendix A.
 
 \subsection{Two transfer problems}\label{sec:data}
 
@@ -185,11 +173,12 @@ sizes, time resolution and periods, split sizes; wind level.}
 
 \paragraph{COSMO-CLM: a perfect model.} \todo{COSMO-CLM 2.2\,km
 (Cui et al. 2024); coarse inputs by 10$\times$ block mean of the
-high-resolution fields, stated plainly; smaller European regions (e.g.\
-southern Scandinavia, Iberia).} One model, one product and no observation
-network: the conditional can still move between regions through the
-physics, but none of RainShift's product confounds remain.
-\ev{PLAN\_COSMO.md Part B, C0--C8. Not run yet.}
+high-resolution fields, stated plainly; five European regions (southern
+Scandinavia, central Spain, Alps, British Isles, Poland).} One model, one
+product and no observation network: the conditional can still move
+between regions through the physics, but none of RainShift's product
+confounds remain. \ev{PLAN\_COSMO.md Part B, C0--C8. C1 built 2026-11-09;
+C2 onward not run.}
 
 \paragraph{Normalisation.} Every dataset, target included, is
 standardised with the \emph{source} statistics. Normalising the target
@@ -209,30 +198,29 @@ selection rule; why width 32.}
 where they act and the assumption under which they can help.
 
 \begin{table}[t]
-\centering\small
+\caption{Methods, where they act, and the assumption under which they can
+reduce target risk. CORAL and multi-scale MMD were dropped after audit
+(appendix B).}\label{tab:methods}
+\begin{center}
 \begin{tabularx}{\linewidth}{llX}
-\toprule
+\topline
 Acts on & Method & Can help if \\
-\midrule
-Inputs   & FDA \citep{yang2020fda}; quantile mapping (RainShift baseline)
-         & $P(Y\mid X)$ shared (covariate shift) \\
-Features & DANN \citep{ganin2016domain}; MMD \citep{gretton2012kernel,long2015learning}
-         & a representation exists in which $P(Y\mid\phi(X))$ is shared \\
-Joint    & JDOT \citep{courty2017jdot,damodaran2018deepjdot}
-         & the target conditional is close to a transported source one \\
-Outputs  & spectral (PSD) matching
-         & spatial structure is shared \\
+\midline
+Inputs    & FDA \citep{yang2020fda}; quantile mapping (RainShift baseline)
+          & $P(Y\mid X)$ shared (covariate shift) \\
+Features  & DANN \citep{ganin2016domain}; MMD \citep{gretton2012kernel,long2015learning}
+          & a representation exists in which $P(Y\mid\phi(X))$ is shared \\
+Joint     & JDOT \citep{courty2017jdot,damodaran2018deepjdot}
+          & the target conditional is close to a transported source one \\
+Outputs   & spectral (PSD) matching
+          & spatial structure is shared \\
 Test time & AdaBN \citep{li2018adabn}
-         & shift is captured by first and second moments of activations \\
-\midrule
-Labels (reference) & oracle (joint training); few-shot fine-tuning
-         & --- \\
-\bottomrule
+          & the shift is captured by first and second moments of activations \\
+\midline
+Labels (reference) & oracle (joint training); few-shot fine-tuning & --- \\
+\botline
 \end{tabularx}
-\caption{Methods, where they act, and the assumption under which they
-can reduce target risk. CORAL and multi-scale MMD were dropped after
-audit (Appendix~\ref{app:audit}).}
-\label{tab:methods}
+\end{center}
 \end{table}
 
 \subsection{Protocol and decomposition}\label{sec:protocol}
@@ -259,16 +247,16 @@ fixed), and the two hardware/software stacks.}
 \paragraph{Metrics.} The headline score is the squared error of
 $\log(P+0.1\,\mathrm{mm\,h^{-1}})$ for the U-Net and the CRPS in the same
 space for AFM. Every such score is reported beside the mm-space bias, the
-wet-pixel fraction and the field maximum (Lesson~4).
+wet-pixel fraction and the field maximum (lesson~4).
 \ev{D1, 2026-10-29; floor literature in overview \S3}
 
-% =====================================================================
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{Lessons}\label{sec:lessons}
 % Each lesson: (i) the lesson in one sentence, (ii) what happened to us,
 % (iii) the evidence (one table or figure at most), (iv) the
 % recommendation, generalised beyond this task. Target: ~1 page each.
 
-% ---------------------------------------------------------------------
+%---------------------------------------------------------------------
 \subsection{Lesson 1: Measure the conditional shift before adapting}
 \label{sec:L1}
 
@@ -286,42 +274,41 @@ conditional and support effects cannot be separated. A model-based 9-D
 test had no power for lack of overlap.}
 \ev{P1, P1b: unet/conditional\_shift\_binned\_p1b.json; P2:
 unet/conditional\_shift\_model\_p2/; overview \S2 claim 1, \S5.4}
-\todo{COSMO C2: same test across the COSMO region pairs.}
+\todo{COSMO C2: the same test across the COSMO region pairs.}
 
 \paragraph{Recommendation.} \todo{Use a conditional test with a
 dependence-preserving null and positive controls; report common support
-next to it; treat "undetermined" as an answer.}
+next to it; treat ``undetermined'' as an answer.}
 
 % Figure 1 candidate: matched-input statistic against its null, RainShift
 % pairs and COSMO pairs side by side.
 
-% ---------------------------------------------------------------------
-\subsection{Lesson 2: Bound the problem with labels first}
-\label{sec:L2}
+%---------------------------------------------------------------------
+\subsection{Lesson 2: Bound the problem with labels first}\label{sec:L2}
 
-\paragraph{Lesson.} The oracle of Eq.~\eqref{eq:decomp} and a few-shot
+\paragraph{Lesson.} The oracle of Eq.~(\ref{eq:decomp}) and a few-shot
 curve are cheap compared with a method sweep, and together they say how
 much any adaptation could gain and how many target labels would buy the
 same gain.
 
 \paragraph{What happened.} \todo{Oracle: $\lamhat$ small into the tropics,
 22--39\,\% of the gap into western Europe for the U-Net, mostly gone for
-AFM. Few-shot: 2,000 labelled target samples reach the oracle in every
+AFM. Few-shot: 2000 labelled target samples reach the oracle in every
 direction. So the gap is reducible in principle and cheaply closed with
 labels, yet not identifiable without them.}
 \ev{P14 table: results/seed<S>/field\_mean\_check\_qm/; oracle trees
-unet\_seed<S>\_oracle/, afm\_seed42\_oracle/; P16 results/seed<S>/unet\_fewshot/;
-overview \S5.1, \S5.6}
+unet\_seed<S>\_oracle/, afm\_seed42\_oracle/; P16:
+results/seed<S>/unet\_fewshot/; overview \S5.1, \S5.6}
 \todo{COSMO C4--C5.}
 
 \paragraph{Recommendation.} \todo{Before a UDA study, run the oracle and
 a few-shot curve; if a few hundred labels close the gap, the practical
 question is label acquisition, not adaptation.}
 
-% Figure 2 candidate: per direction, bar of gap split into budget and
+% Figure 2 candidate: per direction, the gap split into budget and
 % lambda-hat, with the few-shot points overlaid.
 
-% ---------------------------------------------------------------------
+%---------------------------------------------------------------------
 \subsection{Lesson 3: Check that the adaptation term does what it says}
 \label{sec:L3}
 
@@ -330,40 +317,39 @@ through a side channel, or have the wrong sign, and the training curve
 looks normal in each case.
 
 \paragraph{What happened.} Four failures, each found only by a targeted
-check:
-\todo{(a) Inert: the DANN adversarial gradient was $\sim 5\times10^{-4}$ of
-the task gradient; the MMD term was $\sim$0.2\,\% of the task loss.
-(b) Pooled away: alignment of global-average-pooled bottleneck features
-did nothing; spatially resolved alignment traded source for target risk.
-(c) Side channel: every method with a target forward pass mixes target
-statistics into BatchNorm running estimates; replaying that traffic on an
-untouched model reproduces the source degradation, and re-estimating on
-source restores it. AdaBN, which does this on purpose, harmed most
-directions. (d) Sign error: our FDA implementation flipped the target
-mean.}
+check. \todo{(a) Inert: the DANN adversarial gradient was
+$\sim 5\times10^{-4}$ of the task gradient; the MMD term was
+$\sim$0.2\,\% of the task loss. (b) Pooled away: alignment of
+global-average-pooled bottleneck features did nothing; spatially resolved
+alignment traded source for target risk. (c) Side channel: every method
+with a target forward pass mixes target statistics into the BatchNorm
+running estimates. Replaying that traffic alone on an untouched model
+reproduces the source degradation in all five pairs tested, and
+re-estimating on source removes it, so the weights are barely changed.
+AdaBN, which does this on purpose, harmed most directions. (d) Sign
+error: our FDA implementation flipped the target mean.}
 \ev{audit\_2026-10-29.md A1, A2; GAP ablation results/gap\_ablation/summary/
-(read at 1e-5 floor only, A9); AFM BN check afm\_bn\_check\_seed42/;
-overview \S5.2, \S5.3, \S9.1--9.2; PLAN\_COSMO A1}
+(read at the 1e-5 floor only, A9); AFM BN check afm\_bn\_check\_seed42/
+(PLAN\_COSMO A1, 2026-11-09); overview \S5.2, \S5.3, \S9.1--9.2}
 
 \paragraph{Recommendation.} \todo{Log the ratio of adaptation to task
 gradient; evaluate source validation with eval-mode statistics; run a
-target-forward-only control with the alignment weight at zero; unit-test
-input transforms on a known shift.}
+target-forward-only control at zero alignment weight; unit-test input
+transforms on a known shift.}
 
-% ---------------------------------------------------------------------
-\subsection{Lesson 4: Evaluation can manufacture recovery}
-\label{sec:L4}
+%---------------------------------------------------------------------
+\subsection{Lesson 4: Evaluation can manufacture recovery}\label{sec:L4}
 
 \paragraph{Lesson.} Without target labels for model selection, and with
 skewed, zero-inflated targets, the evaluation choices decide more of the
 reported recovery than the method does.
 
 \paragraph{What happened.} \todo{(a) The log floor: at $10^{-5}$ the
-into-Europe "gains" were the model leaving the all-zero predictor, which
+into-Europe ``gains'' were the model leaving the all-zero predictor, which
 both source-only models into Europe essentially are. (b) Physical units:
-a DANN model with pixels of $10^{6}$\,mm\,h$^{-1}$ scored well in the log
+a DANN model with pixels of $10^{6}$\,mm\,h$^{-1}$ scored well in log
 space. (c) References: climatology beats source-only into Europe, so
-"better than source-only" is a weak bar. (d) Units across sources:
+``better than source-only'' is a weak bar. (d) Units across sources:
 source-normalised errors are not comparable across rows. (e) Seeds: the
 method ranking changes with the seed in every direction.}
 \ev{P3, P14, D1; DANN gr0.5 seed 42; afm\_ensemble\_check summary.csv;
@@ -374,10 +360,10 @@ input-derived (upsampled ERA5 tp) references; a physical-unit column
 beside each transformed score; at least three seeds and a rank
 concordance; selection rules that do not use target labels.}
 
-% Table candidate: the "evaluation traps" table, trap / how it showed /
-% check that catches it.
+% Table candidate: "evaluation traps": trap / how it showed / the check
+% that catches it.
 
-% ---------------------------------------------------------------------
+%---------------------------------------------------------------------
 \subsection{Lesson 5: A probabilistic objective does not change the
 diagnosis}\label{sec:L5}
 
@@ -389,17 +375,18 @@ collapsed baseline.
 \paragraph{What happened.} \todo{AFM gaps have the U-Net's shape; tropical
 sources into Europe collapse the ensemble; FDA into Europe is the only
 cell in the project with a partial gain that survives mm space and an
-information-free dressed reference, in two seeds; the input-conditioned
-reference is pending. The oracle into Europe is close to in-domain for
-AFM, unlike the U-Net.}
+information-free dressed reference, in two seeds. The input-conditioned
+ERA5-tp reference decides whether it stays. The oracle into Europe is
+close to in-domain for AFM, unlike the U-Net.}
 \ev{afm\_seed42/, afm\_seed43/, afm\_seed42\_oracle/;
-results/seed42/afm\_ensemble\_check/; overview \S5.6, \S9.3}
+results/seed42/afm\_ensemble\_check/europe\_west\{,\_tpref\}/ (job 20357462);
+overview \S5.6, \S9.3}
 
 \paragraph{Recommendation.} \todo{Score generative models against a
 dressed source-only ensemble and an input-conditioned reference; read
 spread--skill before crediting a CRPS gain.}
 
-% =====================================================================
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{Discussion}\label{sec:discussion}
 
 \paragraph{When should UDA be expected to help in downscaling?}
@@ -412,65 +399,86 @@ generalisation \citep{glawion2025}.}
 that would have saved us most of the compute spent on this study.
 
 \begin{table}[t]
-\centering\small
+\caption{Checks before trusting a domain-adaptation result for
+downscaling.}\label{tab:checklist}
+\begin{center}
 \begin{tabularx}{\linewidth}{lX}
-\toprule
-Before training & Test $P(Y\mid X)$ across regions against a
+\topline
+Before training   & Test $P(Y\mid X)$ across regions against a
 dependence-preserving null; report common support. (L1) \\
-                & Train the oracle and a few-shot curve. (L2) \\
-During training & Log adaptation-to-task gradient ratio; eval-mode source
-validation; target-forward control at zero alignment weight. (L3) \\
-Evaluation      & Trivial references (zero, climatology, upsampled
+                  & Train the oracle and a few-shot curve. (L2) \\
+During training   & Log the adaptation-to-task gradient ratio; eval-mode
+source validation; target-forward control at zero alignment weight. (L3) \\
+Evaluation        & Trivial references (zero, climatology, upsampled
 input); physical-unit bias, wet fraction and maximum; $\geq 3$ seeds and
 rank concordance. (L4) \\
 Generative models & Dressed and input-conditioned references;
 spread--skill. (L5) \\
-\bottomrule
+\botline
 \end{tabularx}
-\caption{Checks before trusting a domain-adaptation result for
-downscaling.}
-\label{tab:checklist}
+\end{center}
 \end{table}
 
-\paragraph{Limitations.} \todo{Three regions and \todo{N} COSMO regions;
-seeds vary initialisation only; two hardware/software stacks split along
-the method comparison; U-Net learning rate untuned (conservative for
-Lesson~5); two binned inputs in Lesson~1; every U-Net is too dry,
-in-domain included.} \ev{overview \S7; CLAUDE.md traps}
+\paragraph{Limitations.} \todo{Three RainShift regions and five COSMO
+regions; seeds vary initialisation only; two hardware/software stacks
+split along the method comparison; U-Net learning rate untuned
+(conservative for lesson~5); two binned inputs in lesson~1; every U-Net
+is too dry, in-domain included.} \ev{overview \S7; CLAUDE.md traps}
 
-% =====================================================================
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{Conclusions}\label{sec:conclusions}
+
 \todo{One paragraph: the thesis, the five lessons in one sentence each,
 and what a practitioner with a data-sparse target should do instead.}
 
-% =====================================================================
-\section*{Acknowledgments}
-\todo{Funding (SNSF?), UNIL Curnagl HPC, RainShift authors for the data,
-OODiagnostics collaborators.}
+\clearpage
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ACKNOWLEDGMENTS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\acknowledgments
+\todo{Funding with grant numbers; UNIL Curnagl HPC; the RainShift authors
+for the data; the COSMO-CLM simulation authors; OODiagnostics
+collaborators.}
 
-\section*{Data Availability Statement}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% DATA AND SOFTWARE AVAILABILITY STATEMENT
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\availstatement
 \todo{RainShift data source and licence; COSMO-CLM data access (Cui et
-al. 2024); code repository and commit; trained weights if released.}
+al. 2024), and whether the derived 10$\times$ stores can be shared; code
+repository and commit; trained weights if released.}
 
-% =====================================================================
-\appendix
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIXES (AMS: \appendix[X], \appendixtitle, then \subsection)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-\section{Implementation details}\label{app:details}
-\todo{Architectures, hyper-parameters, validation split (strided, purge
-gap), compute.}
+\appendix[A]
+\appendixtitle{Implementation details}
+\subsection*{Models, training and splits}
+\todo{Architectures, hyperparameters, validation split (strided, purge
+gap), compute and the two software stacks.}
 
-\section{Audit log and dropped methods}\label{app:audit}
+\appendix[B]
+\appendixtitle{Audit log and dropped methods}
+\subsection*{What was found and what it changed}
 \todo{Each bug or inert configuration found, how it was found, and what
 it changed: FDA sign, DANN gradient ratio, AdaBN scoring the unadapted
 checkpoint, CORAL and multi-scale MMD, BatchNorm mixing. This appendix is
-the evidence base for Lesson~3.}
+the evidence base for lesson~3.}
 \ev{report/audit\_2026-10-29.md}
 
-\section{Per-direction results}\label{app:tables}
+\appendix[C]
+\appendixtitle{Per-direction results}
+\subsection*{Full tables}
 \todo{Full transfer matrices, oracle and method tables at the 0.1\,mm
 floor with mm columns, both architectures, all seeds.}
 
-\bibliographystyle{unsrtnat}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REFERENCES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\clearpage
+
+\bibliographystyle{ametsocV6}
 \bibliography{references}
 
 \end{document}
