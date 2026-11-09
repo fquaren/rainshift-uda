@@ -1,0 +1,1017 @@
+% =====================================================================
+%  Project description: UDA for precipitation super-resolution
+%  Template: arxiv preprint style
+%  https://www.overleaf.com/latex/templates/style-and-template-for-
+%  preprints-arxiv-bio-arxiv/pkzcrhzcdxmc
+% =====================================================================
+
+\documentclass{article}
+
+\usepackage{arxiv}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{natbib}
+
+\newtheorem{assumption}{Assumption}
+\newtheorem{proposition}{Proposition}
+
+\title{Diagnosing Failure Modes of Unsupervised Domain Adaptation in Precipitation Super-Resolution}
+
+\author{
+    Filippo Quarenghi \\
+    Faculty of Geosciences and Environment (FGSE)\\
+    Experise Center for Climate Extremes (ECCE)\\
+    University of Lausanne \\
+    Lausanne, Switzerland \\
+    \texttt{filippo.quarenghi@unil.ch} \\
+        \And
+    Tom Beucler \\
+    Faculty of Geosciences and Environment (FGSE)\\
+    Experise Center for Climate Extremes (ECCE)\\
+    University of Lausanne\\
+    Lausanne, Switzerland\\
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Deep-learning models for precipitation super-resolution lose substantial
+skill when deployed in geographic regions different from those used for
+training, a problem the recent RainShift benchmark
+formalises~\citep{harder2025rainshift}. We present a diagnostic framework
+for evaluating unsupervised domain adaptation (UDA) in this setting,
+grounded in two complementary theoretical bounds for the target risk:
+the optimal-transport bound of \citet{redko2017theoretical} and the
+$\mathcal{H}\Delta\mathcal{H}$-distance bound of \citet{bendavid2010theory}.
+The framework decomposes the transfer gap into an addressable
+covariate-shift component and an irreducible conditional-shift component,
+estimates both pre-training, via multi-source consistency on supported
+inputs and joint-marginal alignment residuals, and post-hoc, via oracle
+joint training, and proposes a novel regime-decomposed irreducible risk
+$\lambda_k$ that localises conditional shift to specific physical
+regimes of input space. Across the full 3$\times$3 matrix the oracle recovers
+the target's own in-domain risk to within $0.02$ standardised MSE on
+every pair, so the class-restricted irreducible risk is negligible: one
+network fits both conditionals at once. The transfer gap is therefore
+reducible in principle yet not identifiable from unlabelled target
+data, and two direct diagnostics we introduce localise the obstruction
+to a difference in $P(y\mid x)$ rather than to model capacity. No
+tested covariate-alignment method closes it. We propose a 3$\times$3 transfer matrix experiment across three
+RainShift regions, applied to a deterministic UNet and a probabilistic
+Adaptive Flow Matching model, with eight UDA methods organised by where
+they act in the pipeline. The methodology generalises beyond climate
+downscaling to any transfer-learning setting where the relative
+dominance of covariate versus conditional shift must be diagnosed before
+committing compute to adaptation.
+\end{abstract}
+
+\keywords{unsupervised domain adaptation \and precipitation
+super-resolution \and optimal transport \and climate downscaling \and
+distribution shift diagnostics \and irreducible risk}
+
+% =====================================================================
+\section{Introduction}
+% =====================================================================
+
+High-resolution precipitation observations are concentrated in the
+Global North, while many of the regions where high-resolution
+precipitation forecasts have the largest socioeconomic value lie in
+data-sparse parts of the Global South. Deep-learning super-resolution
+models trained on rich-data regions and deployed in sparse-data regions
+are the natural route to bridging this gap, but the recent RainShift
+benchmark shows that zero-shot geographic transfer degrades skill by up
+to 30\% depending on architecture and region pair~\citep{harder2025rainshift}.
+The RainShift paper evaluates several in-distribution baselines together
+with quantile mapping on total precipitation as a simple alignment
+technique; it does not benchmark unsupervised domain adaptation
+systematically, nor diagnose which aspects of the transfer gap any
+adaptation method could possibly close.
+
+This project addresses the diagnostic gap. We construct an evaluation
+framework that, given a source--target domain pair and a labelled source
+sample, predicts before any UDA training whether covariate-shift
+adaptation can help, quantifies the irreducible conditional-shift
+component via oracle joint training, identifies in which physical
+regimes of input space the conditional shift lives, and stratifies
+post-hoc method comparison accordingly. We then benchmark a
+representative set of UDA methods on a $3\times 3$ matrix of RainShift
+transfers using two architectures: a deterministic dual-encoder UNet
+and a probabilistic Adaptive Flow Matching
+model~\citep{fotiadis2025adaptive}.
+
+The framework is built on three observations. First, the theoretical
+literature on UDA decomposes target risk into a source-risk term, a
+divergence between distributions, and an irreducible joint-risk term;
+the third encodes conditional shift and cannot be addressed by methods
+that operate on marginals
+alone~\citep{bendavid2010theory,redko2017theoretical}. Second,
+identifiability of conditional shift from unlabelled target data is
+impossible without additional assumptions; different UDA method classes
+operationalise different assumptions, and the choice of method should
+be guided by which assumption is consistent with the data. Third, the
+irreducible component has structure that the scalar quantity $\lambda$
+does not capture: it can be decomposed across physically meaningful
+regions of input space, providing actionable guidance about where the
+transfer is irreducibly hard.
+
+% =====================================================================
+\section{Theoretical foundations}\label{sec:theory}
+% =====================================================================
+
+\subsection{Setup and notation}
+
+Let $\mathcal{X}\subset\mathbb{R}^{C\times H\times W}$ be the input
+space of $C=9$ atmospheric channels at coarse resolution, including
+convective available potential energy, total column water vapour,
+surface pressure, two wind components, and the inputs documented in
+RainShift. Let $\mathcal{Y}\subset\mathbb{R}^{1\times H'\times W'}$ be
+the high-resolution precipitation field. A domain is a joint
+distribution $\mathcal{D}$ over $\mathcal{X}\times\mathcal{Y}$ with
+input marginal $\mu$ and conditional $P(y\mid x)$.
+
+We are given a source domain $\mathcal{D}_S$ and a target domain
+$\mathcal{D}_T$. Training data consist of a labelled source sample
+$\mathcal{S}=\{(x_i^S,y_i^S)\}_{i=1}^{n_S}$ and an unlabelled target
+sample $\mathcal{T}=\{x_j^T\}_{j=1}^{n_T}$. For a hypothesis class
+$\mathcal{H}$ and the squared loss in standardised log-precipitation
+space, the target risk
+$\mathcal{R}_T(f)=\mathbb{E}_{(x,y)\sim\mathcal{D}_T}\!\left[\|f(x)-y\|^2\right]$
+is the quantity to minimise under the constraint that target labels
+are not observed during training. The source risk $\mathcal{R}_S(f)$
+is defined analogously.
+
+\subsection{The optimal-transport bound and its absorbed constants}
+\label{sec:redko}
+
+For a deterministic regressor and a Lipschitz loss-composition,
+\citet{redko2017theoretical} establish
+\begin{equation}
+\mathcal{R}_T(f) \le \mathcal{R}_S(f) + K \cdot W_1(\hat\mu_S, \hat\mu_T)
++ \lambda + \mathrm{Conf}(n_S, n_T, \delta),
+\label{eq:redko_full}
+\end{equation}
+holding with probability $1-\delta$, where four quantities deserve
+explicit comment because they are routinely absorbed in applied work:
+
+\paragraph{The Lipschitz constant $K$.} $K$ is the Lipschitz constant
+of $x \mapsto \ell(f(x), y(x))$ over the support of $\mu_S \cup \mu_T$.
+For deep neural networks, $K$ admits the spectral upper bound
+$K \le L_\ell \cdot \prod_\ell \|W_\ell\|_2$, where $L_\ell$ is the
+Lipschitz constant of the loss with respect to its first argument and
+$\|W_\ell\|_2$ are layer-wise spectral norms~\citep{bartlett2017spectrally}.
+For realistically-trained models this product is typically $10^2$ to
+$10^4$ and is dominated by a handful of layers. The bound
+\eqref{eq:redko_full} is therefore not numerically tight; we absorb $K$
+into the analysis and treat the bound as a decomposition device rather
+than a numerical inequality.
+
+\paragraph{The finite-sample Wasserstein gap.} The empirical
+$W_1(\hat\mu_S, \hat\mu_T)$ converges to the population $W_1$ at rate
+$\mathcal{O}(n^{-1/d})$ in input dimension $d$~\citep{fournier2015rate}.
+For a 9-dimensional input space at sample sizes of order $10^3$, the
+estimator carries non-negligible bias; we mitigate by computing $W_1$
+per channel on standardised distributions and aggregating, accepting
+that this loses inter-channel coupling but improves the convergence
+rate to $\mathcal{O}(n^{-1/2})$ per channel.
+
+\paragraph{The confidence term.} $\mathrm{Conf}(n_S, n_T, \delta)$ scales
+as $\mathcal{O}(\sqrt{d_\mathcal{H}/n_S + d_\mathcal{H}/n_T})$ where
+$d_\mathcal{H}$ is a hypothesis-class complexity measure. For
+deep models this term is worst-case vacuous; tighter bounds via
+PAC-Bayes \citep{germain2013pac,dziugaite2017computing} replace
+$d_\mathcal{H}$ with an effective dimension that depends on the
+realised solution and can be empirically non-vacuous. We do not pursue
+PAC-Bayes bounds in this work; we note them as future direction
+(Section~\ref{sec:future}).
+
+\paragraph{The irreducible joint risk $\lambda$.} Defined as
+\begin{equation}
+\lambda = \min_{h \in \mathcal{H}}
+\big[\mathcal{R}_S(h) + \mathcal{R}_T(h)\big],
+\label{eq:lambda_def}
+\end{equation}
+the irreducible joint risk depends on $\mathcal{H}$, not on the data
+alone. The class-restricted definition is what oracle joint training
+estimates and is the operationally meaningful quantity. The
+Bayes-optimal version (over all measurable functions) is strictly
+smaller but not empirically estimable; we are explicit throughout that
+all $\lambda$-related statements are class-restricted.
+
+For ranking and decomposition purposes we use the simplified form
+\begin{equation}
+\mathcal{R}_T(f) \lesssim \mathcal{R}_S(f) + W_1(\hat\mu_S, \hat\mu_T) + \lambda,
+\label{eq:redko_simplified}
+\end{equation}
+in which $K$, the finite-sample correction, and the confidence term
+are absorbed into the ``$\lesssim$'' notation. This is the form that
+motivates the diagnostic decomposition into addressable and irreducible
+components.
+
+\subsection{The $\mathcal{H}\Delta\mathcal{H}$-distance bound and its
+empirical estimator}
+\label{sec:bendavid}
+
+An alternative line of theoretical analysis~\citep{bendavid2010theory}
+bounds the target risk in terms of the $\mathcal{H}\Delta\mathcal{H}$-%
+distance:
+\begin{equation}
+\mathcal{R}_T(f) \le \mathcal{R}_S(f)
++ \tfrac{1}{2} d_{\mathcal{H}\Delta\mathcal{H}}(\mu_S, \mu_T) + \lambda,
+\label{eq:bendavid}
+\end{equation}
+where
+\begin{equation}
+d_{\mathcal{H}\Delta\mathcal{H}}(\mu_S, \mu_T)
+= 2 \sup_{h, h' \in \mathcal{H}} \Big|
+\mathbb{P}_{x\sim\mu_S}[h(x) \neq h'(x)]
+- \mathbb{P}_{x\sim\mu_T}[h(x) \neq h'(x)]
+\Big|
+\end{equation}
+quantifies the maximum disagreement between two hypotheses in
+$\mathcal{H}$ across the two domains. Two features distinguish this
+bound from the optimal-transport bound \eqref{eq:redko_simplified}.
+
+First, the shift quantity is defined \emph{relative to the hypothesis
+class} used for adaptation, not relative to arbitrary measurable
+functions. This is tighter and more honest about what the model can
+actually exploit.
+
+Second, $d_{\mathcal{H}\Delta\mathcal{H}}$ admits a natural empirical
+estimator: the accuracy of a domain discriminator trained to separate
+source and target features. This is the theoretical anchor for
+adversarial domain adaptation~\citep{ganin2016domain}.
+
+The framework exploits a related observation. When multiple
+source-trained models $\{h_1, \ldots, h_K\}$ are evaluated on a target
+input, their disagreement provides a sampled estimator of
+$d_{\mathcal{H}\Delta\mathcal{H}}$ where the two hypotheses are drawn
+from different source training distributions rather than from random
+initialisations~\citep{mansour2008domain,lakshminarayanan2017simple}.
+High inter-source disagreement on supported target inputs implies that
+the multi-source ensemble cannot be made domain-invariant by any
+single $\phi$ in the class, which provides theoretical justification
+for the multi-source consistency diagnostic introduced in
+Section~\ref{sec:framework}.
+
+\subsection{Identifiability and the assumptions that close it}
+\label{sec:identifiability}
+
+Pure conditional shift is not identifiable from unlabelled target data
+alone: if $\mu_T = \mu_S$ exactly, no statistic of $\{x_j^T\}$ can
+distinguish $P_T(y\mid x)$ from $P_S(y\mid x)$. Practical UDA methods
+close this identifiability gap through additional assumptions; we
+enumerate four families and map each UDA method class to the
+assumption it operationalises.
+
+\begin{assumption}[Covariate-shift]
+\label{ass:cov}
+$P_S(y\mid x) = P_T(y\mid x)$, with shift confined to input marginals.
+Under this assumption, importance-weighted empirical risk minimisation
+is consistent~\citep{sugiyama2007direct}. Methods that operationalise
+it: input-level alignment (QM, FDA, joint Sinkhorn-OT), which align
+$\mu_S$ to $\mu_T$ on the assumption that the conditional is invariant.
+\end{assumption}
+
+\begin{assumption}[Target-shift]
+\label{ass:tgt}
+$P_S(x\mid y) = P_T(x\mid y)$, with shift in the label marginal
+$P(y)$~\citep{lipton2018detecting}. For continuous regression with
+structured spatial outputs (precipitation fields), this assumption
+does not map cleanly to a single shift quantity and is not
+operationalised by any method in our taxonomy.
+\end{assumption}
+
+\begin{assumption}[Shared invariant representation]
+\label{ass:inv}
+There exists a feature map $\phi$ such that $P_S(y\mid \phi(x))
+= P_T(y\mid \phi(x))$. This is an assumption on the hypothesis class
+admitting a domain-invariant representation. Methods that operationalise
+it: feature-level alignment (CORAL, MMD, multi-scale MMD, DANN), which
+search for $\phi$ within the model that satisfies the assumption.
+\end{assumption}
+
+\begin{assumption}[Causal sufficiency]
+\label{ass:causal}
+The observed inputs $x$ form a complete set of causes of $y$, so the
+conditional $P(y\mid x)$ is mechanistically stable across
+domains~\citep{scholkopf2012causal}. For precipitation, this holds at
+the level of fundamental physics (Clausius-Clapeyron, convective
+thermodynamics) but is violated by unresolved sub-grid processes that
+act as omitted causal variables. The irreducible risk $\lambda$ in
+\eqref{eq:lambda_def} is, in this sense, a measure of the causal
+incompleteness of the input set. Methods that operationalise this
+assumption, combined with physical priors: physical-consistency
+losses, spectral PSD matching.
+\end{assumption}
+
+The framework's pre-training diagnostics in
+Section~\ref{sec:framework} are designed to test which of
+Assumptions~\ref{ass:cov}, \ref{ass:inv}, and \ref{ass:causal} is
+consistent with the data, rather than committing to one a priori:
+the joint-marginal alignment residual tests whether covariate-shift
+adaptation has headroom (Assumption~\ref{ass:cov}); multi-source
+consistency tests whether a shared invariant representation is
+plausible (Assumption~\ref{ass:inv}); the physical-prior check tests
+causal completeness (Assumption~\ref{ass:causal}).
+
+\subsection{Regime-decomposed irreducible risk}
+\label{sec:lambda_k}
+
+A scalar $\lambda$ tells us whether transfer is irreducibly hard, but
+not \emph{where} the hardness lives. For precipitation downscaling, the
+practitioner-relevant question is which physical regimes of input space
+contribute most to $\lambda$ and which are addressable. We propose a
+regime-decomposed irreducible risk.
+
+Let $\{\mathcal{X}_1, \ldots, \mathcal{X}_K\}$ be a partition of input
+space into physical regimes computable from inputs alone (for example,
+by joint convective-available-potential-energy and column-water bins,
+or by Köppen climate classes). Define the regime-conditional
+irreducible risk
+\begin{equation}
+\lambda_k = \min_{h \in \mathcal{H}}
+\Big[
+\mathbb{E}_S\!\left[\ell(h(X), Y) \mid X \in \mathcal{X}_k\right]
++ \mathbb{E}_T\!\left[\ell(h(X), Y) \mid X \in \mathcal{X}_k\right]
+\Big].
+\label{eq:lambda_k}
+\end{equation}
+
+\begin{proposition}[Regime decomposition]
+\label{prop:decomp}
+Under the assumption that the optimal hypothesis is regime-stable
+(the inner minimiser of \eqref{eq:lambda_k} is independent of $k$),
+\begin{equation}
+\lambda = \sum_{k=1}^K \mu_T(\mathcal{X}_k)\, \lambda_k.
+\end{equation}
+Without the regime-stability assumption, the right-hand side is an
+upper bound:
+\begin{equation}
+\lambda \le \sum_{k=1}^K \mu_T(\mathcal{X}_k)\, \lambda_k.
+\end{equation}
+\end{proposition}
+
+The regime decomposition gives the framework two properties the scalar
+$\lambda$ does not. First, it identifies \emph{where} in input space
+the conditional shift dominates, so practitioners know which physical
+regimes to flag for additional data acquisition or model refinement.
+Second, it provides a falsifiable prediction: if regime $k$ has
+$\lambda_k$ large, no covariate-shift UDA method should improve target
+performance specifically on regime $k$. The physical-regime
+stratification of UDA results in Section~\ref{sec:physical} tests this
+prediction directly.
+
+We estimate $\lambda_k$ empirically by per-regime oracle joint
+training: train the joint model on the union of source and target
+labels, then evaluate on the source and target test sets restricted to
+$\mathcal{X}_k$. This is the natural per-regime version of the scalar
+oracle estimate. To our knowledge, the regime-decomposed irreducible
+risk has not been studied for regression with physically meaningful
+continuous partitions. The closest published direction is the
+subpopulation-shift line in benchmark
+evaluation~\citep{koh2021wilds}, which considers discrete subgroup
+shift for classification but does not address regression or continuous
+physical regimes.
+
+\subsection{Mapping bounds to UDA method classes}
+\label{sec:mapping}
+
+The two bounds (Sections~\ref{sec:redko}, \ref{sec:bendavid}) and the
+four identifiability assumptions (Section~\ref{sec:identifiability})
+induce a mapping from method class to the operative theoretical
+quantity, summarised in Table~\ref{tab:mapping}. The framework's
+diagnostic-to-method pipeline is: pre-training diagnostics identify
+which assumption is consistent with the data, the regime-decomposed
+$\lambda_k$ identifies which input regimes admit adaptation, and the
+method class consistent with the surviving assumption is selected for
+trial.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Method class & Assumption & Operative bound & Diagnostic signal \\
+\midrule
+Input alignment & Ass.~\ref{ass:cov} & Redko (marginal $W_1$)
+& Low joint-marginal alignment residual \\
+Feature alignment & Ass.~\ref{ass:inv} & Ben-David ($\mathcal{H}\Delta\mathcal{H}$)
+& Low multi-source disagreement \\
+Output / physical & Ass.~\ref{ass:causal} & Physical consistency
+& Physical-prior check passes \\
+Joint distribution & None alone & Joint $W_1$
+& All single-assumption diagnostics fail \\
+\bottomrule
+\end{tabular}
+\caption{Mapping from UDA method class to the identifiability assumption
+it operationalises, the theoretical bound that applies, and the
+pre-training diagnostic signal that supports its use.}
+\label{tab:mapping}
+\end{table}
+
+When all single-assumption diagnostics signal failure, only
+joint-distribution methods (JDOT)~\citep{courty2017jdot} or supervised
+target adaptation (few-shot) can close the gap. This is the scenario
+the europe\_west $\to$ melanesia case study currently appears to be in.
+
+% =====================================================================
+\section{Methodology}
+% =====================================================================
+
+\subsection{Experimental setup}
+
+The benchmark consists of a $3\times 3$ transfer matrix over three
+RainShift regions chosen to span a difficulty axis: europe\_west
+(mid-latitude maritime), horn\_of\_africa (tropical semi-arid), and
+melanesia (tropical maritime convective). The matrix yields nine
+evaluation cells comprising three self-evaluations on the diagonal and
+six off-diagonal transfer pairs. The diagonal cells establish in-domain
+baselines; off-diagonal cells allow testing of (a) asymmetry (S$\to$T
+versus T$\to$S), (b) lateral transfer (tropical to tropical), and (c)
+the dependence of UDA effectiveness on a measurable shift severity.
+
+For each of the six transfer pairs we run every UDA method with three
+random seeds. With two architectures and eight methods, the experiment
+totals approximately 250 training runs.
+
+\subsection{Architectures}
+
+The deterministic baseline is a dual-encoder UNet with nine
+atmospheric input channels in the dynamic branch and two static
+channels (topography and land-sea mask) in the static branch. Training
+loss is mean squared error in standardised log-precipitation space.
+
+The probabilistic baseline is the Adaptive Flow Matching (AFM) model
+of~\citet{fotiadis2025adaptive}, which couples an encoder producing a
+deterministic prediction $\mu$ with a flow network parameterising
+optimal-transport probability paths~\citep{lipman2023flow} between a
+perturbed prior and the target distribution. The encoder architecture
+is identical to the deterministic UNet, so feature-level UDA losses
+apply identically across the two models, providing a clean controlled
+comparison between deterministic and probabilistic super-resolution
+under shift. The flow network's adaptive noise scaling $\sigma_z$,
+updated via an exponential moving average of encoder prediction error,
+provides a partial mechanism for conditional-variance adaptation; we
+test the calibration of this mechanism through spread-skill ratios on
+the target.
+
+A two-stage CorrDiff-style decomposition~\citep{mardani2024corrdiff}
+was considered and rejected for this paper: applying UDA losses only
+to the deterministic stage cannot guarantee that the diffusion
+corrector, trained on source-domain residuals, captures the correct
+target-domain conditional variance. AFM's end-to-end training and
+$\sigma_z$ adaptation provide a more principled handle on this
+question.
+
+\subsection{UDA methods, organised by where they act}
+
+We benchmark eight methods grouped by their point of intervention in
+the model pipeline, with each method mapped to its operative
+assumption (Table~\ref{tab:mapping}):
+
+\paragraph{Input-level alignment (Ass.~\ref{ass:cov}).} Quantile
+mapping per channel as in the RainShift baseline, and a joint Sinkhorn
+optimal-transport alignment~\citep{cuturi2013sinkhorn} that respects
+inter-channel correlations. We additionally include Fourier domain
+adaptation~\citep{yang2020fda} as a negative-control baseline, since
+preliminary results indicate that swapping low-frequency Fourier
+amplitudes between atmospheric domains corrupts climatological mean
+state rather than implementing a style/content separation.
+
+\paragraph{Feature-level alignment (Ass.~\ref{ass:inv}).} Deep
+CORAL~\citep{sun2016deep} matches second-order feature statistics;
+multi-scale maximum mean discrepancy~\citep{gretton2012kernel,long2015learning}
+matches kernel embeddings of feature distributions at multiple encoder
+levels with median-heuristic bandwidths; adversarial alignment via
+DANN~\citep{ganin2016domain} uses a gradient-reversal-layer domain
+discriminator and is the most direct empirical estimator of the
+$\mathcal{H}\Delta\mathcal{H}$ shift. For AFM, all feature-level
+methods are applied to the encoder's intermediate features only.
+
+\paragraph{Joint-distribution alignment.} Joint distribution optimal
+transport~\citep{courty2017jdot} aligns both input marginals and
+predicted conditionals simultaneously, dropping the
+single-assumption restriction by working with the joint distribution
+directly.
+
+\paragraph{Test-time alignment.} Adaptive batch
+normalisation~\citep{li2018adabn} replaces batch-normalisation running
+statistics with target-domain statistics at inference.
+
+\paragraph{Output-level alignment (Ass.~\ref{ass:causal}).} A radially
+averaged power spectral density matching loss penalises differences
+between source and target prediction spectra, providing a physically
+motivated alignment of the spatial correlation structure of predicted
+precipitation.
+
+% =====================================================================
+\section{Diagnostic framework}\label{sec:framework}
+% =====================================================================
+
+The framework is composed of three layers that together estimate where
+in the bound \eqref{eq:redko_simplified} the transfer gap lives, both
+before and after UDA training, and which identifiability assumption
+from Section~\ref{sec:identifiability} is consistent with the data.
+
+\subsection{Pre-training diagnostics}
+
+Three surrogate diagnostics, each tied to one identifiability
+assumption, predict the addressable budget without training any UDA
+method:
+
+\textit{Joint-marginal alignment residual} (tests
+Assumption~\ref{ass:cov}). The joint Sinkhorn-OT alignment of source to
+target inputs is fitted and the residual $W_1$ measured. If the
+residual is non-negligible, Assumption~\ref{ass:cov} is violated and
+covariate-shift adaptation has an upper-bounded ceiling. If the
+residual is near zero but the transfer gap persists, the residual gap
+must be attributed to conditional shift.
+
+\textit{Multi-source consistency on supported inputs} (tests
+Assumption~\ref{ass:inv} and provides an empirical estimator of
+$d_{\mathcal{H}\Delta\mathcal{H}}$). Multiple source-trained models, one
+per RainShift training region, are evaluated on each target input.
+Disagreement among models conditional on high coverage of the input
+across sources is interpreted as evidence against the existence of a
+shared invariant representation in $\mathcal{H}$.
+
+\textit{Physical-prior consistency check} (tests
+Assumption~\ref{ass:causal}). Two-variable slices of input space (e.g.
+column water vapour against convective available potential energy) are
+compared across source and target. Disagreement in physically
+meaningful regions of input space, where known precipitation mechanisms
+differ, indicates that the observed inputs do not form a sufficient
+causal set, so the conditional $P(y\mid x)$ is unstable.
+
+\subsection{Oracle-grounded budget estimation}
+
+For each transfer pair, a joint-training model is trained on the union
+of source and target labels and evaluated on each domain. The
+resulting $\widehat{\lambda}=\mathcal{R}_S(h_{\text{joint}}) +
+\mathcal{R}_T(h_{\text{joint}})$ is a class-restricted upper bound on
+$\lambda$, and
+$\mathcal{R}_T(f_S)-\mathcal{R}_T(h_{\text{joint}})$ is the addressable
+budget. The fraction of this budget recovered by each unsupervised UDA
+method is the cleanest single quantity to report per method.
+
+For the regime-decomposed analysis we additionally compute the
+per-regime $\widehat{\lambda}_k$ by evaluating the joint model on the
+test sets stratified by physical regime, producing a vector of
+irreducible risks across input space.
+
+\subsection{Post-hoc analysis with explicit gap decomposition}
+
+For each (source, target, method) triple we report source MSE, target
+MSE, and the source-target gap separately. We use the normalised
+generalisation gap $\mathrm{NGG}(S,T)=(\mathcal{R}_T-\mathcal{R}_S)
+/(W_1+\epsilon)$ for within-architecture rankings, but report it
+alongside source-MSE inflation to expose methods that achieve apparent
+target improvement through regression-to-mean rather than genuine
+adaptation. Preliminary results show this distinction is necessary in
+practice: feature-moment-matching methods can reduce the
+target--source gap without reducing target error in absolute terms.
+
+% =====================================================================
+\section{Transfer gaps and the addressable budget}\label{sec:budget}
+% =====================================================================
+
+We report the full $3\times3$ matrix for the deterministic UNet with
+source-only and oracle joint training. Two conventions matter for
+reading the numbers. First, standardised MSE is computed in the
+\emph{source} domain's normalised space, because that is the space the
+model is trained in; consequently \texttt{mse\_std} is comparable
+\emph{within} a transfer pair but not across pairs with different
+sources. Second, to compare across pairs we convert each target risk
+into the target domain's own normalisation using the ratio of
+log-precipitation standard deviations, which is recoverable because
+each domain appears as a target under two different source
+normalisations. The two independent recoveries agree to within 2\%
+($\sigma_{\text{horn}}/\sigma_{\text{eu}} = 0.729$ vs $0.723$;
+$\sigma_{\text{mel}}/\sigma_{\text{eu}} = 1.256$ vs $1.279$), which is
+itself a consistency check on the evaluation pipeline.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+pair & $\mathcal{R}_T(f_S)$ & $\mathcal{R}_T(h_{\text{joint}})$ &
+in-domain & transfer gap & $\widehat{\lambda}$ \\
+\midrule
+horn $\to$ europe\_west      & $0.958$ & $0.529$ & $0.523$ & $0.435$ & $0.005$ \\
+melanesia $\to$ europe\_west & $0.872$ & $0.542$ & $0.523$ & $0.349$ & $0.019$ \\
+europe\_west $\to$ horn      & $0.815$ & $0.635$ & $0.631$ & $0.184$ & $0.004$ \\
+europe\_west $\to$ melanesia & $0.770$ & $0.621$ & $0.618$ & $0.152$ & $0.002$ \\
+horn $\to$ melanesia         & $0.723$ & $0.641$ & $0.618$ & $0.105$ & $0.023$ \\
+melanesia $\to$ horn         & $0.717$ & $0.633$ & $0.631$ & $0.086$ & $0.002$ \\
+\bottomrule
+\end{tabular}
+\caption{Transfer matrix in standardised MSE, converted to the
+\emph{target} domain's normalisation so that rows are comparable.
+$\mathcal{R}_T(f_S)$ is the source-only model on the target;
+$\mathcal{R}_T(h_{\text{joint}})$ is the oracle trained on both label
+sets; in-domain is the target's own source-only model. The transfer gap
+is $\mathcal{R}_T(f_S)$ minus in-domain, and
+$\widehat{\lambda} = \mathcal{R}_T(h_{\text{joint}})$ minus in-domain is
+the class-restricted irreducible excess.}
+\label{tab:budget}
+\end{table}
+
+\paragraph{The irreducible risk is negligible.}
+On every pair the oracle recovers the target's own in-domain risk to
+within $0.002$--$0.023$ standardised MSE, i.e.\ $\widehat{\lambda}
+\approx 0$. A single UNet trained on both label sets fits both
+conditionals essentially as well as two separately trained models. This
+is the most consequential number in the study and it rules out the
+trivial explanation for adaptation failure: the hypothesis class is not
+the binding constraint, and there is no capacity-driven irreducible
+term to blame.
+
+This sharpens the claim the framework can make. The transfer gap is
+\emph{reducible in principle} --- $\widehat{\lambda}\approx 0$ exhibits
+a hypothesis in $\mathcal{H}$ that solves both domains simultaneously
+--- but it is not \emph{identifiable} from unlabelled target data.
+Labels locate that hypothesis; marginal alignment does not. The failure
+is one of identifiability in the sense of
+Section~\ref{sec:identifiability}, not of expressivity. We regard this
+as a stronger and more precise statement than an appeal to a large
+irreducible $\lambda$, and it is the statement the remaining
+experiments test.
+
+\paragraph{Transfer is strongly asymmetric.}
+Direction matters more than pair identity. Transfer \emph{into}
+europe\_west costs $0.435$ and $0.349$, while transfer into either
+tropical domain costs $0.086$--$0.184$: a four- to fivefold difference.
+The asymmetry is not visible in mean absolute error, which is nearly
+insensitive on the dry midlatitude target (in-domain $0.088$~mm versus
+$0.095$~mm under transfer, against a standardised-MSE gap of $0.435$),
+so we report standardised MSE as the headline metric and treat MAE as a
+secondary summary. All models additionally carry a negative
+precipitation bias ($-0.05$ to $-0.29$~mm), the expected
+under-dispersion signature of an MSE objective in log space.
+
+\paragraph{The diagnostics predict the ordering.}
+The matched-input diagnostic of Section~\ref{sec:conditional} ranks the
+pairs by conditional discrepancy without training any adaptation
+method, and that ranking matches the measured transfer difficulty.
+horn-of-africa $\leftrightarrow$ melanesia carries the smallest excess
+over the within-domain null ($14.5\times$) and the two \emph{smallest}
+transfer gaps ($0.086$, $0.105$); europe\_west $\leftrightarrow$ horn
+carries the largest excess ($86.9\times$) and gaps of $0.184$ and
+$0.435$ depending on direction. This is the claim the framework is
+built to support: a quantity computable from unlabelled inputs and
+observed targets alone ranks transfer difficulty correctly.
+
+We state the corollary plainly: on this domain triple no pair offers
+covariate alignment both a theoretical licence and substantial
+headroom. The pair with the mildest conditional shift also has the
+smallest gap to close, and the pairs with the largest gaps are those
+where the conditional differs most or where the input supports barely
+overlap. This is a property of this domain triple rather than a general
+result, and it is why the benchmark's informative comparison is between
+the joint-distribution method and the marginal-alignment family, not
+among the latter.
+
+\paragraph{Revised budget estimate.}
+For europe\_west $\to$ melanesia the oracle now recovers $34\%$ of the
+transfer gap, against the $72\%$ reported in an earlier draft from
+pre-revision baselines. The change is attributable to corrected
+baselines rather than to the oracle: the earlier source-only models
+were trained with a contiguous-tail validation split, no early
+stopping, and a normalisation defect that inflated the europe\_west
+risk.
+
+% =====================================================================
+\section{Direct diagnosis of conditional shift}\label{sec:conditional}
+% =====================================================================
+
+The preliminary transfer results establish that adaptation fails, but
+inference from method failure to shift type is indirect. We therefore
+implement two direct diagnostics that measure whether $P(y\mid x)$
+differs across domains without reference to any UDA method: a
+model-free comparison of the conditional at matched inputs, and a
+model-based comparison of the learnt mappings in the full input space.
+The two are complementary---the first makes no modelling assumptions
+but conditions only on a low-dimensional input projection, the second
+uses the full input space but inherits the trained models' fitting
+error. Agreement between them is the evidence.
+
+\subsection{Matched-input conditional discrepancy}
+\label{sec:matched_input}
+
+To test Assumption~\ref{ass:causal} directly we compare the target
+precipitation distribution between domains \emph{at matched inputs},
+using observed samples only: no model, no training, no predictions.
+Input space is partitioned into bins on the two dominant
+precipitation-controlling variables, convective available potential
+energy and total column water vapour, using shared quantile edges from
+the pooled data so both domains occupy the same bins. Within each bin
+$b$ --- that is, conditioning on approximately the same atmospheric
+state --- we compute the exact empirical $W_1$ between the two domains'
+log-precipitation distributions, and report the occupancy-weighted mean
+$\overline{W}_1^{\text{cond}} = \sum_b w_b\, W_1(P_A(y\mid b),
+P_B(y\mid b))$.
+
+Under pure covariate shift (Assumption~\ref{ass:cov}) matched inputs
+imply matched precipitation, so $\overline{W}_1^{\text{cond}}$ falls to
+the level it would take were the two samples drawn from the same
+distribution; under conditional shift the same atmospheric state
+produces different precipitation and it remains well above that level.
+We report $\overline{W}_1^{\text{cond}}$ itself as the statistic rather
+than the ratio $r=\overline{W}_1^{\text{cond}}/W_1^{\text{uncond}}$
+used in an earlier version of this diagnostic. That ratio has an
+unstable denominator: two domains may have near-identical precipitation
+marginals because a difference in $P(x)$ offsets a difference in
+$P(y\mid x)$, in which case $W_1^{\text{uncond}}\to 0$ inflates $r$ at
+perfectly adequate support. A large ratio is therefore not on its own
+evidence of conditional shift, and we report it as context only.
+
+\paragraph{Calibration requires a null.}
+The empirical $W_1$ between two finite samples is positive even when
+the distributions are identical, and positive again from the residual
+covariate variation left inside each bin, since binning matches inputs
+only to the bin width and only on the binned coordinates. Both inflate
+$\overline{W}_1^{\text{cond}}$ by an unknown amount, so its raw value is
+not interpretable on its own. We therefore split a single domain at
+random into two halves and run the identical pipeline between them.
+This yields the value the statistic takes under a true null, carrying
+the same finite-sample noise, the same spatial correlation between
+pixels, and the same within-bin residual covariate shift. We report
+$\overline{W}_1^{\text{cond}}$ relative to that floor, and treat a
+value not clearly exceeding it as no evidence of conditional shift. On
+synthetic data with known ground truth the floor separates the regimes
+cleanly: identical domains return $0.7\times$ the floor, constructed
+covariate shift $2.1\times$, and constructed conditional shift
+$137\times$.
+
+\paragraph{Common support gates the comparison.}
+The comparison is valid only where both domains populate the same bins.
+We therefore report the common-support fraction, the share of each
+domain's mass falling in bins both domains populate above a minimum
+count. Low common support indicates the domains occupy disjoint input
+regions, in which case $\overline{W}_1^{\text{cond}}$ is computed on an
+unrepresentative overlap and is not interpretable as a conditional-shift
+measurement.
+
+Table~\ref{tab:matched_input} reports the diagnostic on the three
+RainShift domains. \emph{All three pairs exhibit conditional shift},
+differing in magnitude rather than in kind. The europe\_west to
+horn-of-africa pair, at essentially complete common support, shows
+$\overline{W}_1^{\text{cond}}$ at $87\times$ the null floor: these two
+domains have the most similar input distributions of the three (the
+smallest $W_1^{\text{uncond}}$) yet the largest conditional
+discrepancy, direct evidence that the atmosphere-to-precipitation
+mapping itself differs between the temperate and semi-arid-tropical
+regimes. The horn-of-africa to melanesia pair, also at full support,
+shows a smaller but unambiguous $14.5\times$ excess. Conditioning on
+inputs does reduce its discrepancy substantially, from
+$W_1^{\text{uncond}}=3.17$ to $\overline{W}_1^{\text{cond}}=0.40$;
+what remains is nonetheless an order of magnitude above noise. We note
+that under the ratio statistic this pair would have been classified as
+predominantly covariate ($r=0.12$), because its unconditional
+discrepancy is large, and that classification does not survive
+calibration against the null. The europe\_west to melanesia pair is
+flagged as low support ($44\%$): these domains occupy largely disjoint
+regions of the (cape, tcw) plane, so no conditional statement can be
+made --- a distinct barrier to covariate-shift adaptation, since input
+marginals that do not overlap cannot be aligned.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+pair & $\overline{W}_1^{\text{cond}}$ & null floor & excess &
+$W_1^{\text{uncond}}$ & support \\
+\midrule
+europe\_west $\leftrightarrow$ horn & $2.14$ & $0.025$ & $86.9\times$ &
+$1.19$ & $99.6\%$ \\
+horn $\leftrightarrow$ melanesia & $0.40$ & $0.027$ & $14.5\times$ &
+$3.17$ & $100\%$ \\
+europe\_west $\leftrightarrow$ melanesia & $2.15$ & $0.029$ &
+($74.5\times$) & $1.98$ & $43.8\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Matched-input conditional discrepancy at $5\times5$ bins over
+$600$ frames per domain. The statistic is
+$\overline{W}_1^{\text{cond}}$; the null floor is the same statistic
+computed between two random halves of a single domain, and excess is
+their ratio. The europe\_west to melanesia row is support-limited and
+its excess is not interpretable. Verdicts are unchanged under an
+$8\times8$, $300$-frame configuration (excesses $37.6\times$,
+$7.8\times$), and $\overline{W}_1^{\text{cond}}$ itself is stable
+across the two ($2.141$ vs $2.140$; $0.497$ vs $0.395$): the coarser
+binning changes the null, not the signal.}
+\label{tab:matched_input}
+\end{table}
+
+\paragraph{Two limitations bound what this can claim.}
+Because the binning conditions on a two-dimensional projection, the
+errors are one-sided: a low value is conservative, since conditioning
+on further variables can only reduce apparent conditional shift,
+whereas a high value is an upper bound, since a difference in an
+unbinned variable appears as different precipitation at nominally
+matched inputs. Separately, the test is pixel-wise --- inputs and
+target are coarsened to a common grid and pixels treated as
+exchangeable --- so it measures $P(y_{\text{pixel}}\mid
+\text{cape}_{\text{pixel}}, \text{tcw}_{\text{pixel}})$, whereas the
+downscaling model learns $P(Y_{\text{field}}\mid X_{\text{field}})$, in
+which precipitation at a pixel depends on the surrounding atmospheric
+state. Two domains could share the field-wise conditional and still
+differ pixel-wise. Pixels within a frame are also strongly correlated,
+so the effective sample size per bin is well below the raw count; the
+null baseline absorbs this, since it inherits the same correlation
+structure. Both limitations motivate the model-based diagnostic below,
+which operates on fields in the full nine-channel input space.
+
+\subsection{Model-based conditional discrepancy}
+\label{sec:model_based}
+
+The source-only model $f_A$ trained on domain $A$ is an estimate of
+$P_A(y\mid x)$. We use the set of trained source-only models to compare
+conditionals in the full nine-channel input space, free of binning. For
+an ordered pair $(A,B)$ we report two quantities. The transfer penalty
+$\mathcal{R}_T(f_A\!\to\!B) - \mathcal{R}_B(f_B\!\to\!B)$ measures how
+much worse $A$'s mapping is on $B$ than $B$'s own model, isolating the
+mapping difference from $B$'s irreducible error. The model disagreement
+is the standardised mean squared difference between $f_A$ and $f_B$
+predictions on identical $B$ inputs; because both models receive the
+same inputs, any disagreement is a pure difference in the learnt
+mapping, with no ground-truth or target-side extrapolation term. A
+concentration statistic, the ratio of the ninetieth percentile to the
+median of the per-sample disagreement, distinguishes a diffuse mapping
+difference (genuine conditional shift) from disagreement concentrated
+in a tail of inputs (a support edge, i.e. extrapolation rather than
+conditional shift).
+
+Across all six ordered pairs the model disagreement is substantial
+($0.22$ to $0.85$ in standardised units) and, by the concentration
+statistic ($1.9$ to $3.6$, far below the tail threshold), diffuse
+rather than support-concentrated. No pair is a support-edge artefact,
+including europe\_west to melanesia, whose diffuse disagreement in the
+full input space complements the low-support finding of the
+matched-input test: even where the domains fail to overlap in the
+(cape, tcw) projection, the extrapolated mappings differ throughout.
+The disagreement magnitudes order by climatological distance---the two
+tropical domains are most similar (melanesia to horn-of-africa,
+$0.22$), europe\_west is most distinct from both ($0.65$ to
+$0.85$)---mirroring the matched-input result, including the
+europe\_west to horn-of-africa conditional reading, which is thereby
+confirmed in the full input space rather than being an artefact of the
+two-variable projection.
+
+We caution that the transfer penalty is corrupted where the source-only
+baseline is itself weak: for europe\_west as target the own-model risk
+is anomalously high, producing negative penalties in which a foreign
+model appears to outperform the home model. We therefore report the
+model disagreement, which is robust to a weak baseline as it does not
+reference the baseline's own risk, as the primary conditional-shift
+statistic, and defer penalty-based quantities to the revised baselines.
+
+\subsection{Synthesis}
+
+Both diagnostics, applied independently and by different mechanisms,
+agree that the RainShift domains differ in $P(y\mid x)$ and that the
+magnitude of that difference orders by climatological distance. This is
+a direct measurement of conditional shift rather than an inference from
+adaptation failure, and it identifies which of the identifiability
+assumptions holds per pair: Assumption~\ref{ass:cov} (covariate shift)
+is tenable for \emph{no} pair in this triple. Calibrating the
+matched-input statistic against a within-domain null removes the one
+apparent exception --- horn-of-africa to melanesia appears
+predominantly covariate under a ratio statistic, but retains a
+$14.5\times$ excess over the noise floor once that floor is measured ---
+while the europe\_west to melanesia pair is barred by non-overlapping
+support rather than by a measured conditional difference. All three
+therefore lie beyond the reach of marginal-alignment methods, regardless
+of weighting. The result explains the observed adaptation failure at its
+cause. It also withdraws a differential prediction that the
+uncalibrated diagnostic appeared to license: with no pair classified as
+covariate-dominated, we do not expect covariate alignment to recover
+budget anywhere, and the joint-distribution method is the only candidate
+in the taxonomy that remains consistent with the measured shift.
+
+% =====================================================================
+\section{Physical evaluation}\label{sec:physical}
+% =====================================================================
+
+Aggregate metrics describe how much a UDA method helps but not why or
+where. RainShift's nine input channels capture distinct physical
+processes (thermodynamic instability via CAPE, moisture availability
+via total column water vapour, cloud mass via TCLW, synoptic dynamics
+via wind components and surface pressure), which makes it possible to
+stratify target performance by physical regime.
+
+We bin target inputs into regimes defined by two- or three-variable
+cuts of input space (e.g. CAPE--humidity, surface-pressure-anomaly--%
+wind-magnitude) and report per-regime target error for the source-only
+baseline and each UDA method. The expected output is a regime-by-method
+matrix that reveals which physical processes each method helps or
+hinders. Methods that improve performance uniformly across regimes are
+acting as generic regularisers; methods that improve specifically in
+convective regimes are addressing the tropical-precipitation shift
+between europe\_west and melanesia; methods that worsen performance
+in synoptic regimes are damaging the parts of the transfer that
+source-only training already handled correctly.
+
+The regime stratification is paired with the per-regime oracle
+$\widehat{\lambda}_k$ estimate from Section~\ref{sec:lambda_k},
+yielding a falsifiable test of the framework: if regime $k$ has
+$\lambda_k$ large, no covariate-shift UDA method should improve target
+performance specifically on regime $k$. Methods that violate this
+prediction either fail Assumption~\ref{ass:inv} (in which case they
+must be working by an orthogonal mechanism, e.g. regularisation that
+helps in some regimes by accident) or signal that the regime
+partition is itself misaligned with the true conditional shift
+structure.
+
+% =====================================================================
+\section{Expected contributions}
+% =====================================================================
+
+The project will produce four contributions:
+
+\textit{A pre-training diagnostic framework for UDA evaluation},
+combining joint-marginal alignment residuals, multi-source disagreement
+on supported inputs, and physical-prior consistency checks, each
+mapped to a specific identifiability assumption
+(Section~\ref{sec:identifiability}) and validated against the
+post-hoc oracle measurement of $\lambda$. This framework is the
+project's most generalisable methodological contribution; it applies
+to any transfer-learning setting where practitioners must decide
+whether to commit compute to UDA before observing target labels.
+
+\textit{A novel regime-decomposed irreducible risk
+$\lambda_k$} (Section~\ref{sec:lambda_k}) that localises conditional
+shift to specific physical regimes of input space, with a
+corresponding decomposition result (Proposition~\ref{prop:decomp})
+and an empirical estimator via per-regime oracle joint training. To
+our knowledge this is the first treatment of regime-decomposed
+irreducible risk for regression with physically meaningful continuous
+partitions, and constitutes the project's most original theoretical
+contribution.
+
+\textit{A systematic UDA benchmark on RainShift} across input, feature,
+output, and inference-level methods for both deterministic and
+probabilistic super-resolution architectures, evaluated on a
+$3\times 3$ transfer matrix with multi-seed confidence intervals. The
+benchmark explicitly reports source-MSE inflation alongside target
+metrics to expose regression-to-mean artefacts in feature-moment
+methods.
+
+\textit{A physical-regime-stratified evaluation of UDA method success
+and failure}, identifying which atmospheric processes each method
+addresses and which it leaves untouched, with the regime partition
+constructed from RainShift input channels alone and therefore
+applicable in target-label-free deployment.
+
+% =====================================================================
+\section{Future directions}\label{sec:future}
+% =====================================================================
+
+Three theoretical extensions are natural follow-ups beyond the scope
+of the present project.
+
+\emph{PAC-Bayesian domain adaptation bounds.} The bounds in
+Section~\ref{sec:theory} are worst-case over the hypothesis class.
+PAC-Bayes-DA bounds~\citep{germain2013pac} replace the worst-case
+complexity term with one that depends on a posterior over weights,
+which for deep networks can be empirically
+non-vacuous~\citep{dziugaite2017computing}. AFM's flow network
+provides a natural posterior approximation via stochastic predictions,
+which could be exploited to compute non-vacuous bounds on
+$\widehat\lambda$ for the case studies.
+
+\emph{Causal-mechanism transferability.} Assumption~\ref{ass:causal}
+is a strong claim about which inputs constitute a sufficient causal
+set. A more refined treatment would identify, per regime, which
+sub-grid processes are the dominant causal omissions, with the
+regime-decomposed $\lambda_k$ providing the empirical signal. This
+connects naturally to recent work on causal-mechanism-aware
+generalisation~\citep{scholkopf2012causal}.
+
+\emph{Tighter joint-distribution shift estimators.} The Joint-OT
+quantity $W_1(\mathcal{D}_S, \mathcal{D}_T)$ provides a single scalar
+that captures both covariate and conditional shift, but is not
+empirically estimable without target labels. Surrogate estimators of
+the joint shift, perhaps via the regime-decomposed $\lambda_k$ as an
+intermediary, could close this gap.
+
+% =====================================================================
+\bibliographystyle{unsrtnat}
+\bibliography{references}
+
+\end{document}
