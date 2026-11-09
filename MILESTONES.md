@@ -15,7 +15,8 @@ finishing, and do not reopen a frozen item.
 
 RainShift (after this, its numbers are frozen):
 - [x] AFM BatchNorm check read: confirmed in all five pairs (PLAN_COSMO A1, 2026-11-09).
-- [ ] ERA5-tp (bicubic-upsampled input `tp`) reference in `afm_ensemble_check.py`, then the
+- [ ] ERA5-tp (bicubic-upsampled input `tp`) reference in `afm_ensemble_check.py` (submitted
+      2026-11-09, job 20357462 → `results/seed42/afm_ensemble_check/europe_west_tpref/`), then the
       FDA-into-europe_west cell is either stated or dropped (L5).
 - [ ] P8: test metrics of `unet_seed42_a100check/` (limitations sentence).
 - [ ] Regenerate every table at 0.1 mm/h with mm bias / wet fraction / max columns, from
