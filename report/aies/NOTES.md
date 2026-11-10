@@ -12,7 +12,7 @@ missing, `\ev{}` pointing at the source of each number. Numbers come from
 |---|---|---|---|
 | L1 conditional shift first, calibrated null | P1b (2 pairs yes, horn↔mel undetermined), P1 (pixel null withdrawn), P2 (no power) | C2 | COSMO C2; figure |
 | L2 labels first: oracle + few-shot | oracle 3 seeds (UNet), AFM oracle seed 42, P16 | C4–C5 | tables at 0.1 mm; paired-λ̂ seed sd; P4 (stronger oracle into europe) |
-| L3 the adaptation term must act | audit A1 (FDA), A2 (DANN ratio), MMD magnitude, GAP ablation, BN mixing (UNet rule 3, AFM BN check), AdaBN | — | BN-check tasks 2–4; GAP ablation re-score at D1 or scoped sentence (A9) |
+| L3 the adaptation term must act | **main evidence since 2026-11-10: source-BN re-scoring.** Every target-forward method, UNet (3 seeds) and AFM (seed 42), behaves like source-only once BN is re-estimated on source. Source cost 0.213 → 0.003 (UNet), and the target gains vanish with it. Also audit A1 (FDA), A2 (DANN ratio), MMD magnitude, GAP ablation, AdaBN | — | feature probe ((a) never aligned / (b) aligned, inert / (c) BN made GAP invariant); source-BN control on source-only and FDA; dose ladder only if (a) |
 | L4 evaluation manufactures recovery | P3, P14, D1, zero predictor, DANN 10⁶ mm/h, climatology > source-only, seed-unstable ranking | — | trivial references at 0.1 mm; P12 (Kendall's W) |
 | L5 objective does not change diagnosis | AFM phase 1/oracle/phase 2, FDA into europe (2 seeds), ensemble check | — | ERA5-tp reference in `afm_ensemble_check.py` |
 
@@ -74,8 +74,32 @@ autoregressive emulators). Worth reading for length and tone.
 
 ## Open decisions
 
-- Title (three candidates in `main.tex`).
+- Title: decided at the M2 gate (2026-11-09). Constraints: "unsupervised domain adaptation"
+  in the title; "downscaling" over "super-resolution" (AIES audience); no "generative" (one
+  model, one lesson, mostly seed 42: it would promise a generative-model study); American
+  spelling ("unlabeled"). Candidates:
+  1. Unsupervised domain adaptation for precipitation downscaling in data-sparse regions:
+     what unlabeled data can and cannot do
+  2. When does unsupervised domain adaptation help precipitation downscaling across
+     regions? Lessons learned
+  3. Lessons from unsupervised domain adaptation for cross-region precipitation
+     downscaling (working title)
+  4. Shared physics, shared mapping? Lessons from unsupervised domain adaptation for
+     precipitation downscaling (if COSMO contrasts cleanly with RainShift)
+  The current "What unlabelled target data cannot fix ..." commits to the negative before
+  COSMO; drop it unless COSMO also fails.
 - Whether COSMO evidence sits inside L1/L2 (current) or in its own section. If the COSMO gate
   in PLAN_COSMO.md A3 comes out null, it becomes one paragraph in L1.
-- Whether L5 stays a full lesson or becomes a paragraph of L4, if the ERA5-tp reference kills
-  the FDA cell.
+- L5 stays a full lesson (2026-11-10): ERA5 tp scores worse than zero, so it does not kill the
+  FDA cell. State FDA against climatology, not source-only.
+- **Claim 3 / L3 rewrite (2026-11-10).** "Methods trade the source conditional for target risk"
+  is withdrawn: the trade was BN mixing. New wording: the alignment terms did not act, and BN
+  did. Add the theory for why a working alignment would not help either. Under label-marginal
+  shift, invariant features force ε_S + ε_T up (Zhao et al. 2019, the JS lower bound). The
+  intuition: if Z is invariant then Ŷ = g(Z) is invariant, but P(Y) differs (europe 0.097 vs
+  melanesia 0.31 mm/h). Add `zhao2019invariant` there (already in references.bib). The dose
+  ladder, if it runs, is the empirical test.
+- Europe→melanesia with source BN goes into L4: a log-floor recovery of 0.4–1.0 next to
+  10⁵–10⁶ mm/h pixels. The extremes come from extrapolation (tcw +4.4σ) through exp with
+  σ_log = 3.7; RainShift's own ResNet does the same (18,113 mm/h CRPS, Tibetan Plateau).
+- Setup sentence: RainShift clips ERA5 precipitation inputs to IMERG's range; we do not.
