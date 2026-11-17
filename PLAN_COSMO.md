@@ -322,10 +322,21 @@ All figures are `mse_log_e01`, as a mean over seeds 42/43/44, with the seed sd i
   gap. The failing direction is from the two driest sources (true wet fraction 0.095 and 0.051)
   into the two wettest non-Alpine targets (0.113 and 0.135). That is a description from five
   regions, not a test.
-- **Against C2.** Input-shift size alone does not order the gap. `sp` is 4.4–4.75 sd between
-  Spain and Poland or the British Isles, yet British Isles → Spain and Poland → Spain have no
-  gap. Alps–British Isles has the only clear (tp, cape) excess, and that cell's gap is
-  +0.003 to +0.014. The C3 key figure stays descriptive.
+- **Against C2.** This bullet is corrected by the figures (job 20614078, `figures/cosmo_c3/`).
+  - **Sp does not order the gap.** `sp` is 4.4–4.75 sd between Spain and Poland or the British
+    Isles, yet British Isles → Spain and Poland → Spain have no gap.
+  - **The dynamic inputs do.** The input shift over cape, tcw, tclw, tp, u and v, averaged as
+    W1 per source sd, orders the relative excess: Spearman ρ = +0.53. The relabelling p is
+    0.008 (over 120 relabellings), which is the floor: no relabelling beats the true one.
+    The order is not monotone. Alps → British Isles has the largest shift (0.56) and only
+    +31 %. The four large cells sit at 0.28–0.39.
+  - **Conditional excess does not order the gap.** (cape, tcw): ρ = +0.09, p = 0.44.
+    (tp, cape): ρ = +0.21, p = 0.08.
+  - **Wetness contrast.** For log2(mean_T / mean_S), ρ = +0.76, but p = 0.11, because that
+    matrix keeps its rank structure under relabelling.
+  - **Caveats.** Five regions, so this is little power and one test among five, without
+    correction. On COSMO, "the transfer cost does not depend on input shift" is not
+    supported for the dynamic inputs; it holds only for `sp`.
 - **Gate (A3 item 3).** It is not a null. 4 of 20 pairs have a gap far outside seed noise and
   below a non-learned baseline. 6 are small but clear: +0.005 to +0.016, the four into the
   Alps and alps into british_isles and scandinavia. 10 are within noise. C4's
