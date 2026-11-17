@@ -632,7 +632,7 @@ included. Paper use: an L4 example, not a gain. A log-floor recovery of 0.4–1.
 mixing (L3). Missing: the pixel fraction above, say, 100 mm/h per model, without which
 "a few pixels" is unquantified.
 
-**2026-11-10: training-maximum columns (submitted) and the feature probe (prepared, not submitted).**
+**2026-11-10: training-maximum columns and the feature probe (both read 2026-11-11, below).**
 - `compare_fields.py` now also writes, per model, the fraction and count of pixels above its
   source's training maximum (from `train_data_out.zarr`, validation chunks included), the
   fraction above 100 mm/h, and the mean and `mse_log_e01` with predictions clamped at that
@@ -657,6 +657,191 @@ mixing (L3). Missing: the pixel fraction above, say, 100 mm/h per model, without
   - **(c) Nothing to act on.** Source-only's own train_batch MMD is already near the null.
     Per-domain batch BN made the GAP features near-invariant before any loss: a structural
     (b).
+
+**Read 2026-11-11, training-maximum columns** (job 20394524, `results/plots/compare_fields_srcbn_trainmax_seed<S>/europe_west__to__melanesia/`;
+the first submission, 20391536, was OOM-killed in `_train_max` and wrote nothing). Training
+maxima: europe_west 83.4 mm/h, melanesia 152.5 mm/h (file maxima, validation steps
+included, so the fractions below are conservative).
+- Pixels above the source training maximum are rare: 0 to 3.4×10⁻⁴ of pixels for every model,
+  source-only included (6×10⁻⁶ to 1×10⁻⁴; maxima 1,605 / 23,194 / 46,557 mm/h for seeds
+  42/43/44). Oracle and in-domain stay at or near 0 (in-domain seed 43: 39 pixels).
+- Clamping at the training maximum changes `mse_log_e01` by at most 0.005 in every row. The
+  log-floor numbers and rankings stand; the extremes do not drive them.
+- They drive the mm-space mean entirely: joint_ot src BN seed 43 1.93 → 0.17 mm/h clamped;
+  DANN gr0.5 src BN seed 42 0.67 → 0.07. Every clamped mean is below the observed 0.312.
+  Mean mm is unusable without the clamp; report the clamped mean next to the fraction.
+- Extremes come from extrapolation, not adaptation: source-only has them at every seed.
+- Checked twice because it flatters a method: joint_ot src BN seed 43 scores 0.876 vs oracle
+  0.887. Clamped it is still 0.876, but its wet fraction is 0.109 against 0.205 observed,
+  and seeds 42/44 give 1.009 / 0.978 (oracle 0.920 / 0.881). Seed-unstable, an L4 example,
+  not a gain.
+
+**Read 2026-11-11, feature probe** (job 20394525, `results/seed<S>/feature_probe/probe.csv`,
+3 seeds × 6 pairs = 18 cases per row). Means over the 18 cases; MMD is GAP, multi-kernel
+with a per-model median bandwidth, so ratios between models are approximate; the classifier
+is not affected by that.
+
+```
+                      deployed (eval, source BN)        what the loss saw (train-mode batch BN)
+                      MMD    ratio to SO   clf acc      MMD     ratio to SO   clf acc
+source-only (SO)      0.460  1             1.000        0.0135  1             0.908
+mmd                   0.248  0.59 (0.14-1.11) 0.999     0.0014  0.12 (0.05-0.21) 0.813
+joint_ot              0.370  0.92 (0.39-2.68) 1.000     0.0242  2.09          0.988
+dann                  0.464  1.07          1.000        0.0089  0.70          0.894
+dann gr0.5            0.441  1.02          0.997        0.0184  1.68          0.883
+spectral              0.446  0.99          0.999        0.0118  0.95          0.907
+null (src vs src)     ~0.002-0.003                      ~0.000
+```
+Mixed BN (eval as trained) reads like source BN: 0.25-0.48, classifier ≥ 0.979.
+
+Reading against the rule fixed on 2026-11-10:
+- **(a) holds for every method in deployment.** No method brings deployed MMD near the null
+  (every case ≥ 29× it, typically ~100×), and the domain classifier is at 0.98-1.00 for all of them, as for
+  source-only. DANN, DANN gr0.5 and spectral do not differ from source-only even in the
+  space the loss saw; joint_ot increases the distance there.
+- **(b) does not hold as stated, but MMD is the partial case.** MMD did act on its own
+  objective: 0.12× source-only in train-mode batch BN, i.e. near the null. 41 % of that
+  carried into the deployed features (0.59×), and the source-BN predictions still equal
+  source-only's. That is weak evidence for "alignment does not reach the output", not a
+  (b) reading: the deployed features are far from aligned.
+- **(c) partly holds.** Per-domain batch BN alone cuts source-only's GAP MMD by 97 %
+  (0.46 → 0.0135), so every loss acted on a small residual. It is not near the null, and the
+  classifier still separates the domains (0.85-0.96), so it is not a structural (b).
+- **The mechanism.** The loss is computed with per-domain batch statistics; deployment uses
+  fixed running statistics. Alignment achieved in the first space does not transfer to the
+  second, because the first already removed the per-channel mean and scale shift that
+  dominates the second. A larger weight on the current trainer would push on the residual
+  and change nothing in deployment. Any ladder therefore has to run on the BN-fixed trainer
+  (target pass in eval-mode BN, B4.9), where the loss sees the features the model deploys.
+
+Consequence: by the rule, the dose ladder goes to the M2 gate, on the BN-fixed trainer only.
+Proposed arms: DANN (never aligned anywhere) and MMD (aligned in the loss's space; the arm
+that can reach deployed alignment and test whether it moves the prediction, i.e. the Zhao
+bound). For L3: "the alignment terms did not act" becomes "they acted, if at all, in a
+batch-normalised space that deployment never sees".
+
+**2026-11-11: BN-fixed trainer written (B4.9, UNet only), not yet tested or run.**
+`train_unet.py --target_bn eval` (default `train`, so every existing tree keeps its meaning)
+runs each target forward of coral / mmd / mmd_ms / dann / joint_ot / spectral inside
+`_bn_eval`: BatchNorm layers in eval mode, so the target batch is normalised with the
+running statistics and never updates them; gradients flow as before. The source pass keeps
+train-mode BN. Consequences: the alignment loss sees the target features the deployed model
+computes, and `best.pt` holds source-only statistics, so these runs are scored as trained,
+with no `_srcbn` re-estimation. Refused for none / fda / adabn. `run_exp_unet.sh` takes
+`TARGET_BN=eval` and env overrides `LAMBDA_UDA` / `DANN_WEIGHT`, each of which requires an
+`OUTPUT_SUFFIX` side tree. Known asymmetry: source features are normalised by batch
+statistics, target features by running statistics; they differ by batch noise and the
+running-average lag (momentum 0.1), which matters in the first epoch only.
+Test: `test_target_bn.py` (synthetic, in `scripts/run_tests.sh`): after one step, running
+stats are independent of the target batch and equal a source-only forward, the weights do
+depend on it, and train mode (control) fails the first check. Next, before any ladder: one
+default-weight MMD run europe→melanesia, seed 42, `OUTPUT_SUFFIX=_tgtbneval`, read with
+`feature_probe.py` (eval_srcbn = as trained here) for whether deployed alignment moves at all.
+The AFM trainer is not changed.
+
+**Read 2026-11-12, BN-fixed MMD, seed 42, europe→melanesia** (test job 20438249: all tests
+pass, `test_target_bn.py` included; training 20438441, best at epoch 6 on source validation,
+stopped at 11; read 20460852: `results/seed42_tgtbneval/feature_probe/probe.csv`,
+`results/plots/compare_fields_tgtbneval_seed42/europe_west__to__melanesia/`,
+`results/seed42_tgtbneval/unet/none/`). One seed, one pair, default weight (λ 0.1).
+
+- **The term acts in deployment for the first time.** Deployed GAP MMD 0.0073 (null 0.0002),
+  against 0.43 for MMD with source BN, 0.24 as trained, 1.00 for source-only; grid4 0.030
+  against 0.20–0.71; domain classifier 0.88 against 1.00 for every other model. The ratio to
+  the null (~36×) does not separate it from the 2026-11-11 models because the null is tiny;
+  the absolute distance is ~60× below the old MMD run.
+- **Log floor: recovery ≈ 1.0.** Target `mse_log_e01` 0.921 against source-only 1.080 and
+  oracle 0.921 (P16; `compare_fields` gives 0.920), in-domain 0.865. Source 0.310 against
+  0.305 (Δsrc +0.006; MMD src BN 0.311). Selected on source validation, no target labels.
+- **mm space does not follow.** Target MAE 0.343 mm against source-only 0.315 and in-domain
+  0.298 (worse). Bias −0.210 against −0.299 and −0.271: wetter than in-domain. Wet fraction
+  (0.1 mm) 0.077 against in-domain 0.059, oracle 0.043, obs 0.205; p99 1.80 against 0.92 mm/h;
+  max 10,289 mm/h, pixels above the training maximum 4.3×10⁻⁵ against 6.0×10⁻⁶ for
+  source-only (7×). The bulk is wetter, not only the tail. This is the pattern the log floor
+  rewards (P3), so the log-floor recovery is not yet adaptation.
+
+**Pre-registered 2026-11-12, before any replication result exists.** Replication: seeds 43
+and 44 on europe→melanesia (training 20467868 / 20467869, reads 20467871 / 20467872) and
+seed 42 on horn→europe (20467870, read 20467873), all `TARGET_BN=eval`, default weight,
+`unet_seed<S>_tgtbneval/`. Every comparison is paired within a seed against that seed's own
+source-only and oracle, at `mse_log_e01` on the target test split.
+
+References: europe→melanesia source-only 1.080 / 1.095 / 1.031 and oracle 0.921 / 0.888 /
+0.882 (seeds 42/43/44), source-only target MAE 0.315 / 0.379 / 0.358 mm. horn→europe
+source-only 0.4486 (the all-zero predictor, MAE 0.0974 = field mean), oracle 0.352,
+in-domain 0.305.
+
+Criteria, per run:
+- *F (features):* deployed GAP MMD ≤ 0.1× the same seed's source-only, and the domain
+  classifier ≤ 0.95. Without F, the run did not reproduce the mechanism, whatever it scores.
+- *L (log floor):* recovery (source-only − run) / (source-only − oracle) ≥ 0.5.
+- *S (source cost):* source `mse_log_e01` within 0.02 of source-only.
+- *M (mm space):* target MAE ≤ source-only's of the same seed, and the fraction of pixels
+  above the training maximum ≤ 10× source-only's. Into europe_west, where source-only is the
+  zero predictor, M means beating the zero predictor's MAE (0.0974 mm).
+
+Seed 42 europe→melanesia passes F, L and S and fails M.
+
+Readings, decided now:
+1. *Confirmed:* F, L, S and M hold on both europe→melanesia replicates and on horn→europe.
+   Seed 42 already fails M, so this needs seeds 43 and 44 to pass all four. Then claim 3
+   becomes "once the target pass leaves BN alone, a default-weight MMD reaches the oracle",
+   the M2 gate reconsiders a full Article, and the dose ladder is reopened as a method result
+   (with the prior that it is not one, checked twice).
+2. *Log-floor only:* F and L hold in ≥ 2 of 3 europe→melanesia seeds, but M fails in the
+   majority. Then the lesson is "an alignment term that acts buys log-floor score with mm
+   error": L3/L6, not a gain. Claim 3 keeps "BN, not alignment" for the old trainer and adds
+   this sentence for the fixed one. No ladder.
+3. *Not reproduced:* L fails at seeds 43 and 44, or F fails. Then seed 42 is noise or an
+   unreproduced mechanism, claim 3 stands as rewritten on 2026-11-10, and the BN-fixed MMD
+   run is reported as the control that closes it.
+horn→europe is read on its own: an L pass there with an M fail is the P3 near-dry artefact
+and counts against reading 1, not for it. Anything not covered here is reported as such,
+not fitted into a reading afterwards.
+
+**Read 2026-11-13, replication: reading 2 (log-floor only).** Jobs 20467868–70 (training) and
+20467871–73 (reads) all completed. Outputs: `results/seed<S>_tgtbneval/feature_probe_<pair>/`,
+`results/plots/compare_fields_tgtbneval_seed<S>/<pair>/`,
+`results/seed<S>_tgtbneval/unet/none/rows/<pair>__mmd.csv`. Thresholds applied as written.
+
+```
+europe→melanesia             seed 42        seed 43        seed 44
+L  recovery                  1.00           0.99           1.03
+   target mse_log_e01        0.921          0.891          0.877
+   (source-only / oracle)    1.080 / 0.921  1.095 / 0.888  1.031 / 0.882
+F  deployed GAP MMD / SO     0.007×         0.024×         0.023×
+F  domain classifier         0.88           0.65           0.955  (fail)
+S  Δsrc                      +0.006         +0.007         +0.024 (fail)
+M  target MAE mm (SO)        0.343 (0.315)  3.15 (0.379)   0.325 (0.358)
+   M                         fail           fail           pass
+   best / stop epoch         6 / 11         10 / 15        3 / 8
+```
+
+- **L reproduces in every seed, and clamping does not change it** (seed 43: 0.884 clamped,
+  0.889 unclamped, `compare_fields`). On the log floor the BN-fixed MMD lands on the oracle
+  three times out of three.
+- **M fails in 2 of 3.** Seed 43 is a blow-up: bias +2.6 mm/h, max 8.7×10⁶ mm/h, pixels above
+  the training maximum 2.65×10⁻⁴ against 9.96×10⁻⁵ for its source-only (itself 23,194 mm/h max).
+  Its training log shows target MAE diverging from epoch 12 (11 → 34 → 198 → 6,327 mm);
+  source-validation selection picked epoch 10, already at 3.1 mm. In every seed the run is
+  wetter than in-domain in the bulk (wet fraction 0.077 / 0.098 / 0.079 against in-domain
+  0.059 / 0.053 / 0.049; p99 0.85–1.8 against 0.71–0.92 mm/h).
+- **Seed 44 fails F and S narrowly** (classifier 0.955 against ≤ 0.95; Δsrc +0.024 against
+  ≤ 0.02). Recorded as fails.
+- **horn→europe, seed 42: no effect.** Target 0.4479 against source-only 0.4486 and oracle
+  0.352 (recovery 0.007); MAE 0.0974 mm, the all-zero predictor's, max 0.46 mm/h, wet
+  fraction 0. Deployed GAP MMD fell to 0.03× source-only (0.0067 against 0.212), but the
+  classifier still separates the domains (0.98). Features moved, the output did not: the
+  GAP "(b)" reading that 2026-11-11 could not establish, on one seed and one pair.
+
+Reading 2, as decided in advance: an alignment term that acts on deployed features buys
+log-floor score with mm error. For claim 3 / L3: on the old trainer the terms did not act and
+BN did; on the BN-fixed trainer MMD acts, reaches the oracle on the log floor into melanesia
+by wetting bulk and tail, and does not move the zero predictor into europe_west. No dose
+ladder (reading 2). Open, not pre-registered: why L lands on the oracle so exactly
+(1.00 / 0.99 / 1.03). A trivial-wetting reference (source-only plus constant drizzle at the
+run's wet fraction) would show whether the log floor alone produces it; run before the L3
+sentence is written.
 
 **Proposed 2026-11-09, larger RainShift matrix (R-matrix).** All 19 regions are on disk.
 Pre-registered additions to cover the regimes: northamerica-east (mid-latitude, a europe_west

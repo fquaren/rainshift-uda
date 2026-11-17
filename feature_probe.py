@@ -41,6 +41,15 @@ read once per (domain, stats) and cached on CPU; batches of `--batch_size`
 the trainer's 8-chunk (1600 h) shuffle buffer.
 
 Writes <out_dir>/probe.csv; --out_dir is refused if it exists.
+
+Optional (2026-11-12, BN-fixed trainer read, MILESTONES M2):
+  --pair SRC TGT        probe only that ordered pair (default: all six)
+  --extra LABEL=DIR     an extra run of that pair, probed under
+                        eval_trained  eval mode, its own running stats (for a
+                                      --target_bn eval run these are source-only:
+                                      the target pass never updated them)
+                        train_batch   as above
+                        Repeatable; needs --pair.
 """
 
 import argparse
@@ -156,7 +165,21 @@ def main():
     p.add_argument("--out_dir", required=True, help="refused if it exists")
     p.add_argument("--stride", type=int, default=17)
     p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--pair", nargs=2, metavar=("SRC", "TGT"), default=None,
+                   help="probe only this ordered pair")
+    p.add_argument("--extra", action="append", default=[], metavar="LABEL=DIR",
+                   help="extra run of --pair, probed under eval_trained and train_batch")
     args = p.parse_args()
+    if args.extra and args.pair is None:
+        p.error("--extra needs --pair")
+    if args.pair is not None and tuple(args.pair) not in _pairs():
+        p.error(f"--pair {args.pair} is not one of {_pairs()}")
+    extras = []
+    for e in args.extra:
+        label, sep, d = e.partition("=")
+        if not sep or not label or not d:
+            p.error(f"--extra {e!r}: expected LABEL=DIR")
+        extras.append((label, Path(d)))
 
     out_dir = Path(args.out_dir)
     if out_dir.exists():
@@ -171,7 +194,8 @@ def main():
 
     # Resolve every checkpoint first, so a missing run fails before any GPU work.
     jobs = []
-    for src, tgt in _pairs():
+    pairs = [tuple(args.pair)] if args.pair is not None else _pairs()
+    for src, tgt in pairs:
         pair = f"{src}__to__{tgt}"
         so = trees["main"][0] / f"{pair}__none"
         jobs.append((src, tgt, "source-only", [("eval_srcbn", so), ("train_batch", so)]))
@@ -180,6 +204,8 @@ def main():
             jobs.append((src, tgt, m, [("eval_srcbn", srcbn), ("eval_mixed", mixed), ("train_batch", mixed)]))
         mixed, srcbn = trees["gr05"][0] / f"{pair}__dann", trees["gr05"][1] / f"{pair}__dann"
         jobs.append((src, tgt, "dann_gr0.5", [("eval_srcbn", srcbn), ("eval_mixed", mixed), ("train_batch", mixed)]))
+    for label, d in extras:
+        jobs.append((pairs[0][0], pairs[0][1], label, [("eval_trained", d), ("train_batch", d)]))
     missing = sorted({str(d) for *_, modes in jobs for _, d in modes
                       if not (d / "best.pt").exists() or not (d / "config.json").exists()})
     if missing:

@@ -123,4 +123,80 @@ for cells, shift in (((flat, flat), 0.15), ((tilt, tilt[::-1]), -0.15)):
     assert p < 0.05, (shift, obs, p)
     print(f"conditional shift {shift:+.2f}: W1 {obs:.3f}, p {p:.3f}")
 
+
+# --- 5. loader geometry (2026-11-13, COSMO C2): tiny synthetic stores
+import tempfile
+from pathlib import Path
+
+import xarray as xr
+
+from conditional_shift_binned import _load_matched, input_shift, input_marginals
+
+
+def store(root, n_in, n_out, T=30, tp_is_block_mean=False):
+    """data_in / data_out zarr pair as RainShift / cosmo_build write them."""
+    p = rng.gamma(0.3, 2.0, (T, n_out, n_out)).astype(np.float32)
+    b = n_out // n_in
+    tp = p.reshape(T, n_in, b, n_in, b).mean(axis=(2, 4)) if tp_is_block_mean else rng.random((T, n_in, n_in))
+    dims = ("time", "lat", "lon")
+    xr.Dataset({"cape": (dims, rng.random((T, n_in, n_in))), "tcw": (dims, rng.random((T, n_in, n_in))),
+                "tp": (dims, tp.astype(np.float32))},
+               coords={"time": np.arange(T)}).to_zarr(root / "test_data_in.zarr")
+    xr.Dataset({"precipitation": (dims, p)}, coords={"time": np.arange(T)}).to_zarr(root / "test_data_out.zarr")
+    return p
+
+
+tmp = Path(tempfile.mkdtemp(prefix="cond_binned_test_"))
+
+# RainShift geometry: block scale reproduces the old hard-coded 40x40 loader.
+(tmp / "rs").mkdir()
+p_rs = store(tmp / "rs", 80, 200)
+c, tc, y, tt = _load_matched(tmp / "rs", "test", 10, 3)
+idx = np.sort(np.random.default_rng(3).choice(30, size=10, replace=False))
+di = xr.open_zarr(tmp / "rs" / "test_data_in.zarr")
+old_c = di["cape"].isel(time=idx).values.reshape(10, 40, 2, 40, 2).mean(axis=(2, 4))
+old_p = np.clip(p_rs[idx].reshape(10, 40, 5, 40, 5).mean(axis=(2, 4)), 0, None)
+assert np.allclose(c, old_c.ravel()) and np.allclose(y, old_p.ravel(), rtol=1e-6), "block = old loader"
+assert np.array_equal(tt, np.repeat(idx, 1600))
+
+# COSMO geometry, tp = block mean of the target: block scale makes y a function
+# of the conditioning input (the degenerate case), fine scale does not.
+(tmp / "cosmo").mkdir()
+p_c = store(tmp / "cosmo", 20, 200, tp_is_block_mean=True)
+tp_b, cape_b, y_b, _ = _load_matched(tmp / "cosmo", "test", 10, 3, cond=("tp", "cape"))
+assert y_b.size == 10 * 400 and np.allclose(y_b, np.clip(tp_b, 0, None), rtol=1e-5), "block: y = tp"
+tp_f, cape_f, y_f, t_f = _load_matched(tmp / "cosmo", "test", 10, 3, cond=("tp", "cape"), target_scale="fine")
+assert y_f.size == 10 * 200 * 200 and np.allclose(y_f, p_c[idx].ravel(), rtol=1e-6), "fine: native pixels"
+cell = tp_f.reshape(10, 200, 200)[:, ::10, ::10]          # one pixel per 10x10 cell
+assert np.allclose(tp_f.reshape(10, 20, 10, 20, 10), cell[:, :, None, :, None]), "covariates constant per cell"
+assert np.allclose(y_f.reshape(10, 20, 10, 20, 10).mean(axis=(2, 4)), cell, rtol=1e-5), "cell mean of y = tp"
+# Subsample: a store whose target value IS the flat pixel position (exact in
+# float32 below 2^24), so the kept positions can be read off the values.
+(tmp / "pos").mkdir()
+T, dims = 30, ("time", "lat", "lon")
+xr.Dataset({"cape": (dims, rng.random((T, 20, 20))), "tcw": (dims, rng.random((T, 20, 20)))},
+           coords={"time": np.arange(T)}).to_zarr(tmp / "pos" / "test_data_in.zarr")
+posf = np.broadcast_to(np.arange(200 * 200, dtype=np.float32).reshape(200, 200), (T, 200, 200))
+xr.Dataset({"precipitation": (dims, np.array(posf))},
+           coords={"time": np.arange(T)}).to_zarr(tmp / "pos" / "test_data_out.zarr")
+k = 7
+cape_k, _, y_k, t_k = _load_matched(tmp / "pos", "test", 10, 3, target_scale="fine", fine_per_cell=k)
+assert y_k.size == 10 * 400 * k and t_k.size == y_k.size
+pk = y_k.reshape(10, 400 * k).astype(np.int64)
+assert (pk == pk[0]).all(), "same fine positions in every frame"
+assert np.unique(pk[0]).size == 400 * k, "no position twice"
+cell_of = (pk[0] // 200) // 10 * 20 + (pk[0] % 200) // 10
+assert np.all(np.bincount(cell_of, minlength=400) == k), "k pixels in every cell"
+cape_cells = xr.open_zarr(tmp / "pos" / "test_data_in.zarr")["cape"].isel(time=idx).values.reshape(10, 400)
+assert np.allclose(cape_k.reshape(10, -1), cape_cells[:, cell_of]), "each pixel carries its cell's covariates"
+
+# input shift: identical domains give 0, a shifted copy gives the shift.
+m = input_marginals(tmp / "cosmo", "test", 10, 3)
+assert set(m) == {"cape", "tcw", "tp"}
+assert all(v["w1"] == 0 for v in input_shift(m, m).values())
+sh = input_shift({"cape": m["cape"]}, {"cape": m["cape"] + 0.5})["cape"]
+assert np.isclose(sh["w1"], 0.5) and np.isclose(sh["w1_per_sd_x"], 0.5 / m["cape"].std())
+print(f"loader: block = old 40x40 loader; COSMO block degenerate (y = tp), fine native, "
+      f"{k}/cell subsample fixed across frames; input W1 exact")
+
 print("test_conditional_shift_binned: all passed")

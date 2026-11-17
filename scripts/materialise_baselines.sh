@@ -30,13 +30,23 @@ MODEL="${MODEL:-unet}"
 case "${MODEL}" in
     unet) PFX="" ;;
     afm)  PFX="afm_" ;;
-    *) echo "ERROR: MODEL must be unet or afm"; exit 1 ;;
+    # unet_cosmo: the COSMO tree unet_cosmo_seed<S>/ (PLAN_COSMO C3); pass the
+    # regions in DOMAINS_ENV.
+    unet_cosmo) PFX="" ;;
+    *) echo "ERROR: MODEL must be unet, afm or unet_cosmo"; exit 1 ;;
 esac
 # OUTPUT_SUFFIX selects a side tree, e.g. _smoke.
 MODEL_DIR="${OUTPUT_DIR}/${MODEL}_seed${SEED}${OUTPUT_SUFFIX:-}"
 run_dir() { echo "${MODEL_DIR}/${PFX}$1__to__$2__none"; }
 
 DOMAINS=("europe_west" "horn-of-africa" "melanesia")
+# Space-separated override, e.g. DOMAINS_ENV="alps british_isles poland ..." (COSMO).
+if [[ -n "${DOMAINS_ENV:-}" ]]; then
+    read -ra DOMAINS <<< "${DOMAINS_ENV}"
+fi
+if [[ "${MODEL}" == "unet_cosmo" && -z "${DOMAINS_ENV:-}" ]]; then
+    echo "ERROR: MODEL=unet_cosmo needs DOMAINS_ENV (the COSMO regions)."; exit 1
+fi
 
 [[ -d "${MODEL_DIR}" ]] || { echo "ERROR: ${MODEL_DIR} does not exist."; exit 1; }
 echo "=== materialising pair-named source-only checkpoints in ${MODEL_DIR} ==="
@@ -84,7 +94,8 @@ done
 echo
 echo "=== verification ==="
 n_diag=$(ls -d "${MODEL_DIR}"/${PFX}*__to__*__none 2>/dev/null | wc -l)
-echo "  checkpoint dirs found: ${n_diag} (expect 9 = 3 diagonal + 6 off-diagonal)"
+n_dom=${#DOMAINS[@]}
+echo "  checkpoint dirs found: ${n_diag} (expect $((n_dom * n_dom)) = ${n_dom} diagonal + $((n_dom * (n_dom - 1))) off-diagonal)"
 for d in "${MODEL_DIR}"/${PFX}*__to__*__none; do
     [[ -f "$d/best.pt" ]] || echo "  WARNING: $(basename "$d") has no best.pt"
 done

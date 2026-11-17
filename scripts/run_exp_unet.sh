@@ -108,18 +108,27 @@ NUM_WORKERS=12
 BATCH_SIZE=128
 
 FDA_BETA=0.01
-LAMBDA_UDA=0.1
+# LAMBDA_UDA / DANN_WEIGHT may be overridden from the environment (the dose
+# ladder); like UDA_GRAD_RATIO, a non-default value needs a side tree.
+LAMBDA_UDA="${LAMBDA_UDA:-0.1}"
 # DANN uses a separate, small adversarial weight (the GRL alpha already
 # ramps the reversal 0->1). ~5e-4 per Wang et al. 2026; a large value
 # collapses the discriminator to ln(2). Ignored by non-DANN methods.
-DANN_WEIGHT=5e-4
+DANN_WEIGHT="${DANN_WEIGHT:-5e-4}"
 
 # Optional gradient-matched weight for mmd / mmd_ms / dann (audit A2), off by
 # default. The run tag does not record it, so it needs its own side tree.
 UDA_EXTRA=()
 [[ -n "${UDA_GRAD_RATIO:-}" ]] && UDA_EXTRA+=(--uda_grad_ratio "${UDA_GRAD_RATIO}")
-if (( ${#UDA_EXTRA[@]} )) && [[ -z "${OUTPUT_SUFFIX:-}" ]]; then
-    echo "ERROR: UDA_GRAD_RATIO needs an OUTPUT_SUFFIX side tree."; exit 1
+# TARGET_BN=eval: the target forward uses BatchNorm running statistics and
+# never updates them (train_unet.py _bn_eval, B4.9). Off by default, so every
+# existing tree keeps its meaning. Only methods with a target forward accept
+# it; train_unet.py refuses fda / adabn / none.
+[[ -n "${TARGET_BN:-}" ]] && UDA_EXTRA+=(--target_bn "${TARGET_BN}")
+NONDEFAULT_W=0
+[[ "${LAMBDA_UDA}" != "0.1" || "${DANN_WEIGHT}" != "5e-4" ]] && NONDEFAULT_W=1
+if (( ${#UDA_EXTRA[@]} || NONDEFAULT_W )) && [[ -z "${OUTPUT_SUFFIX:-}" ]]; then
+    echo "ERROR: UDA_GRAD_RATIO / TARGET_BN / a non-default LAMBDA_UDA or DANN_WEIGHT needs an OUTPUT_SUFFIX side tree."; exit 1
 fi
 
 # --------------------------------------------------------------------------

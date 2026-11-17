@@ -138,38 +138,105 @@ def _w1_exact(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.sum(np.abs(ca - cb) * d))
 
 
-def _load_matched(domain_path: Path, split: str, n_frames: int, seed: int):
-    """Return per-pixel (cape, tcw, precipitation in mm/h) on a common 40x40
-    grid, and each pixel's time index in the split (hours from its start).
+def _block(a, g):
+    """Block-mean a (F, n, n) array to (F, g, g); n must be a multiple of g."""
+    F, n = a.shape[0], a.shape[1]
+    b = n // g
+    return a.reshape(F, g, b, g, b).mean(axis=(2, 4))
 
-    Inputs are 80x80 and the target 200x200; both are block-averaged to 40x40
-    so each input pixel has one collocated target value. The frame draw
-    depends on (n, seed) only, so domains with the same split length get the
-    same timestamps.
+
+def _frames(n, n_frames, seed):
+    """The frame draw depends on (n, seed) only, so domains with the same
+    split length get the same timestamps."""
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(n, size=min(n_frames, n), replace=False))
+
+
+def _load_matched(domain_path: Path, split: str, n_frames: int, seed: int,
+                  cond=("cape", "tcw"), target_scale="block", fine_per_cell=0):
+    """Return per-pixel (cond[0], cond[1], precipitation in mm/h) and each
+    pixel's time index in the split (hours from its start).
+
+    The common grid is G = gcd(input size, target size): RainShift 80 / 200
+    -> 40, COSMO 20 / 200 -> 20. Inputs are block-averaged to G x G.
+      target_scale "block": the target is block-averaged to G x G too, so each
+        input pixel has one collocated target value (RainShift P1b, unchanged).
+      target_scale "fine": the target stays at its native grid and every fine
+        pixel takes the covariates of the G-cell it lies in. Use this when a
+        conditioning input is the coarse target itself (COSMO `tp` is the
+        block mean of the target by construction, so a block-mean target
+        would be a function of the input and the test trivial). It compares
+        sub-grid structure given the coarse inputs. With fine_per_cell = k > 0,
+        k of the fine pixels of each cell are kept, the same positions in
+        every frame and domain (fixed by `seed`).
     """
     pre = "test" if split == "test" else "train"
     di = xr.open_zarr(domain_path / f"{pre}_data_in.zarr")
     do = xr.open_zarr(domain_path / f"{pre}_data_out.zarr")
 
-    n = di.sizes["time"]
-    rng = np.random.default_rng(seed)
-    idx = np.sort(rng.choice(n, size=min(n_frames, n), replace=False))
-
-    cape = np.nan_to_num(di["cape"].isel(time=idx).values, nan=0.0)
-    tcw = np.nan_to_num(di["tcw"].isel(time=idx).values, nan=0.0)
+    idx = _frames(di.sizes["time"], n_frames, seed)
+    covs = [np.nan_to_num(di[v].isel(time=idx).values, nan=0.0) for v in cond]
     p = np.nan_to_num(do["precipitation"].isel(time=idx).values,
                       nan=0.0, posinf=0.0, neginf=0.0)
-
-    F = p.shape[0]
-    p = p.reshape(F, 40, 5, 40, 5).mean(axis=(2, 4))
-    cape = cape.reshape(F, 40, 2, 40, 2).mean(axis=(2, 4))
-    tcw = tcw.reshape(F, 40, 2, 40, 2).mean(axis=(2, 4))
-    p = np.clip(p, 0.0, None)
-
     di.close()
     do.close()
-    return (cape.ravel().astype(np.float64), tcw.ravel().astype(np.float64),
-            p.ravel().astype(np.float64), np.repeat(idx, 40 * 40))
+
+    F, n_in, n_out = p.shape[0], covs[0].shape[1], p.shape[1]
+    G = int(np.gcd(n_in, n_out))
+    covs = [_block(c, G) for c in covs]
+    if target_scale == "block":
+        p = _block(p, G)
+        npix = G * G
+    elif target_scale == "fine":
+        bo = n_out // G
+        covs = [np.repeat(np.repeat(c, bo, axis=1), bo, axis=2) for c in covs]
+        if fine_per_cell:
+            if not 0 < fine_per_cell <= bo * bo:
+                raise ValueError(f"fine_per_cell must be in 1..{bo * bo}")
+            # k positions per cell, as flat indices into the n_out x n_out grid.
+            rng = np.random.default_rng(seed + 1)
+            pick = np.stack([rng.permutation(bo * bo)[:fine_per_cell] for _ in range(G * G)])
+            ci, cj = np.divmod(np.arange(G * G), G)
+            ri, rj = np.divmod(pick, bo)
+            flat = ((ci[:, None] * bo + ri) * n_out + (cj[:, None] * bo + rj)).ravel()
+            p = p.reshape(F, -1)[:, flat]
+            covs = [c.reshape(F, -1)[:, flat] for c in covs]
+        npix = p[0].size
+    else:
+        raise ValueError(f"target_scale {target_scale!r}")
+    p = np.clip(p, 0.0, None)
+    return (covs[0].ravel().astype(np.float64), covs[1].ravel().astype(np.float64),
+            p.ravel().astype(np.float64), np.repeat(idx, npix))
+
+
+def input_marginals(domain_path: Path, split: str, n_frames: int, seed: int):
+    """Every input variable (data_in.zarr, minus coordinates) of the sampled
+    frames, flattened at the input grid, NaN dropped."""
+    pre = "test" if split == "test" else "train"
+    di = xr.open_zarr(domain_path / f"{pre}_data_in.zarr")
+    idx = _frames(di.sizes["time"], n_frames, seed)
+    out = {}
+    for v in di.data_vars:
+        if di[v].ndim != 3:
+            continue
+        a = di[v].isel(time=idx).values.ravel().astype(np.float64)
+        out[v] = a[np.isfinite(a)]
+    di.close()
+    return out
+
+
+def input_shift(mx, my):
+    """Per-variable W1 between two domains' input marginals: raw, and per each
+    domain's sd (the ordered-pair 'source units': per_sd_x reads x as source)."""
+    res = {}
+    for v in sorted(set(mx) & set(my)):
+        a, b = mx[v], my[v]
+        w = _w1_exact(a, b)
+        sx, sy = float(np.std(a)), float(np.std(b))
+        res[v] = {"w1": w,
+                  "w1_per_sd_x": (w / sx if sx > 0 else None),
+                  "w1_per_sd_y": (w / sy if sy > 0 else None)}
+    return res
 
 
 def _binned_w1(a_cape, a_tcw, a_p, b_cape, b_tcw, b_p, n_bins, min_count):
@@ -346,15 +413,17 @@ class Design:
             fb[sl] = s * k * k + c * k + t
         return fb
 
-    def covariate_mismatch(self, groups=None):
-        """Occupancy-weighted within-group W1 of cape and tcw between the
+    def covariate_mismatch(self, groups=None, names=("cape", "tcw")):
+        """Occupancy-weighted within-group W1 of the two covariates between the
         samples (observed labels), raw and per pooled within-group sd.
-        Groups: the coarse bins, or e.g. fine_bins(k)."""
+        Groups: the coarse bins, or e.g. fine_bins(k). `names` label the two
+        covariates in the keys (the attributes are .cape/.tcw whatever they
+        hold)."""
         g = self.seg if groups is None else groups
         _, g = np.unique(g, return_inverse=True)
         ng = int(g.max()) + 1 if g.size else 0
         res = {}
-        for name, v in (("cape", self.cape), ("tcw", self.tcw)):
+        for name, v in ((names[0], self.cape), (names[1], self.tcw)):
             o = np.lexsort((v, g))
             s, vs, la = g[o], v[o], self.lab[o]
             d = np.diff(vs)
@@ -458,7 +527,7 @@ def _summ(v):
             "p95": float(np.nanpercentile(v, 95)), "n": int(v.size)}
 
 
-def verdict(obs, null, ci, support, alpha, support_threshold):
+def verdict(obs, null, ci, support, alpha, support_threshold, cond=("cape", "tcw")):
     if support < support_threshold:
         return f"LOW SUPPORT ({support:.0%}) - not interpretable"
     p = p_value(obs, null)
@@ -467,7 +536,7 @@ def verdict(obs, null, ci, support, alpha, support_threshold):
     if p >= alpha:
         return f"within the conditional-permutation null (p={p:.3f}) -> no evidence beyond covariate shift"
     if ci[0] > np.nanpercentile(null, 95):
-        return f"clear excess (p={p:.3f}, CI above null p95) -> conditional shift on (cape, tcw), upper bound"
+        return f"clear excess (p={p:.3f}, CI above null p95) -> conditional shift on ({', '.join(cond)}), upper bound"
     return f"weak excess (p={p:.3f}, CI reaches the null's upper tail) -> inconclusive"
 
 
@@ -545,12 +614,28 @@ def main():
                     help="one-domain split nulls, diagnostics only")
     ap.add_argument("--null_reps", type=int, default=20,
                     help="random splits per diagnostic null mode (\"year\" has one)")
+    ap.add_argument("--cond", nargs=2, default=["cape", "tcw"], metavar=("V1", "V2"),
+                    help="the two conditioning inputs (default cape tcw, RainShift P1b)")
+    ap.add_argument("--target_scale", default="block", choices=["block", "fine"],
+                    help="block: target block-averaged to the common grid (P1b); fine: native "
+                    "target pixels with their cell's covariates (needed when a conditioning "
+                    "input is the coarse target, e.g. COSMO tp)")
+    ap.add_argument("--fine_per_cell", type=int, default=0,
+                    help="with --target_scale fine: keep this many fine pixels per cell (0 = all)")
+    ap.add_argument("--input_w1", action="store_true",
+                    help="also report per-variable W1 of every input between the domains")
     a = ap.parse_args()
     if Path(a.out).exists():
         raise SystemExit(f"{a.out} exists. Not overwriting.")
+    if a.fine_per_cell and a.target_scale != "fine":
+        ap.error("--fine_per_cell needs --target_scale fine")
+    cond = tuple(a.cond)
 
     root = Path(a.data_root)
-    data = {d: _load_matched(root / d, a.split, a.n_frames, a.seed) for d in a.domains}
+    data = {d: _load_matched(root / d, a.split, a.n_frames, a.seed, cond, a.target_scale,
+                             a.fine_per_cell) for d in a.domains}
+    marg = ({d: input_marginals(root / d, a.split, a.n_frames, a.seed) for d in a.domains}
+            if a.input_w1 else None)
     t0 = data[a.domains[0]][3]
     for d in a.domains:
         if not np.array_equal(data[d][3], t0):
@@ -577,8 +662,10 @@ def main():
                            "n_bins_used": legacy[2], "support_min": legacy[3]},
              "perm_null": {}, "bootstrap_ci": {}, "excess_over_null_mean": {}, "verdict": {},
              "perm_fallback_pixel_frac": fallback, "perm_units": int(cp.present.size),
-             "covariate_mismatch": {"coarse": des.covariate_mismatch(),
-                                    "fine": des.covariate_mismatch(cp.fb)}}
+             "covariate_mismatch": {"coarse": des.covariate_mismatch(names=cond),
+                                    "fine": des.covariate_mismatch(cp.fb, names=cond)}}
+        if marg is not None:
+            r["input_shift"] = input_shift(marg[x], marg[y])
         for k in STATS:
             nv, bv = _col(null, k), _col(boot, k)
             ci = (np.nanpercentile(bv, [2.5, 97.5]).tolist() if np.isfinite(bv).any()
@@ -587,17 +674,22 @@ def main():
             r["bootstrap_ci"][k] = ci
             mu = r["perm_null"][k]["mean"]
             r["excess_over_null_mean"][k] = (obs[k] - mu if mu is not None else None)
-            r["verdict"][k] = verdict(obs[k], nv, ci, des.support, a.alpha, a.support_threshold)
+            r["verdict"][k] = verdict(obs[k], nv, ci, des.support, a.alpha, a.support_threshold, cond)
             print(f"{x + ' <-> ' + y:34s} {k:11s} {obs[k]:8.4f} {np.nanmean(nv):8.4f} "
                   f"{np.nanpercentile(nv, 95):8.4f} {r['perm_null'][k]['p']:6.3f} "
                   f"[{ci[0]:8.4f},{ci[1]:8.4f}] {des.support:5.0%} {des.nseg:4d}")
         r["headline"] = {"stat": HEADLINE, "verdict": r["verdict"][HEADLINE]}
         mc = r["covariate_mismatch"]
         print(f"  verdict ({HEADLINE}): {r['verdict'][HEADLINE]}")
-        print(f"  covariate W1/sd inside bins: coarse cape {mc['coarse']['w1_cape_per_sd']:.3f} "
-              f"tcw {mc['coarse']['w1_tcw_per_sd']:.3f}; fine cape {mc['fine']['w1_cape_per_sd']:.3f} "
-              f"tcw {mc['fine']['w1_tcw_per_sd']:.3f}; fallback pixels {fallback:.1%}; "
+        c0, c1 = cond
+        print(f"  covariate W1/sd inside bins: coarse {c0} {mc['coarse'][f'w1_{c0}_per_sd']:.3f} "
+              f"{c1} {mc['coarse'][f'w1_{c1}_per_sd']:.3f}; fine {c0} {mc['fine'][f'w1_{c0}_per_sd']:.3f} "
+              f"{c1} {mc['fine'][f'w1_{c1}_per_sd']:.3f}; fallback pixels {fallback:.1%}; "
               f"legacy W1_cond(1e-5) {legacy[0]:.4f}")
+        if marg is not None:
+            print("  input W1 / sd(" + x + "): " + ", ".join(
+                f"{v} {s['w1_per_sd_x']:.3f}" for v, s in r["input_shift"].items()
+                if s["w1_per_sd_x"] is not None))
 
         r["block_nulls"] = {}
         for mode in a.null_modes:

@@ -8,6 +8,7 @@ import json
 import math
 import time
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -42,6 +43,38 @@ _LAM_CAP = 100.0
 
 _NEEDS_TARGET_FORWARD = {"coral", "mmd", "mmd_ms", "spectral", "dann", "joint_ot"}
 _NEEDS_FEATURES = {"coral", "mmd", "mmd_ms", "dann", "joint_ot"}
+
+
+@contextmanager
+def _bn_eval(model):
+    """BatchNorm layers of `model` in eval mode for the duration (B4.9).
+
+    Used for the target forward with --target_bn eval: the target batch is
+    normalised with the running statistics, which then hold source batches
+    only, and it never updates them. Gradients flow as usual; only the
+    normalisation changes. Other modules keep their mode (the UNet has no
+    dropout), and the DANN discriminator is not part of `model`.
+
+    Why: in train mode each domain's batch is normalised by its own batch
+    statistics. That alone removes ~97 % of the GAP bottleneck distance the
+    losses act on, and the alignment achieved there does not reach the
+    features the deployed model (eval mode, running statistics) computes
+    (feature probe, PLAN.md 2026-11-11). It also mixes target statistics into
+    the saved running statistics (CLAUDE.md, BN trap). With eval-mode BN on
+    the target pass the loss sees the target features the model deploys, and
+    best.pt holds source-only statistics, so no _srcbn re-estimation is needed.
+    The source pass keeps train-mode BN (batch statistics): source features
+    are therefore normalised by the batch, not the running statistics, which
+    differ only by batch noise and the running-average lag."""
+    bns = [m for m in model.modules()
+           if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.training]
+    for m in bns:
+        m.eval()
+    try:
+        yield
+    finally:
+        for m in bns:
+            m.train()
 
 
 def _tag(src, tgt):
@@ -95,6 +128,12 @@ def build_loaders(args, src_stats, tgt_stats, batch_size=None):
                 raise ValueError(f"train_half {args.train_half} leaves no {split} chunk of {n}")
             ds.seed = args.seed
             print(f"train_half {args.train_half}: {split} keeps {len(ds.chunk_ids)} of {n} chunks, shuffle seed {ds.seed}")
+        # --data_order_seed: the shuffle RNG (read in __iter__, train split only;
+        # JointZarrDataset uses the source's) follows --seed. The validation
+        # offset was fixed at construction with the default seed and stays.
+        if args.data_order_seed and split == "train":
+            ds.seed = args.seed
+            print(f"data_order_seed: {path} train shuffle seed {ds.seed}")
         return ds
 
     if args.joint_training:
@@ -165,6 +204,7 @@ def train_one_epoch(
     grad_ratio=0.0,
     lam_state=None,
     diagnostics=False,
+    target_bn="train",
 ):
     """grad_ratio > 0 (mmd / mmd_ms / dann): instead of lambda_eff (dann:
     dann_weight), weight the alignment term so that its gradient on the
@@ -174,7 +214,10 @@ def train_one_epoch(
     before matching, so the GRL ramp still applies on top and the share
     achieved is grad_ratio * alpha. diagnostics: log the unbiased bottleneck
     MMD under GAP and grid4 pooling, and its null (uda.mmd_diagnostics),
-    every step. joint_ot logs the Sinkhorn marginal errors every 50 steps."""
+    every step. joint_ot logs the Sinkhorn marginal errors every 50 steps.
+    target_bn: "train" (default, every run to date) forwards the target batch
+    with train-mode BatchNorm; "eval" uses the running statistics and leaves
+    them untouched (_bn_eval, B4.9)."""
     model.train()
     sum_task, sum_uda, n = 0.0, 0.0, 0
     extra = defaultdict(float)
@@ -182,6 +225,7 @@ def train_one_epoch(
     use_feat = method in _NEEDS_FEATURES
     alpha = dann_grl_schedule(epoch, total_epochs) if method == "dann" else 1.0
     tgt_iter = iter(tgt_loader)
+    tgt_ctx = (lambda: _bn_eval(model)) if target_bn == "eval" else nullcontext
     matched = grad_ratio > 0 and method in ("mmd", "mmd_ms", "dann")
     if matched:
         probe = [p for name, p in model.named_parameters() if name.startswith(("dyn_enc", "bottleneck"))]
@@ -211,25 +255,31 @@ def train_one_epoch(
         # The target prediction is not used by these losses. Taking [1] lets
         # it die at once, which frees its 200x200 decoder graph instead of
         # keeping it alive through backward() (`_, feats_t = ...` did). The
-        # full forward still runs, so BatchNorm running statistics see the
-        # target batch exactly as before; only memory changes.
+        # full forward still runs, so with --target_bn train the BatchNorm
+        # running statistics see the target batch exactly as before; only
+        # memory changes. With --target_bn eval they never see it (_bn_eval).
         if method == "coral":
-            feats_t = model(x_t, s_t, extract_features=True)[1]
+            with tgt_ctx():
+                feats_t = model(x_t, s_t, extract_features=True)[1]
             uda_loss = uda_comp["loss_fn"](feats_s["bottleneck"], feats_t["bottleneck"])
         elif method == "mmd":
-            feats_t = model(x_t, s_t, extract_features=True)[1]
+            with tgt_ctx():
+                feats_t = model(x_t, s_t, extract_features=True)[1]
             uda_loss = uda_comp["loss_fn"](feats_s["bottleneck"], feats_t["bottleneck"])
         elif method == "mmd_ms":
-            feats_t = model(x_t, s_t, extract_features=True)[1]
+            with tgt_ctx():
+                feats_t = model(x_t, s_t, extract_features=True)[1]
             uda_loss = uda_comp["loss_fn"](feats_s, feats_t, levels=uda_comp["levels"])
         elif method == "dann":
-            feats_t = model(x_t, s_t, extract_features=True)[1]
+            with tgt_ctx():
+                feats_t = model(x_t, s_t, extract_features=True)[1]
             uda_loss = dann_loss(uda_comp["disc"], feats_s["bottleneck"], feats_t["bottleneck"], alpha)
         elif method == "joint_ot":
             # Joint alignment needs the target PREDICTION as well as target
             # features: the label-transfer cost couples source labels to the
             # model's output at target inputs.
-            pred_t, feats_t = model(x_t, s_t, extract_features=True)
+            with tgt_ctx():
+                pred_t, feats_t = model(x_t, s_t, extract_features=True)
             # Every 50 steps also take the diagnostics, for the Sinkhorn
             # marginal errors (audit A8); the loss is the same either way.
             sk_step = step % 50 == 0
@@ -245,7 +295,8 @@ def train_one_epoch(
             else:
                 uda_loss = res
         elif method == "spectral":
-            pred_t = model(x_t, s_t)
+            with tgt_ctx():
+                pred_t = model(x_t, s_t)
             uda_loss = uda_comp["loss_fn"](pred_s, pred_t)
 
         # Weighting. DANN has its own fixed weight, dann_weight (default 5e-4,
@@ -392,6 +443,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
             grad_ratio=args.uda_grad_ratio,
             lam_state=lam_state,
             diagnostics=args.uda_diagnostics,
+            target_bn=args.target_bn,
         )
         sched.step()
         val = evaluate(model, src_val, criterion, device, src_stats)
@@ -539,6 +591,12 @@ def parse_args():
                         "GRL ramp applies on top, share = ratio * alpha). 0 = off.")
     p.add_argument("--uda_diagnostics", action="store_true",
                    help="mmd / mmd_ms: log unbiased bottleneck MMD under GAP and grid4 pooling, with a null.")
+    p.add_argument("--target_bn", default="train", choices=["train", "eval"],
+                   help="BatchNorm mode of the target forward (B4.9). train: batch "
+                        "statistics, and the target batch updates the running statistics "
+                        "(every run to date). eval: running statistics, never updated by "
+                        "the target, so the loss sees the deployed target features and "
+                        "best.pt keeps source-only statistics. Needs a side tree.")
     p.add_argument("--fda_beta", type=float, default=0.01)
     p.add_argument("--jdot_alpha", type=float, default=1.0,
                    help="JDOT weight on the feature term relative to the label-transfer term.")
@@ -569,6 +627,11 @@ def parse_args():
                    help="Split-half null (PLAN.md P2): train and select on alternate time blocks only; "
                    "source-only runs (source = target) only")
     p.add_argument("--half_block_hours", type=int, default=8760)
+    p.add_argument("--data_order_seed", action="store_true",
+                   help="Let --seed also set the training-data order (shuffle RNG of every train "
+                   "dataset). The validation offset stays seed 42's, so the split does not move. "
+                   "Off by default: every RainShift run so far shares seed 42's data order "
+                   "(CLAUDE.md, '--seed does not reach the dataset'). For COSMO (MILESTONES M2).")
     p.add_argument(
         "--val_chunks",
         type=int,
@@ -596,6 +659,9 @@ def parse_args():
     if args.train_half is not None and (args.joint_training or args.uda_method != "none"
                                         or args.source_path != args.target_path):
         p.error("--train_half is for single-domain source-only runs (source = target, uda_method none)")
+    if args.target_bn == "eval" and args.uda_method not in _NEEDS_TARGET_FORWARD:
+        p.error(f"--target_bn eval only changes methods with a target forward "
+                f"({sorted(_NEEDS_TARGET_FORWARD)}), not {args.uda_method}")
     return args
 
 

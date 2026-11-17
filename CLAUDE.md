@@ -144,8 +144,9 @@ Seeds: 42, 43, 44.
   (`unet_srcbn_export.py` / `afm_srcbn_export.py`: reset, momentum=None, 200 source train
   batches) and compare against those rows. The re-estimated copies live in sibling trees
   `unet_seed<N>_srcbn/`, `unet_seed<N>_danngr05_srcbn/`, `afm_seed<N>_srcbn/`; never write
-  them into the original tree. A trainer whose target pass leaves BN untouched (B4.9) is
-  planned, not written.
+  them into the original tree. `train_unet.py --target_bn eval` (B4.9, `TARGET_BN=eval`
+  in `run_exp_unet.sh`, side tree required) keeps the target pass out of BN; those runs
+  are scored as trained. The AFM trainer has no such flag.
 - **Out-of-range inputs blow up through exp.** σ_log of IMERG is 2.7–4.7, so log-space
   drift under extrapolation (melanesia tcw sits at +4.4σ in europe units) gives
   10⁵–10⁶ mm/h pixels. Report the pixel fraction above the training maximum
@@ -180,8 +181,10 @@ super-resolution on RainShift. It is a diagnosis paper, not a method paper. Four
    scores like source-only, losing both the source cost and the target gains. The old
    "trade the source conditional for target risk" was BN mixing and is withdrawn. Why a
    term that did act would not help either: under label-marginal shift, invariant
-   features force ε_S + ε_T up (Zhao et al. 2019). Whether the features ever aligned is
-   the feature probe's question (PLAN.md); the dose ladder runs only if they did not.
+   features force ε_S + ε_T up (Zhao et al. 2019). Feature probe (2026-11-11): no method
+   aligned the features the model deploys. The losses see train-mode per-domain batch BN,
+   which alone removes ~97 % of the GAP distance; MMD aligned there and it did not carry
+   over. A dose ladder only means something on the BN-fixed trainer (M2 gate).
 4. The failure is a property of the task, not of the MSE objective (AFM, seed 42).
 
 Headline metric is `mse_log_e01` (log(P + 0.1 mm/h)). Every UNet, in-domain included,
