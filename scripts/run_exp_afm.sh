@@ -246,11 +246,20 @@ elif [[ "${PHASE}" == "2" ]]; then
         fi
         refuse_partial "${OUTPUT_DIR}/$(tag "${src}" "${tgt}" "${method}")"
 
+        # AdaBN adapts the seed's own phase-1 model (main tree, as MAIN_HP)
+        # instead of retraining it; sampler steps match eval_array.sh STEPS.
+        METHOD_EXTRA=()
+        if [[ "${method}" == "adabn" ]]; then
+            P1_CKPT="${OUTPUT_ROOT}/afm_seed${SEED}/$(tag "${src}" "${src}" none)/best.pt"
+            [[ -f "${P1_CKPT}" ]] || { echo "ERROR: missing phase-1 checkpoint ${P1_CKPT}"; exit 1; }
+            METHOD_EXTRA=(--adabn_from "${P1_CKPT}" --adabn_steps "${ADABN_STEPS:-10}")
+        fi
+
         run_python "${CODE_ROOT}/train_afm.py" \
             --source_path "${DATA_ROOT}/${src}" \
             --target_path "${DATA_ROOT}/${tgt}" \
             --output_dir  "${OUTPUT_DIR}" \
-            --uda_method  "${method}" \
+            --uda_method  "${method}" "${METHOD_EXTRA[@]}" \
             --lambda_uda  "${LAMBDA_UDA}" \
             --fda_beta    "${FDA_BETA}" \
             --dann_weight "${DANN_WEIGHT}" \

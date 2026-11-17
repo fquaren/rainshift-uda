@@ -353,7 +353,19 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
 
     best, wait, best_epoch = float("inf"), 0, 0
     history, lam_state = [], {}
-    for epoch in range(1, args.epochs + 1):
+    # --adabn_from: AdaBN on an existing source-only checkpoint, no training.
+    # best.pt is that checkpoint unchanged, so the source score is phase 1's
+    # and best_adabn.pt differs from it only in the BatchNorm statistics.
+    # Retraining would reproduce phase 1 (same recipe and seed) at ~5 GPU-h.
+    n_epochs = args.epochs
+    if args.adabn_from:
+        if args.uda_method != "adabn":
+            raise SystemExit("--adabn_from needs --uda_method adabn")
+        model.load_state_dict(torch.load(args.adabn_from, weights_only=True))
+        torch.save(model.state_dict(), out / "best.pt")
+        n_epochs, best = 0, None
+        print(f"AdaBN from {args.adabn_from}, no training")
+    for epoch in range(1, n_epochs + 1):
         t0 = time.time()
         # Per-epoch lambda; ignored when the method has no auxiliary loss
         # (none / fda / adabn) because uda stays at zero in those branches.
@@ -639,6 +651,8 @@ def parse_args():
                         "BatchNorm statistics; keep equal to evaluate.py --sample_steps.")
     p.add_argument("--adabn_flow_batches", type=int, default=100,
                    help="adabn: target training batches for the flow-net pass (0 = all).")
+    p.add_argument("--adabn_from", default=None,
+                   help="adabn: adapt this source-only best.pt instead of training a new model.")
     p.add_argument("--stop_after", type=int, default=0,
                    help="Stop after this many epochs without shortening the cosine schedule (0 = off).")
     p.add_argument("--joint_training", action="store_true", help="Train on concatenated source and target domains")

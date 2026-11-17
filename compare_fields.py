@@ -16,7 +16,14 @@ mm. From that subset it writes:
                     (input), IMERG observation, then each run
   climatology.png   mean precipitation and wet frequency (> 0.1 mm/h) maps
   histogram.png     pixel distribution of log10(P + 0.01)
-  summary.csv       per run: field mean, wet fraction, p99, max, mse_log_e01
+  summary.csv       per run: field mean, wet fraction, p99, max, mse_log_e01;
+                    the fraction of pixels above the run's SOURCE training
+                    maximum (train_data_out.zarr, validation chunks included;
+                    the observation row uses the target's) and above 100 mm/h;
+                    mean and mse_log_e01 with predictions clamped at that
+                    maximum (same rule for every run, source-only and oracle
+                    included: a robustness row, not a headline)
+  train_max.json    the training maxima used
 --output_dir is refused if it exists.
 
 Usage (inside a job, see scripts/run_compare_fields.sh):
@@ -26,6 +33,7 @@ Usage (inside a job, see scripts/run_compare_fields.sh):
 
 import argparse
 import csv
+import json
 from pathlib import Path
 
 import matplotlib
@@ -34,6 +42,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import xarray as xr
 from matplotlib.colors import LogNorm
 from torch.utils.data import DataLoader
 
@@ -46,10 +55,26 @@ from plotting import DEFAULT_INPUT_VARS, _predict
 WET_MM = 0.1
 FLOOR_MM = 0.1
 QUANTILES = (0.5, 0.9, 0.99)
+HIGH_MM = 100.0
 
 
 def _to_mm(arr, stats):
     return inverse_transform(arr, "precipitation", stats).astype(np.float32)
+
+
+def _train_max(domain_dir):
+    """Largest finite IMERG value (mm/h) in a domain's training file. Non-finite
+    pixels count as 0, as in _transform_channel. The file also holds the
+    validation steps, so this is an upper bound on the training-split maximum
+    and frac_gt_train_max is conservative. Streams one 200-step chunk at a time:
+    a dask .max() over the whole store ran one chunk per node core and was
+    OOM-killed at 32 GB (job 20391536)."""
+    da = xr.open_zarr(Path(domain_dir) / "train_data_out.zarr", chunks=None)["precipitation"]
+    step, top = 200, 0.0
+    for i in range(0, da.sizes["time"], step):
+        a = np.asarray(da[i:i + step].values)
+        top = max(top, float(np.where(np.isfinite(a), a, 0.0).max()))
+    return top
 
 
 def main():
@@ -129,19 +154,36 @@ def main():
     preds = {k: np.concatenate(v) for k, v in preds.items()}
     print(f"{len(obs)} samples kept of {pos} (stride {args.stride})")
 
+    # Training maxima: each run is judged against its own source's, the
+    # observation against the target's.
+    tmax = {d: _train_max(data_root / d) for d in sorted({args.target, *(r["src"] for r in runs)})}
+    print("training maxima (mm/h): " + ", ".join(f"{d} {v:.2f}" for d, v in tmax.items()))
+
     out_dir.mkdir(parents=True)
     labels = [r["label"] for r in runs]
     fields = {"IMERG obs": obs, **preds}
+    (out_dir / "train_max.json").write_text(json.dumps(tmax, indent=2))
+
+    def _mse_log(a):
+        return np.mean((np.log(a + FLOOR_MM) - np.log(obs + FLOOR_MM)) ** 2)
 
     # Summary per run on the subset.
     with open(out_dir / "summary.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["label", "checkpoint", "mean_mm", "wet_frac_0.1", "p99_mm", "max_mm", "mse_log_e01"])
+        w.writerow(["label", "checkpoint", "mean_mm", "wet_frac_0.1", "p99_mm", "max_mm", "mse_log_e01",
+                    "train_max_domain", "train_max_mm", "frac_gt_train_max", "n_gt_train_max",
+                    f"frac_gt_{HIGH_MM:g}mm", "mean_mm_clamped", "mse_log_e01_clamped"])
         for name, a in fields.items():
-            ck = next((r["ckpt"] for r in runs if r["label"] == name), "")
-            mse = np.mean((np.log(a + FLOOR_MM) - np.log(obs + FLOOR_MM)) ** 2)
+            run = next((r for r in runs if r["label"] == name), None)
+            ck = run["ckpt"] if run else ""
+            dom = run["src"] if run else args.target
+            cap = tmax[dom]
+            above = a > cap
+            ac = np.minimum(a, cap)
             w.writerow([name, ck, f"{a.mean():.4f}", f"{(a > WET_MM).mean():.4f}",
-                        f"{np.percentile(a, 99):.3f}", f"{a.max():.2f}", f"{mse:.4f}"])
+                        f"{np.percentile(a, 99):.3f}", f"{a.max():.2f}", f"{_mse_log(a):.4f}",
+                        dom, f"{cap:.2f}", f"{above.mean():.3e}", int(above.sum()),
+                        f"{(a > HIGH_MM).mean():.3e}", f"{ac.mean():.4f}", f"{_mse_log(ac):.4f}"])
 
     # Fields at fixed quantiles of the observed field mean.
     fm = obs.mean(axis=(1, 2))
