@@ -608,6 +608,34 @@ met: **claim 3's UNet evidence is BatchNorm artefact.**
   re-estimates BN on source-only or FDA (cumulative average versus EMA). It would cost little and
   close the "re-estimation itself" objection.
 
+**Read 2026-11-23, source-BN control** (array 20811932, `scripts/unet_srcbn_control.sh`:
+`results/seed<N>_srcbnctrl/unet/none/` against `seed<N>_v3/` (none), `seed<N>_fdafix/` (fda)
+and `seed<N>_srcbn/`; `mse_log_e01`). The same procedure as `_srcbn` (reset, momentum=None, 200
+source train batches, torch seed 1000) applied to source-only and fixed FDA. Comparison script
+in the session scratchpad, not kept.
+- *Into europe\_west and horn.* Re-estimation moves source-only target scores by ≤ 0.001. The
+  objection is closed there: the 11-10 reading (the gains were BN mixing) stands.
+- *Source, in-domain.* Re-estimation is not neutral: it costs source-only +0.003 to +0.040
+  (melanesia seed 42 +0.040, europe\_west seed 42 +0.016). Against the control instead of
+  as-trained source-only, the `_srcbn` UDA dSrc stay within ±0.01, except melanesia→horn DANN and
+  MMD, which are 0.04–0.05 *better* than re-estimated source-only.
+- *Into melanesia: the 11-10 "methods beat source-only" was the re-estimation.* Re-estimation
+  alone improves source-only in all six pair×seed cells, by 0.013–0.044, the size of the 11-10
+  mean dTgt (−0.006 to −0.023). Against the control, horn→melanesia: all four methods worse
+  than source-only (mean +0.003 to +0.029, ≤ 1/3 seeds better). europe→melanesia: MMD +0.010
+  (1/3); DANN −0.021 and spectral −0.022, 2/3 seeds with the third of opposite sign at
+  ±0.05–0.11; joint\_ot −0.087, 3/3 (−0.058 / −0.193 / −0.009), the L4 case already flagged
+  (625 mm/h RMSE at seed 43). Claim 3 is stronger, but every `_srcbn` delta must be stated
+  against the `_srcbnctrl` source-only rows, not the as-trained ones.
+- *FDA is not a clean control arm.* Its running statistics are of target-styled source, so
+  re-estimating on raw source removes part of what FDA does. Into melanesia, FDA under the
+  control is worse than re-estimated source-only in all six cells (+0.03 to +0.13); into
+  europe\_west part of the gain survives (horn→europe seed 43 −0.022, melanesia→europe seed 42
+  −0.031, the rest ≈ 0). FDA has no target forward, so its as-trained rows stay the scored ones;
+  the arm says FDA's UNet effect runs partly through BN statistics of styled inputs.
+- *Caveat.* One draw of 200 batches per model. The variance of the re-estimation itself is not
+  measured and may account for part of the source-side moves up to 0.04.
+
 **Read 2026-11-10, fields** (job 20376532: `results/plots/compare_fields_srcbn_seed<S>/europe_west__to__melanesia/`,
 1 test sample in 10). IMERG has a wet fraction (> 0.1 mm/h) of 0.205, p99 5.8 and max 59 mm/h.
 The oracle is itself far too dry: wet 0.043–0.054, p99 0.42–0.63, max 17–41. Source-only is
@@ -856,6 +884,99 @@ australasia-east (southern-hemisphere subtropics). That gives 7 regions and 42 o
 - **What it can and cannot show:** this tests region-specificity, not dataset-specificity.
   Every pair is still ERA5→IMERG, and IMERG's error structure varies by region (gauge-adjusted
   over land, passive microwave over ocean). Only COSMO changes the dataset.
+
+**Revised 2026-11-17: R5, a 5-region RainShift matrix to mirror COSMO C3.** Two regions
+are added from the four pre-registered above, so the choice stays inside the list. The
+result is 5×5 matrices, the same figures as `figures/cosmo_c3/`, and a relabelling test
+with 120 orderings instead of 6.
+- **northamerica-east.** A mid-latitude, mostly frontal regime with mixed land and ocean,
+  the europe_west analogue. It gives RainShift the pair it lacks: one where little shift
+  is expected. COSMO had 10 of 20 pairs within noise and RainShift has none. If
+  europe_west ↔ northamerica-east also fails, the RainShift failure is not regime
+  distance but something every RainShift pair shares (region identity through statics,
+  or IMERG's region-dependent errors).
+- **west-africa.** Monsoon convection over land, with a strong dry season and wet season.
+  It falls between horn (dry, convective) and melanesia (wet, maritime) in wetness, so it
+  adds a middle point to the dry→wet axis behind the COSMO support-asymmetry hypothesis.
+  It also gives a land-convective counterpart to maritime melanesia.
+- **Not chosen.**
+  - tibetan-plateau: IMERG's passive-microwave retrievals are poor over snow and high
+    terrain, so target noise would be confounded with orography. RainShift's own ResNet
+    already blows up there.
+  - australasia-east: its stores have a different layout (`*_opt` variants, including
+    `test_data_in_opt`), and the southern-hemisphere season flips `tisr`, another
+    region-identity channel. It adds no axis the other two lack.
+- **Stats blocker, proposed fix.** Make an overlay root `data_rainshift_r5/<region>/` of
+  symlinks to the shared stores. The three existing regions also get a symlink to their
+  `normalization_stats.json`. The new regions' stats are computed into the overlay
+  directory, which is ours, so nothing is written into `raw_data/rainshift`. Check before
+  use that `ClimateSRDatasetZarr` writes the stats file to the root it was given and not
+  to a resolved path.
+- **Scope.**
+  1. Phase-1 source-only on the two new regions × seeds 42/43/44: 6 runs with the existing
+     phase-1 settings and no `--data_order_seed`, to stay comparable with the existing
+     RainShift seeds. Roughly 2–3 A100-h each, about 15 A100-h.
+  2. Score the 16 new cells × 3 seeds.
+  3. P1b and per-variable input W1 on the 7 new unordered pairs (CPU).
+  4. Trivial references (zero, climatology, bicubic ERA5 `tp`; bicubic is only a weak
+     reference here, see report/aies/NOTES.md).
+  5. The same figures.
+  6. Oracle and BN-fixed methods stay on the existing pairs unless the matrix shows a
+     new cell worth it.
+- **Open before launching.**
+  - NaN and range checks on the two new IMERG targets, inside a job.
+  - Whether the new runs go into `unet_seed<N>/` (new names, nothing overwritten) or a
+    side tree `unet_seed<N>_r5/`. The side tree is the safer default.
+- **Done 2026-11-17.**
+  - *Overlay.* `data_rainshift_r5/` holds symlinks to the shared stores. The three existing
+    regions also link their stats.
+  - *Stats job 20615520 (`rainshift_r5_stats.py`).* It recomputed europe_west in streamed
+    chunks and matched the cached file to 1.1e-15. It then wrote the stats for
+    northamerica-east and west-africa into the overlay.
+  - *Target checks* (`results/r5/target_check.json`, test mean / wet fraction):
+    - horn 0.055 / 0.045;
+    - west-africa 0.078 / 0.047;
+    - europe_west 0.097 / 0.099;
+    - northamerica-east 0.149 / 0.100;
+    - melanesia 0.313 / 0.205.
+
+    The wetness axis is well spread. Northamerica-east is about 1.5× wetter than europe_west,
+    so it is a regime analogue, not a wetness twin.
+  - *Non-finite target pixels in train:* west-africa 1,245, the same issue as melanesia
+    (2,387). The `_transform_channel` `nan_to_num` fix covers it. Every test split is clean.
+  - *Training.* Phase 1 runs as array 20615551 (A100, side tree `unet_seed<S>_r5/`), started
+    after the stats job.
+  - *Read 2026-11-23* (phase 1 done 2026-11-18; scoring array 20791976,
+    `results/seed<S>_r5/unet/none/`, 25 rows per seed, 17,520 test samples each).
+    `mse_log_e01`, mean (sd) over seeds 42/43/44, rows source, columns target:
+
+    | src \ tgt | europe\_west | horn | melanesia | NA-east | W-africa |
+    |---|---|---|---|---|---|
+    | europe\_west | **0.3046** (0.001) | 0.2236 (0.003) | 1.0686 (0.027) | 0.3757 (0.004) | 0.2783 (0.004) |
+    | horn | 0.4485 (0.000) | **0.2213** (0.002) | 0.9750 (0.032) | 0.5706 (0.002) | 0.2835 (0.004) |
+    | melanesia | 0.4485 (0.000) | 0.2277 (0.000) | **0.8788** (0.011) | 0.5657 (0.002) | 0.2799 (0.001) |
+    | NA-east | 0.3646 (0.009) | 0.2188 (0.001) | 0.8483 (0.023) | **0.3946** (0.004) | 0.2717 (0.002) |
+    | W-africa | 0.4458 (0.002) | 0.2215 (0.002) | 1.0357 (0.063) | 0.5624 (0.010) | **0.2739** (0.002) |
+
+    - The 3×3 block reproduces `seed<S>_v3` exactly: the three original regions are reused,
+      only northamerica-east and west-africa were trained.
+    - Much of the matrix is the zero field. Every tropical source predicts zero into
+      europe\_west (bias −0.097 = −mean) and northamerica-east (bias −0.148 = −mean). The horn
+      and west-africa columns each span ~0.01, and the horn diagonal's bias (−0.054) is the
+      zero predictor's too.
+    - NA-east as source beats the in-domain model on all three tropical targets: melanesia
+      0.848 vs 0.879 (also in mm: RMSE 1.252 vs 1.255, bias −0.253 vs −0.278), horn 0.2188 vs
+      0.2213, west-africa 0.2717 vs 0.2739 (the last two within ~1 sd). A negative gap leaves
+      λ̂ undefined there. Most likely reading: the tropical in-domain UNets are so dry that a
+      wetter source wins. To mirror COSMO C3 the table needs a zero-predictor row per target,
+      or it ranks dryness.
+    - **West-africa blows up in-domain.** Test RMSE 0.91 / 18.4 / 22.7 mm/h (seeds 42/43/44);
+      west-africa→melanesia 107 / 295 / 684 mm/h, bias +1.6 / +3.2 mm/h at seeds 43/44, log
+      score also worse (0.95–1.11); europe→west-africa 3.4 / 6.5 / 45.7 mm/h. The `nan_to_num`
+      fix is present (`dataset_zarr.py:84`, `:131`, and `rainshift_r5_stats.py`). Cause
+      unknown; until then the blow-up was only out of region. Next: `compare_fields.py` with
+      training-maximum columns on the west-africa diagonal. No west-africa row is quoted
+      before it.
 
 ## Dependencies
 

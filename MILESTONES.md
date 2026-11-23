@@ -7,17 +7,17 @@ is writing. The paper type is decided at the M2 gate. The experiment designs liv
 (RainShift) and PLAN_COSMO.md (COSMO); this file is only the calendar, the gates and the cuts.
 The skeleton is in `report/aies/main.tex`, and `report/aies/NOTES.md` maps lesson → evidence.
 
-Compute is not the constraint: about 60–80 A100-h for COSMO, plus a few short RainShift jobs
-(and 25–30 A100-h if the dose ladder runs). The constraint is that each step waits on the
-previous read. Read a job within a day of it finishing, and do not reopen a frozen item.
+Compute is not the constraint: about 60–80 A100-h for COSMO, plus a few short RainShift jobs.
+The constraint is that each step waits on the previous read. Read a job within a day of it
+finishing, and do not reopen a frozen item.
 
 **What changed on 2026-11-10.** With BatchNorm re-estimated on source, every UNet and AFM
 target-forward method behaves like source-only. The source cost and the target gains both
 came from BN mixing (PLAN.md, "Read 2026-11-10"). Claim 3 ("methods trade the source
 conditional for target risk") has no evidence left. It becomes L3's main evidence: the
 adaptation terms did not act. Whether a term that *does* act produces the trade that Zhao et
-al. (2019) predict is now an open experiment (the dose ladder below), gated on the feature
-probe.
+al. (2019) predict was to be the dose ladder; it was dropped on 2026-11-13 after the BN-fixed
+MMD replication read log-floor only (M2, B4.9).
 
 ## M1 — by 2026-11-30: RainShift closed, COSMO data built
 
@@ -48,9 +48,11 @@ RainShift, open (in this order):
       prediction did not move. Per-domain batch BN alone removes 97 % of the GAP distance, so
       every loss acted on a residual. By the rule, the ladder goes to the M2 gate, BN-fixed
       trainer only, arms DANN and MMD.
-- [ ] Source-BN control: re-estimate BN on source-only and FDA as well (cumulative average vs
-      EMA). It closes the "re-estimation itself did it" objection. `unet_srcbn_export.py`
-      refuses non-target-forward runs, so it needs a flag.
+- [x] Source-BN control (array 20811932, read 2026-11-23, PLAN.md). Closed into europe\_west and
+      horn (source-only moves ≤ 0.001). Into melanesia re-estimation alone improves source-only
+      by 0.013–0.044, so the 11-10 "methods beat source-only" goes; only joint\_ot
+      europe→melanesia (L4) survives. State `_srcbn` deltas against `_srcbnctrl` rows. FDA arm
+      is not a clean control (BN stats of styled source).
 - [ ] Rewrite claim 3 everywhere it appears: the CLAUDE.md "What this project is" (yours),
       `report/aies/main.tex` L3 and intro, and NOTES.md. "Trade" becomes "did not act; BN did",
       plus the Zhao lower bound as the reason a working alignment would not help either.
@@ -82,15 +84,14 @@ COSMO:
       20467868–73): reading 2, log-floor only. Recovery 1.00 / 0.99 / 1.03 into melanesia,
       mm fails in 2 of 3 seeds (seed 43 blows up), horn→europe unchanged (zero predictor).
       The dose ladder is dropped. Open: a trivial-wetting reference before the L3 sentence.
-      AFM trainer not changed (only needed for the optional M4 run). The dose ladder and C5's
-      MMD wait on this.
+      AFM trainer not changed (only needed for the optional M4 run). C5's MMD waits on this.
 - [ ] FSS and RAPSD in `evaluate.py`, once, for both datasets. Needs no `train_time_index` fix.
-- [ ] Before C3: let `--seed` reach the COSMO data order. *Flag written 2026-11-13:*
+- [x] Before C3: let `--seed` reach the COSMO data order. *Flag written 2026-11-13:*
       `train_unet.py --data_order_seed` (off by default; train splits only, recorded in
-      config.json). Not yet run; the COSMO C3 launcher must pass it. Generalise the `train_half` branch
-      of `build_loaders` (`ds.seed = args.seed` after construction, so shuffle follows the seed
-      and the validation offset stays seed 42's) into a flag, and use it for every COSMO run.
-      COSMO has no earlier runs to stay comparable with. RainShift stays as is; the paper states
+      config.json). *Used by C3:* `cosmo_c3.sh` passes it, and all 75 run directories in
+      `unet_cosmo_seed<S>/` record `"data_order_seed": true` (checked 2026-11-21). Shuffle
+      follows the seed and the validation offset stays seed 42's. COSMO has no earlier runs to
+      stay comparable with. RainShift stays as is; the paper states
       that its seed spread is initialisation (plus GPU nondeterminism) only, not data order
       (Tom, 2026-11-12: "weights initialization, stochastic optimization").
 - [ ] Read the oracle source-cost column in `seeds_42_43_44_unet_mse_std` against seed sd. If
@@ -116,23 +117,22 @@ COSMO:
       - 4 large: poland or spain_central into british_isles or scandinavia_south, 0.14–0.20
         against 0.045–0.049 in-domain, seed sd 0.05–0.06, worse than bicubic `tp`.
 
-      Not a null for the A3 gate. Open: check the maxima and wet fraction on the four large
-      cells (compare_fields), because RMSE up to 6.8 mm/h suggests blow-up pixels.
+      Not a null for the A3 gate. Maxima and wet fraction: compare_fields 20613827, read
+      2026-11-17 (PLAN_COSMO.md C3 point 8). Rare blow-ups (≤ 28 per million pixels, up to
+      56,665 mm/h) explain the RMSE but not the cost. The cost is missing rain occurrence:
+      wet fraction 0.050–0.094 against 0.11–0.135 true. Seeds differ in how dry they
+      extrapolate.
 - [ ] **Gate, with Tom, before the break.**
   - Lessons Learned (default).
   - A full AIES Article only if C2–C3 contrast cleanly with RainShift: either no conditional
     excess and small or closable gaps on COSMO, or a clear conditional shift even in the
     perfect model.
-  - **The dose ladder: run or drop.** The probe read (a) (2026-11-11), so it is on the table:
-    MMD and DANN on the BN-fixed trainer, 4 pre-registered weights (spaced up to a visible source cost), europe→melanesia
-    and horn→europe, seed 42, about 16 runs and 25–30 A100-h. Every weight is reported with
-    feature MMD and domain-classifier accuracy. The best weight in hindsight appears only as
-    an upper bound that used target labels. This is not tuning: nothing is selected.
-    *Against it (Tom, 2026-11-12: the trade-off is sensitive to the pair and the seed).* One
-    draw per weight cannot show a curve when the method ordering already flips across seeds
-    (L5). A robust version is ≥ 3 seeds × 2 pairs, about 48 runs and 75 A100-h, for a curve
-    Zhao et al. (2019) already predict. Recommendation: drop it, and carry the trade-off with
-    the toy problem below.
+  - ~~The dose ladder: run or drop.~~ *Dropped 2026-11-13, not a gate question any more.* The
+    BN-fixed MMD replication read reading 2, log-floor only (B4.9 above, PLAN.md readings).
+    Tom's objection (2026-11-12) stands as well: one draw per weight cannot show a curve when
+    the method ordering flips across seeds, and the robust version (≥ 3 seeds × 2 pairs, ~75
+    A100-h) buys a curve Zhao et al. (2019) already predict. The trade-off is carried by the
+    toy problem below.
   - **Toy problem (Tom, 2026-11-12).** Two-feature linear regression: collinear in the
     source, decorrelated in the target, so the source loss is flat along one direction while
     the target loss is not, and no marginal alignment picks that direction without labels.
@@ -149,8 +149,6 @@ COSMO:
 
 - [ ] C4: oracle on 4 pairs (seeds 43/44 only if λ̂ is near noise).
 - [ ] C5: FDA, AdaBN, few-shot N = 10 / 100 on the same pairs; MMD only with the BN-fixed pass.
-- [ ] If the gate approved it: the dose ladder (RainShift), then its read with `compare_fields`
-      (wet fraction, max, above-training-max).
 - [ ] C7: PGW +3K on Spain and Scandinavia (preprocess, score, one oracle per region).
 
 ## M4 — February 2027: figures, frozen numbers, buffer
@@ -173,8 +171,7 @@ Fill `report/aies/` lesson by lesson; abstract and significance statement last.
 - The old draft's multi-source disagreement, physical-prior check and regime-decomposed λ_k.
 - C6 (AFM on COSMO), unless C3 shows the dry-collapse or zero-predictor pattern again.
 - C8 (no statics), unless C2 points at orography.
-- Any new UDA method or weight tuning (PLAN.md "Out of scope"). One exception: the pre-registered
-  dose ladder, if the M2 gate approves it. Its premise changed on 2026-11-10: the methods were
-  not "doing what they claim".
+- Any new UDA method or weight tuning (PLAN.md "Out of scope"). The one exception considered, the
+  pre-registered dose ladder, was dropped on 2026-11-13 (M2, B4.9).
 - Changing the training transform (ε = 1e-5 is RainShift's). The clamp at the training maximum is
   an evaluation robustness row, not a retraining.
