@@ -107,6 +107,10 @@ def compute_metrics(pred, true):
 
 
 def _infer_model_type(exp_dir_name):
+    """afm_* -> AFM, cfm_* -> plain conditional flow matching (AFMModel
+    mode="cfm", PLAN_COSMO.md C6), anything else -> UNet."""
+    if exp_dir_name.startswith("cfm_"):
+        return "cfm"
     return "afm" if exp_dir_name.startswith("afm_") else "unet"
 
 
@@ -132,6 +136,13 @@ def load_model(model_type, checkpoint, device, base_features=32):
         # A masked-input checkpoint (PLAN.md P19) carries its keep vectors.
         keep = {k: clean[k] for k in ("dyn_keep", "stat_keep") if k in clean}
         model = DualEncoderUNet(9, 2, 1, base_features, **keep)
+    elif model_type == "cfm":
+        # cond_ch is recorded in the run's config.json next to the checkpoint
+        # (train_afm.py writes vars(args)); the state dict alone does not
+        # carry it in a form worth parsing.
+        cfg = Path(checkpoint).parent / "config.json"
+        cond_ch = json.loads(cfg.read_text()).get("cond_ch", 8) if cfg.exists() else 8
+        model = AFMModel(9, 2, 1, base_features, mode="cfm", cond_ch=cond_ch)
     else:
         model = AFMModel(9, 2, 1, base_features, encoder_loss_weight=0.1)
     model.load_state_dict(clean)
@@ -287,7 +298,7 @@ def evaluate_model(
             s_bias += float((p_mm - t_mm).sum())
             n_phys += p_mm.size
 
-        if model_type == "afm" and n_ensemble > 0:
+        if model_type in ("afm", "cfm") and n_ensemble > 0:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 samples = model.sample(x, s, n_samples=n_ensemble, steps=sample_steps, generator=ens_gen)
             # Scored per batch: the ensemble for a whole split does not fit
@@ -498,7 +509,7 @@ def append_csv(csv_path, row):
 
 
 def parse_exp_name(name):
-    name = name.removeprefix("afm_")
+    name = name.removeprefix("afm_").removeprefix("cfm_")
     m = re.match(r"(.+?)__to__(.+?)__(.+)", name)
     if m:
         return m.group(1), m.group(2), m.group(3)
