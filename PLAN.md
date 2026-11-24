@@ -50,6 +50,16 @@ Decided 2026-09-30: seed five more methods, FDA, spectral, AdaBN, DANN and MMD. 
 
 **Hardware and software check (2026-09-30, job 65226160).** Phase 2 moves to the A100 `gpu` partition with the dl-torch env (torch 2.13, Python 3.14), while everything already trained used GH200 with the container (torch 2.9, Python 3.12). Seed-42 europe→horn joint_ot was re-trained on an A100 into `unet_seed42_a100check/`. Same seed, same split, same hyper-parameters, and the training trajectory reproduces the GH200 run. Task loss agrees to 1e-4 to 4e-4 per epoch (0.6191 vs 0.6190 at epoch 1, 0.5119 vs 0.5117 at epoch 11). Between seeds it differs by about 3e-3. The best validation epoch is the same (6), and so is the early stop (11). Best validation loss is 0.6969 against 0.6949 on GH200. Two GH200 runs of the same seed differed by 0.0013, and the GH200 seed range is 0.671–0.695. At the level of training and validation loss the hardware-and-software change is an order of magnitude below seed variance. The test metrics of this checkpoint were not evaluated. It fits in the A100's 40 GB, and DANN and MMD have the same two-forward memory footprint. It costs 942 s per epoch against 530 s on GH200, 1.8× slower, so a run that stops at epoch 11 takes about 2.9 h, and 25 epochs would take 6.5 h, inside the 12 h limit. Phase 2 on A100 therefore costs about 1.8× the GPU-hours of GH200.
 
+**P8 read 2026-11-24** (job 20811933, `scripts/p8_a100check.sh`: `results/seed42_a100check{,_srcbn}/unet/none/`
+against `seed<S>_v3/` and `seed<S>_srcbn/`, europe→horn joint\_ot, `mse_log_e01`). As trained,
+A100 − GH200 at seed 42 is −0.0044 on source and −0.0008 on target; the GH200 seed range is
+0.387–0.414 (source) and 0.2275–0.2314 (target), so the stack is 0.17× and 0.21× of it. With
+source BN, −0.0007 and +0.0022 against seed ranges 0.302–0.315 and 0.209–0.228 (0.05× and
+0.12×). Limitations sentence: the GH200/A100 stack difference is a fifth of the seed range or
+less. But the source-BN target difference (+0.0022) is the size of the whole into-horn budget
+(0.002–0.004), so no method comparison into horn is resolved across stacks — which the
+source-BN read already found to be noise.
+
 Done when the transfer matrix and the per-method recovery table are reported as mean ± standard deviation over seeds 42/43/44, and the method ordering is either stable or the instability is stated in the text.
 
 **Seed variance is initialisation variance only.** `--seed` never reaches the dataset (see CLAUDE.md, traps), so all seeded runs share the validation split and the data order. Only the weight initialisation and cuDNN nondeterminism differ. Say so in the methods section. The error bars are narrower than a full re-draw of the training procedure would give. Fixing it now would make the remaining runs incomparable with the finished ones. If it is fixed, re-run everything.
@@ -636,6 +646,21 @@ in the session scratchpad, not kept.
 - *Caveat.* One draw of 200 batches per model. The variance of the re-estimation itself is not
   measured and may account for part of the source-side moves up to 0.04.
 
+**P12 read 2026-11-24, Kendall's W over seeds** (target `mse_log_e01`, per off-diagonal
+pair, m = 3 seeds; ties by exact score; comparison awk in the session scratchpad, not kept).
+χ² = m(n−1)W with df n−1 is only an approximation at m = 3.
+- *As trained* (n = 7: none, fda from `fdafix`, spectral, adabn, dann, mmd, joint\_ot):
+  W = 0.75 e→h, 0.61 e→m, 0.84 h→e, 0.94 h→m, 0.92 m→e, 0.67 m→h. Four of six pass the
+  χ² approximation at 0.05 (critical W ≈ 0.70); 11–18 of 21 method pairs keep their order in
+  all three seeds. The old "ordering not stable" was wrong for as-trained scores.
+- *Source BN* (n = 5: `_srcbnctrl` source-only, dann, mmd, joint\_ot, spectral from `_srcbn`):
+  W = 0.18–0.48, none passes (critical W ≈ 0.79); 1–4 of 10 pairs stable.
+- *Reading.* The seed-stable ordering is the BN-mixing ordering. Once BN is re-estimated on
+  source, the methods cannot be told apart across seeds. This backs claim 3 (and L4) better
+  than an "unstable ordering" sentence would: the stable ranking was the BN artefact, not the
+  alignment terms. Stable vs source-only under source BN: joint\_ot better on e→m (the L4
+  case), mmd/dann better on m→h (by ≤ 0.003); mmd worse on h→e, spectral/dann worse on h→m.
+
 **Read 2026-11-10, fields** (job 20376532: `results/plots/compare_fields_srcbn_seed<S>/europe_west__to__melanesia/`,
 1 test sample in 10). IMERG has a wet fraction (> 0.1 mm/h) of 0.205, p99 5.8 and max 59 mm/h.
 The oracle is itself far too dry: wet 0.043–0.054, p99 0.42–0.63, max 17–41. Source-only is
@@ -977,6 +1002,53 @@ with 120 orderings instead of 6.
       unknown; until then the blow-up was only out of region. Next: `compare_fields.py` with
       training-maximum columns on the west-africa diagonal. No west-africa row is quoted
       before it.
+  - *Read 2026-11-24, west-africa fields* (array 20896714, `scripts/compare_fields_r5_wafr.sh`,
+    stride 1, `results/plots/compare_fields_r5_seed<S>/west-africa__to__{west-africa,melanesia}/`;
+    35–37 GB peak RSS). Training maxima: west-africa 122.4, melanesia 152.6, europe\_west
+    83.4 mm/h.
+    - *The in-domain west-africa model is the zero field plus a few exploding pixels.* Test
+      obs: mean 0.078 mm/h, wet fraction 0.047, p99 2.3, max 61 (below the training maximum).
+      In-domain (seeds 42/43/44): mean 0.003 / 0.017 / 0.020, wet fraction 0.002–0.003, p99
+      0.007–0.012; 849 / 3,893 / 4,841 pixels above the training maximum (1–7×10⁻⁶), max
+      2,228 / 92,629 / 109,731 mm/h. Clamped, the mean is 0.003–0.005 and `mse_log_e01` does not
+      move. The 18–23 mm/h RMSE is those pixels; the 0.274 diagonal is a dry predictor's score.
+      For comparison the melanesia diagonal is ~10× too dry (mean 0.03–0.04 vs 0.31) but does
+      not blow up (≤ 324 pixels, max 384).
+    - *west-africa→melanesia is the worst extrapolation seen so far.* 1.4×10⁻⁴ to 1.9×10⁻³ of
+      pixels above the training maximum (up to 1.3 M pixels), max 0.36 / 0.99 / 1.39 M mm/h,
+      mean 0.30 / 1.90 / 3.55 raw and 0.10–0.68 clamped. 10–20× europe→melanesia's fraction.
+      Clamping moves its `mse_log_e01` by up to 0.023, so the log floor does not protect it.
+    - *Consequence.* West-africa is no target-side reference: its diagonal is a dry model, and
+      every west-africa row carries the clamped numbers beside it.
+    - *Not established:* why an in-region model extrapolates. This job measured outputs only.
+      Working hypothesis, untested: test-period inputs (tcw or cape most likely) outside
+      west-africa's training range. Check: per-channel input ranges, test vs train, CPU job.
+      *Submitted 2026-11-24:* array 20900124 (`scripts/rainshift_input_ranges.sh`,
+      `rainshift_input_ranges.py`), four stats regions, into `results/r5/input_ranges/<region>/`.
+      Also records the smallest positive decoded `tp`/`cp` per store (the int16 packing differs
+      per file, so the dry floor after the log can differ between train and test).
+  - *Read 2026-11-24, trivial references* (job 20811934, `scripts/rainshift_refs.sh`,
+    `results/rainshift_references/references.csv`, test split, 0.1 mm floor).
+    `mse_log_e01` of zero / bicubic ERA5 `tp` / train climatology, and the in-domain UNet's
+    skill over zero:
+
+    | target | zero | bicubic tp | climatology | in-domain UNet | skill over zero |
+    |---|---|---|---|---|---|
+    | europe\_west | 0.4488 | 0.4357 | 0.6702 | 0.3046 | 32 % |
+    | horn | 0.2320 | 0.3346 | 0.4077 | 0.2213 | 4.6 % |
+    | melanesia | 1.1882 | 1.2329 | 1.7180 | 0.8788 | 26 % |
+    | NA-east | 0.5819 | 0.5196 | 0.9840 | 0.3946 | 32 % |
+    | W-africa | 0.2932 | 0.3817 | 0.5320 | 0.2739 | 6.6 % |
+
+    - Horn and west-africa in-domain UNets are 5–7 % better than predicting zero. The whole
+      horn column spans 0.219–0.228 and the west-africa column 0.272–0.284, against zero at
+      0.232 and 0.293 (NA-east beats in-domain in both): there is no room for a method to show
+      anything into either.
+    - Into europe\_west, horn/melanesia/west-africa sources score 0.4458–0.4485 against zero's
+      0.4488: they are the zero predictor. Into NA-east the tropical sources (0.553–0.571) beat
+      zero by 2–5 %.
+    - Climatology is worse than zero everywhere in the log floor; bicubic `tp` beats zero only in
+      the extratropics (europe\_west, NA-east).
 
 ## Dependencies
 

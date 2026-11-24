@@ -56,14 +56,15 @@ RainShift, open (in this order):
 - [ ] Rewrite claim 3 everywhere it appears: the CLAUDE.md "What this project is" (yours),
       `report/aies/main.tex` L3 and intro, and NOTES.md. "Trade" becomes "did not act; BN did",
       plus the Zhao lower bound as the reason a working alignment would not help either.
-- [ ] Regenerate every table at 0.1 mm/h with mm bias / wet fraction / max / above-training-max
-      columns, from `seed<S>_v3/`, `seed<S>_fdafix/`, the `_srcbn` trees, the oracle trees and the
-      AFM trees. The `_srcbn` rows sit next to the as-trained ones.
-- [ ] P8: test metrics of `unet_seed42_a100check/` (limitations sentence).
-- [ ] GAP ablation: re-score at D1 (A9), or keep only the sentence its `mse_std` reading
-      supports. Wait for the probe: (b)/(c) gives the ablation a role again.
-- [ ] Zero / climatology references at 0.1 mm (L4).
-- [ ] P12 (Kendall's W over seeds): one afternoon, backs L4.
+- Table regeneration: deferred to M4 on 2026-11-24 (see there).
+- [x] P8 (job 20811933, read 2026-11-24, PLAN.md): the stack difference is ≤ 0.21× the GH200
+      seed range, but with source BN it equals the into-horn budget.
+- [x] GAP ablation: keep only the sentence its `mse_std` reading supports. Decided 2026-11-24
+      by the rule above: the probe gave reading (a), not (b)/(c).
+- [x] Zero / climatology references at 0.1 mm (job 20811934, read 2026-11-24, PLAN.md R5):
+      horn and west-africa in-domain UNets are 5–7 % better than zero.
+- [x] P12 (read 2026-11-24, PLAN.md): as trained W = 0.61–0.94, with source BN 0.18–0.48. The
+      stable ordering was BN mixing.
 
 COSMO:
 - [x] C1 build: months array 20348663 and merge 20348664 completed 2026-11-09. Five stores are in
@@ -72,7 +73,8 @@ COSMO:
 - [x] C2: shift diagnosis (job 20502163, read 2026-11-16, PLAN_COSMO.md). (cape, tcw): clear
       excess in 7 of 10 pairs of the perfect model; (tp, cape) on fine pixels: 1 clear, 5 weak,
       4 within. The (cape, tcw) excess is mostly projection, so claim 1 / L1 becomes an upper
-      bound. Open: RainShift (tp, cape) as the control (one CPU job).
+      bound. Open: RainShift (tp, cape) as the control (one CPU job). *Submitted 2026-11-24:*
+      array 20901937, `scripts/rainshift_c2_tp_cape.sh` (P1b settings, block and fine).
 
 ## M2 — by 2026-12-18: C3 and the paper-type gate
 
@@ -157,6 +159,13 @@ COSMO:
       side that the source-BN re-scoring cannot. Drop it if the ladder ran and read cleanly: the
       UNet ladder already answers "does a working term act".
 - [ ] Fix `train_time_index`, then the case-study panel.
+- [ ] Regenerate every table at 0.1 mm/h with mm bias / wet fraction / max / above-training-max
+      columns, from `seed<S>_v3/`, `seed<S>_fdafix/`, the `_srcbn` and `_srcbnctrl` trees, the
+      oracle trees and the AFM trees. The `_srcbn` rows sit next to the as-trained ones and are
+      compared with `_srcbnctrl` source-only. *Moved from M1 2026-11-24.* `evaluate.py` writes
+      no wet fraction, maximum or above-training-max columns (only `compare_fields.py` does):
+      needs them in `evaluate.py` (which also carries uncommitted cfm changes) plus a GPU
+      re-score of every tree, or a compare_fields pass per tree.
 - [ ] All paper figures and tables generated from scripts, with numbers frozen.
 - [ ] Rest is buffer.
 
