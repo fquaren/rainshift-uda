@@ -10,7 +10,7 @@ The paper is a diagnosis, not a method. Nothing below needs a UDA method to work
 
 | # | Claim | Evidence it needs | Status |
 | --- | --- | --- | --- |
-| 1 | The three domain pairs differ in P(Y\|X), not only in P(X) | Null-calibrated matched-input W1\_cond, plus the model-based 9D diagnostic as corroboration, plus input QM (P15) recovering little | **Holds for two pairs; horn↔melanesia undetermined (2026-11-02).** P1b (conditional-permutation null, 0.1 mm floor, controls pass): europe↔horn clear excess (W1\_cond 0.281 against null 0.032, p = 0.010, full support); europe↔melanesia clear but at 58 % support; horn↔melanesia none (p = 0.71, every statistic). All are upper bounds on (cape, tcw) only. P2 (9-D, model-based) cannot decide: the domains are perfectly separable on their inputs (AUC 1.000, overlap 1–157 of 17,520 samples), and its positive control registers a planted ×1.5 shift as R = 1.02, the size of horn↔melanesia's R = 1.01–1.05. Input QM (P15) recovers at most 0.9 of oracle gaps of 2.7–5.6 in `mse_log`. Likely framing: on RainShift, conditional shift and lack of support cannot be separated for the tropical pair. Superseded: the pixel-null 86.9× / 14.5× and the P1 week-null factors |
+| 1 | The three domain pairs differ in P(Y\|X), not only in P(X) | Null-calibrated matched-input W1\_cond, plus the model-based 9D diagnostic as corroboration, plus input QM (P15) recovering little | **Holds for two pairs on (cape, tcw); on (tp, cape) all three pairs show excess, horn↔melanesia included (2026-11-24, upper bound, `tp` mismatch uncalibrated; see "Read 2026-11-24, (tp, cape) control").** Earlier status, horn↔melanesia undetermined (2026-11-02): P1b (conditional-permutation null, 0.1 mm floor, controls pass): europe↔horn clear excess (W1\_cond 0.281 against null 0.032, p = 0.010, full support); europe↔melanesia clear but at 58 % support; horn↔melanesia none (p = 0.71, every statistic). All are upper bounds on (cape, tcw) only. P2 (9-D, model-based) cannot decide: the domains are perfectly separable on their inputs (AUC 1.000, overlap 1–157 of 17,520 samples), and its positive control registers a planted ×1.5 shift as R = 1.02, the size of horn↔melanesia's R = 1.01–1.05. Input QM (P15) recovers at most 0.9 of oracle gaps of 2.7–5.6 in `mse_log`. Likely framing: on RainShift, conditional shift and lack of support cannot be separated for the tropical pair. Superseded: the pixel-null 86.9× / 14.5× and the P1 week-null factors |
 | 2 | The gap is reducible in principle but not identifiable from unlabelled target data | Oracle joint training recovering target in-domain risk, giving λ̂ ≈ 0, repeated over seeds; the few-shot label curve (P16) as its constructive counterpart; the input-set ablation (P19), because the statics make the domain readable from X and λ̂ ≈ 0 may only mean the network fits two conditionals | **Holds into the tropics, not into europe\_west (2026-11-02, 3 seeds, `mse_log_e01`).** Into melanesia and horn the oracle reaches in-domain (λ̂ −0.045 to 0.056; into horn there is no source-only gap to explain at this floor). Into europe\_west λ̂ = 0.032–0.056, 22–39 % of the source-only gap, every seed. P16: 2,000 labelled target samples (10 chunks) bring the source-only model to the oracle on every pair; 20,000 do no better; into europe\_west fine-tuning also stops at the oracle, not at in-domain. The 1-chunk arm overfits (14/18 runs with absurd mm bias) and is not a data point. P19, 3 seeds: the seed-42 λ̂ rise under `mask_shift` does not replicate (0.33 / 0.29 / 0.09); robust is a gap shrink of ~40 %, half of it in-domain skill lost. Withdrawn: "λ̂ ≈ 0 holds for the 11-input set, not for the task". Earlier `mse_log` (1e-5) numbers: λ̂ 0.4–6 % of the gap in five pairs, 18 ± 9 % in horn→melanesia |
 | 3 | Methods fail by trading the source conditional for target risk, and feature alignment is structurally blocked | Source inflation against budget recovery, spectral shape loss, the JDOT feature-term share, and a GAP ablation | Partial. GAP ablation done (2026-10-06, Stage 2 panel c Result): GAP alignment is inert, grid4 alignment trades source for target in 3 seeds, the effect rule hinges on seed 42, so "structurally blocked" needs rewording. Seeded numbers show a trade only into europe\_west and harm elsewhere, so the claim needs rewording (Stage 0, seed aggregate). The zero-rain check (P3, read 2026-10-27) explains the Europe-target gains as a log-floor artefact. Every foreign model into europe\_west predicts ≤ 3 % of the observed rain. The methods raise the near-zero floor, which pays in log(P + 1e-5). With a 0.01 mm floor the horn→europe gains fall to 0.02–0.10 of a 0.68 gap, and the melanesia→europe ordering changes (P14). The figure and the falsification do not exist. *2026-11-02, at the 0.1 mm headline:* recovery into horn is undefined (gap 0.002–0.011); into europe\_west the melanesia source-only model is the all-zero predictor, so recovery there measures leaving zero (FDA fix: 0.3 % wet pixels against 9.9 %). FDA fix pays more on the source than it gains on the target. DANN (ratio 1 and 0.5) produces models with 10³–10⁶ mm/h pixels that the log floor rewards; ratio 0.5 is dropped (0.38 / 0.38 / −0.32). Every log-floor number needs a mm-space or wet-fraction row beside it |
 | 4 | The failure is a property of the task, not of the MSE objective | The same diagnosis on a flow-matching model, with the risk redefined in CRPS | **Half done (2026-11-02, seed 42).** AFM phase 1 (LR 1e-4, ratio 1.0, EMA 0.999) passes acceptance on test: CRPS\_std 0.200 / 0.167 / 0.293 against UNet MAE\_std 0.423 / 0.339 / 0.543 (europe, horn, melanesia); its μ is a worse point forecast than the UNet. Source-only transfer gaps in `crps_log_e01` have the UNet's shape (into melanesia 0.348 / 0.333 against 0.276; into europe\_west 0.197 / 0.195 against 0.121), and tropical sources into europe\_west collapse the ensemble to near-dry members (spread 0.011 mm against 0.102). The oracle is trained; its test scoring (66790277) gives λ̂\_CRPS. Phase 2 waits on D2. Motivation sharpened by the field plots: every UNet, in-domain included, predicts ~13 % of melanesia's rain and a quarter of its wet pixels, so the UNet's numbers compare degrees of dryness |
@@ -661,6 +661,36 @@ pair, m = 3 seeds; ties by exact score; comparison awk in the session scratchpad
   alignment terms. Stable vs source-only under source BN: joint\_ot better on e→m (the L4
   case), mmd/dann better on m→h (by ≤ 0.003); mmd worse on h→e, spectral/dann worse on h→m.
 
+**Read 2026-11-24, (tp, cape) control for COSMO C2** (array 20901937,
+`scripts/rainshift_c2_tp_cape.sh`; `unet/conditional_shift_binned_p1b_tp_cape_{block,fine}.json`,
+logs `/scratch/fquareng/outputs/20901937_{0,1}`). P1b settings, only the conditioning set
+changes; the unit tests passed in both tasks. `log_e01`, obs / null mean (null p95):
+
+| pair | block (40×40) | fine (6 px/cell) | bins | P1b (cape, tcw) |
+|---|---|---|---|---|
+| europe↔horn | 0.101 / 0.045 (0.055) | 0.095 / 0.040 (0.050) | 12 | 0.281, p 0.010 |
+| europe↔melanesia | 0.057 / 0.024 (0.037) | 0.056 / 0.020 (0.029) | 20 | 0.457, 58 % support |
+| horn↔melanesia | 0.105 / 0.021 (0.032) | 0.103 / 0.018 (0.030) | 20 | 0.066, p 0.71 |
+
+- All six at p = 0.010 (the floor of 100 permutations), support 100 %, bootstrap CIs above the
+  null p95, in every statistic (wet fraction, wet W1, both floors). Block and fine agree within
+  ~6 %. The one-domain half-size nulls are 0.001–0.026 against cross-half 0.056–0.104.
+- *Unlike COSMO.* There, conditioning on coarse precipitation removed most of the (cape, tcw)
+  excess. Here the europe pairs shrink (0.28 → 0.10, 0.46 → 0.06) but stay clear, and
+  horn↔melanesia goes from none to ~5× its null. The plausible difference: RainShift `tp` is
+  ERA5, not the target's block mean, so P(Y | tp, cape) differing includes a regional ERA5→IMERG
+  relation. For claim 1 that is a real P(Y|X) difference, the map the model must learn.
+- *Caveats.* Still an upper bound on two binned inputs. `tp` is the strongest predictor of y,
+  and the fine sub-bins leave a within-bin `tp` mismatch of 0.08–0.14 sd (coarse 0.12–0.21;
+  `cape` coarse 0.46 sd on europe↔melanesia, fine 0.15). The permutation null keeps fine
+  sub-bin composition, but residual `tp` mismatch inside a sub-bin can produce excess that
+  `cape` mismatch would not; how much is not calibrated. Conditioning on (cape, tcw) and on
+  (tp, cape) asks different questions: neither implies shift given the full X, and their
+  disagreement on horn↔melanesia is not a contradiction. p sits at its floor.
+- *Consequence for claim 1.* horn↔melanesia moves from "undetermined" to "excess on (tp, cape),
+  upper bound". Word it that way; do not call it established without a calibration of the
+  within-sub-bin `tp` mismatch (e.g. a pure-covariate-shift positive control built on `tp`).
+
 **Read 2026-11-10, fields** (job 20376532: `results/plots/compare_fields_srcbn_seed<S>/europe_west__to__melanesia/`,
 1 test sample in 10). IMERG has a wet fraction (> 0.1 mm/h) of 0.205, p99 5.8 and max 59 mm/h.
 The oracle is itself far too dry: wet 0.043–0.054, p99 0.42–0.63, max 17–41. Source-only is
@@ -1027,6 +1057,23 @@ with 120 orderings instead of 6.
       `rainshift_input_ranges.py`), four stats regions, into `results/r5/input_ranges/<region>/`.
       Also records the smallest positive decoded `tp`/`cp` per store (the int16 packing differs
       per file, so the dry floor after the log can differ between train and test).
+    - *Read 2026-11-24, input ranges* (array 20900124, `results/r5/input_ranges/<region>/`
+      `ranges.csv`, `exceed.csv`, `<entry>_tmax.npy`). **The hypothesis is weak.** In
+      west-africa units, west-africa's own test split leaves the training range only in
+      `cape`: 7×10⁻⁸ of pixels (~8 pixels) in ~2 timesteps, up to +2.8σ beyond the training
+      maximum. Europe's own test split leaves its range by more (`tclw` +6.2σ, `tcw` +3.8σ) and
+      the europe in-domain model does not blow up; horn and melanesia test splits do not leave
+      theirs at all. So in-region exceedance neither is large in west-africa nor predicts a
+      blow-up elsewhere. The int16 dry floor is identical in every store (smallest positive
+      `tp` 9.69×10⁻⁴, `cp` 2.99×10⁻⁴ after ×1000), so packing is ruled out. Out of region the
+      exceedance is large, as expected: west-africa→melanesia in west-africa units has `sp`
+      below the training minimum in every frame (0.9 % of pixels, to −4.3σ), `cape` to +5.2σ in
+      0.4 % of steps, `tisr` above range in 5 % of steps; europe→melanesia in europe units has
+      `tcw` above range in 69 % of steps (to +6.5σ) and `tclw` to +15.7σ, yet blows up 10–20×
+      less than west-africa→melanesia. *Not established:* whether the ~2 `cape` timesteps are
+      the blow-up timesteps; that needs per-timestep output maxima (one GPU pass, not
+      submitted). Until then the west-africa in-domain blow-up is unexplained, and exceedance
+      in σ is not a usable predictor of blow-up across sources.
   - *Read 2026-11-24, trivial references* (job 20811934, `scripts/rainshift_refs.sh`,
     `results/rainshift_references/references.csv`, test split, 0.1 mm floor).
     `mse_log_e01` of zero / bicubic ERA5 `tp` / train climatology, and the in-domain UNet's

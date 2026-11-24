@@ -103,3 +103,28 @@ autoregressive emulators). Worth reading for length and tone.
   10⁵–10⁶ mm/h pixels. The extremes come from extrapolation (tcw +4.4σ) through exp with
   σ_log = 3.7; RainShift's own ResNet does the same (18,113 mm/h CRPS, Tibetan Plateau).
 - Setup sentence: RainShift clips ERA5 precipitation inputs to IMERG's range; we do not.
+- **Candidate section: "complex topography is hard" (2026-11-17, from COSMO C3).**
+  - *Evidence.* Every source into the Alps costs +8 % to +26 %, wet sources included. The
+    Alps as source cost +26–31 % going wet→dry, the only wet→dry cells with a clear cost.
+    The Alps also have the worst in-domain score (0.062).
+  - *Caveat, which decides whether it can be a section.* It is one region. Topography is
+    confounded with everything else about the Alps: the wettest region, summer convection,
+    and the largest `sp` spread. A claim about topography needs a second complex-terrain
+    region against a flat one with similar wetness.
+  - *Where that region could come from.* Within COSMO, a further C1 build (e.g. the
+    Pyrenees, the Carpathians or western Norway, if inside the COSMO domain). On RainShift,
+    tibetan-plateau, which IMERG's poor high-terrain retrievals confound. Until then it is
+    an observation in the COSMO paragraph, not a section.
+- **The bicubic-`tp` reference means different things in the two datasets (2026-11-17).**
+  Methods text and any figure that puts both side by side must say so.
+  - *COSMO (perfect model).* The coarse input `tp` is the exact 10×10 block mean of the
+    2.2 km target (checked: block error 0, bias 0). Bicubic `tp` is therefore a strong
+    reference. It gets most of the log-floor score (0.051–0.099 against 0.24–0.59 for zero),
+    and the UNet beats it by only 30–38 %. "Worse than bicubic `tp`", as in the four dry→wet
+    C3 cells, means a learned model that has lost information the input hands it directly.
+  - *RainShift.* `tp` is ERA5's own precipitation, a different product from IMERG, in m/h
+    and not clipped to IMERG's range. ERA5 `tp` scores worse than zero (L5 note above). So
+    bicubic `tp` is a weak reference there, and beating it says little.
+  - *Consequence.* Do not compare "skill over bicubic" across the two datasets. Use
+    in-domain-relative cost (E_T(f_S) / E_T(f_T) − 1) for cross-dataset statements, and
+    bicubic only within COSMO.

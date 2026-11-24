@@ -73,8 +73,12 @@ COSMO:
 - [x] C2: shift diagnosis (job 20502163, read 2026-11-16, PLAN_COSMO.md). (cape, tcw): clear
       excess in 7 of 10 pairs of the perfect model; (tp, cape) on fine pixels: 1 clear, 5 weak,
       4 within. The (cape, tcw) excess is mostly projection, so claim 1 / L1 becomes an upper
-      bound. Open: RainShift (tp, cape) as the control (one CPU job). *Submitted 2026-11-24:*
-      array 20901937, `scripts/rainshift_c2_tp_cape.sh` (P1b settings, block and fine).
+      bound. RainShift (tp, cape) control: array 20901937, read 2026-11-24 (PLAN.md). Clear
+      excess in all three pairs, block and fine alike, horn↔melanesia included (0.10 against
+      null 0.02): unlike COSMO, because RainShift `tp` is ERA5, not the target's block mean.
+      Upper bound; within-sub-bin `tp` mismatch not calibrated.
+- [x] West-africa input ranges (array 20900124, read 2026-11-24, PLAN.md R5): in-region
+      exceedance is ~8 `cape` pixels; hypothesis weak, blow-up unexplained.
 
 ## M2 — by 2026-12-18: C3 and the paper-type gate
 

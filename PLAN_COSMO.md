@@ -337,6 +337,27 @@ All figures are `mse_log_e01`, as a mean over seeds 42/43/44, with the seed sd i
   - **Caveats.** Five regions, so this is little power and one test among five, without
     correction. On COSMO, "the transfer cost does not depend on input shift" is not
     supported for the dynamic inputs; it holds only for `sp`.
+- **Hypothesis, support asymmetry (2026-11-17, not tested).** The transfer cost is
+  directional: wet→dry is nearly free (−3 % to +11 %, except the two Alps cells), and
+  dry→wet costs (+2 % to +333 %).
+  - *The idea.* Even the wettest regions are dry 86–89 % of hours, so a wet source's
+    training data contain the dry target's conditions. A dry source never sees the wet
+    target's moist tail and must extrapolate there, in its own normalised space, through
+    the exp of the log output.
+  - *Why the metric is not the cause.* The obvious alternative is a floor in the metric:
+    every model gets a dry target's dry pixels right, so ratios compress. The references
+    argue against it. The headroom over the in-domain model is about the same in the
+    driest and a wet target: zero predictor +590 % into Spain and +1000 % into the
+    British Isles; bicubic `tp` +48 % and +49 %. So the metric does discriminate in dry
+    targets, and the small costs there are real.
+  - *Tests.*
+    1. Per cell, the fraction of target hours with inputs outside the source's training
+       range. This should order the cost better than log2(mean_T / mean_S) does
+       (ρ +0.76, relabelling p 0.11).
+    2. The log error split into wet-pixel misses, dry-pixel false alarms and extremes.
+    3. compare_fields 20613827: the maxima in the four large cells.
+  - *What it does not explain.* Alps→British Isles (+31 %) and Alps→Scandinavia (+26 %)
+    go wet→dry and still cost, which points to terrain (P(Y|X)), not to support.
 - **Gate (A3 item 3).** It is not a null. 4 of 20 pairs have a gap far outside seed noise and
   below a non-learned baseline. 6 are small but clear: +0.005 to +0.016, the four into the
   Alps and alps into british_isles and scandinavia. 10 are within noise. C4's
@@ -344,6 +365,101 @@ All figures are `mse_log_e01`, as a mean over seeds 42/43/44, with the seed sd i
   list, is one of them; Scandinavia→Spain is its no-gap reverse.
 - **Seed sensitivity (Tom).** It is concentrated where the gap is: sd 0.05–0.06 on gaps of
   0.09–0.16. Any method comparison on those cells needs ≥ 3 seeds.
+
+**C2–C3 synthesis (2026-11-17).** Sources: the C2 JSONs, the three C3 `results.csv`,
+`references.csv` and `figures/cosmo_c3/` 01–12. Source-only only. Still pending:
+compare_fields 20613827 for the maxima.
+
+1. **In the perfect model, transfer mostly works.**
+   - 10 of 20 pairs are within seed noise of the target's own model, in the log floor and in
+     mm MAE alike. Every source reaches the in-domain model on C. Spain and on Poland.
+   - What one COSMO region learns largely holds in another: same model physics, same
+     coarse-to-fine operator. That is the clean contrast with RainShift, where no pair
+     transfers for free.
+2. **Where it fails, it fails by direction, not by distance.**
+   - The cost matrix is strongly asymmetric. The two driest sources into the two wettest
+     non-Alpine targets cost +199 % to +333 % in the log floor and +70 % to +110 % in MAE.
+     So it is not a log-floor artefact.
+   - The reverse cells cost −3 % to +6 %.
+   - Pattern: a wet source contains the dry target's conditions, a dry source does not
+     contain the wet target's moist tail (support-asymmetry hypothesis above). The
+     reference check rules out a metric floor as the cause.
+3. **The failing cells are under-determined, not just biased.**
+   - Seed sd there is 0.05–0.06 on gaps of 0.09–0.16, and ≤ 0.008 in every other cell.
+   - Outside the source's support the training data no longer constrain the model, and
+     different initialisations and data orders extrapolate differently.
+   - This is Tom's flat-loss point, measured: it sits in the cells where source support
+     does not cover the target, and it is absent where it does. The toy problem should
+     illustrate this case, a flat source loss over the target's regime. That is cleaner
+     than the RainShift oracle-source-cost read, which fitted only horn as a source.
+4. **In those cells the learned model is worse than not learning.**
+   - All four are worse than bicubic `tp`, which on COSMO is the exact block mean
+     upsampled.
+   - The UNet throws away the coarse rain the input hands it, so this is extrapolation,
+     not a missing sub-grid mapping.
+5. **Which diagnostics see it.**
+   - *Dynamic-input shift, measured in source units,* orders the cost (ρ +0.53, relabelling
+     p 0.008), though not monotonically. It is label-free and directional.
+   - *Symmetric statistics cannot predict an asymmetric cost.* The C2 conditional excess on
+     (cape, tcw) is largest for Spain–Scandinavia (0.120), yet Spain→Scandinavia costs
+     +312 % and Scandinavia→Spain −2 %. On (tp, cape) at 2.2 km the excess is ≤ 0.010:
+     given coarse rain, the sub-grid mapping is nearly shared. The (cape, tcw) excess is
+     mostly projection (C2 read). The UNet sees all inputs and the statics, and it absorbs
+     that excess wherever the source covers the target.
+   - *`sp` shift is irrelevant to the cost.* Poland and British Isles → Spain and Alps are
+     4.4–5.3 source sd, and cost −3 % to +16 %.
+6. **The Alps are the one place where a mapping story fits.**
+   - Every source into the Alps costs +8 % to +26 %, including the wet ones.
+   - The Alps as source cost +26–31 % going wet→dry into the British Isles and
+     Scandinavia.
+   - Terrain changes P(Y|X) in a way the matched (cape, tcw) test only partly sees.
+7. **Every model is too dry, transferred or not:** 20–38 % of the target's mean rain is
+   missing. The dry→wet cells are drier than the target's own model, by 11–17 points of mean
+   rain on the British Isles and Scandinavia. Dryness is not what separates them, though:
+   Alps → British Isles misses only 12 % and still costs +31 %.
+8. **compare_fields read (job 20613827, 2026-11-17).** Poland and Spain into the British Isles
+   and Scandinavia, against the same-target control (the other wet region) and the target's
+   own model. Seeds 42/43/44, every 10th test hour. Outputs:
+   `results/plots/compare_fields_cosmo_c3_seed<S>/<target>/summary.csv`.
+   - **Blow-ups exist but do not drive the cost.**
+     - Maxima reach 579–56,665 mm/h against a true maximum of 52–71. Above-training-max
+       pixels are 0.7–28 per million.
+     - Spain seed 44 has no blow-up at all (maxima 19 and 37 mm/h), yet it is the worst
+       cell (0.242 and 0.267).
+     - The RMSE inflation comes from these few pixels; the log-floor cost does not.
+   - **The cost is missing rain occurrence.**
+     - The failing cells' wet fraction is 0.050–0.094, against 0.111 and 0.135 true and
+       0.098–0.125 for the in-domain and control models.
+     - The cell's score follows its wet fraction across seeds. Spain→British Isles: wet
+       fraction 0.083 / 0.064 / 0.050 and score 0.141 / 0.188 / 0.242. Mean rain falls with
+       it (0.082 / 0.067 / 0.036 against 0.100 true).
+     - p99 is also low: 1.0–2.0 against 2.1–2.4 true.
+     - So a dry source run on a wet target's moist hours mostly produces no rain where it
+       rains, plus a rare extreme. The UNet does not discard the coarse rain wholesale (the
+       C3 synthesis point 4 wording is too strong). It under-produces rain occurrence in
+       the regime it never saw.
+   - **The seed spread is in how dry each seed extrapolates.** Spain→British Isles goes from
+     wet 0.083 (seed 42) to 0.050 (seed 44). That is the under-determination of point 3,
+     made concrete: the seeds disagree on how often it rains outside the source's support.
+   - **Controls behave.** Scandinavia→British Isles and British Isles→Scandinavia stay
+     within 0.004 of the in-domain score in every seed, with maxima ≤ 109 mm/h.
+   - (The plots label the truth "IMERG obs" and the input "ERA5 tp"; on COSMO they are the
+     2.2 km target and the coarse `tp`.)
+
+**What this means for UDA (the hypothesis to take to C4–C5 and to RainShift).**
+- Unlabelled target inputs can tell *where* a source will fail: the input shift in source
+  units is label-free and orders the cost.
+- They cannot supply *what* Y is in the region the source never saw. A feature-alignment term
+  makes the target's moist tail look like the source's bulk. That hides the extrapolation
+  instead of resolving it.
+- Prediction for C5 on Spain→Scandinavia: alignment methods do not recover the gap, and they
+  may shrink the seed spread without moving the mean. Few-shot labels do recover it.
+  Scandinavia→Spain is a no-gap control: any method that costs there is pure harm.
+
+**C2–C3 caveats.** Five regions, so the relabelling tests have little power. Five predictors
+were tested without correction. Source-only only. RainShift seeds do not vary data order and
+COSMO seeds do (`--data_order_seed`), so the seed spreads of the two datasets are not
+comparable one to one.
 
 **C4 — Oracle on 4 pairs (~8 A100-h; seeds 43/44 only if λ̂ is near noise).** The pairs are
 Spain→Scandinavia, Scandinavia→Spain, and two chosen from C2 to span the shift range (lowest and
@@ -360,9 +476,113 @@ highest P1b excess). λ̂, gap and budget come from the same aggregation code as
 - Not run: DANN, joint_ot, spectral, CORAL, mmd_ms. The lesson is that they add rows, not
   findings.
 
-**C6 — AFM on COSMO: optional.** Only if C3–C5 show a gap that the MSE objective might explain
-(e.g. the all-zero or dry-collapse pattern again). Then: phase 1 on the 2 regions of the
-headline pair, oracle, FDA (~30 A100-h).
+**C6 — The model ladder: UNet, AFM, CFM (rewritten 2026-11-17, replaces the optional AFM item).**
+
+*Why a ladder.*
+- A deterministic-only study can be dismissed: the UNet regresses the conditional mean.
+- AFM alone does not answer that. Its flow starts from z = μ + σ_z·ε, where μ is a
+  `DualEncoderUNet` trained with MSE, σ_z is an EMA of μ's RMSE, and the checkpoint is chosen
+  on μ's MSE (`models/afm.py`, `train_afm.py`).
+- So the arm is three models, each one step from the next, sharing the same
+  `DualEncoderUNet`, data, splits, seeds, scoring and BN handling:
+
+| rung | the `DualEncoderUNet` output is | loss | selection |
+|---|---|---|---|
+| UNet | the prediction | MSE (log space) | val MSE |
+| AFM | μ, the start of the flow (z = μ + σ_z ε) | flow + MSE on μ | val MSE of μ (as on RainShift) |
+| CFM | a conditioning field for the flow; the flow starts from N(0, I) | flow only | val CRPS |
+
+- In AFM the flow net is conditioned on raw `x_dyn`, `x_stat` and x_t, and the encoder only
+  supplies its start. CFM keeps the encoder but feeds its output to the flow net as an extra
+  conditioning channel, trained only through the flow loss.
+- So all three rungs have the same encoder, and every alignment term acts on the same
+  bottleneck. The rungs differ in what the encoder is asked to be: the answer (UNet), the
+  centre of the answer (AFM), or a learned description of the input (CFM).
+- *Reading.*
+  - The four dry→wet cells fail on all three rungs: the failure does not depend on the
+    objective.
+  - They fail on UNet and AFM but not CFM: the regression mean is the cause.
+  - Either reading is a result.
+
+*What the generative rungs add beyond "same result".* Does the ensemble know it is outside
+the source's support? Per cell, the spread-skill ratio, rank histograms and CRPS:
+- widening spread in the dry→wet cells is a partial rescue (honest uncertainty);
+- unchanged, overconfident spread is the UNet's failure in another form.
+
+*Which UDA methods carry over to the generative rungs.*
+
+| method | UNet | AFM | CFM | note |
+|---|---|---|---|---|
+| FDA | yes | yes | yes | input space, no target forward, model-agnostic |
+| AdaBN | yes | yes | yes | flow-net BN sees x_t at every t: re-estimate on the sampler's trajectories over target inputs (already in `train_afm.py --adabn_from`). Re-estimation itself costs up to 0.015 CRPS on source (RainShift 3.6), so it is a labelled control |
+| MMD (GAP bottleneck, BN-fixed target pass) | yes | yes | yes | acts on the shared encoder. In AFM the flow net is never aligned (`build_uda` docstring). In CFM the aligned features feed the flow net, so alignment reaches the generative path |
+| CORAL, DANN | yes | possible | possible | same placement as MMD. DANN blew up in mm on the UNet; run on generative rungs only if MMD acts |
+| joint_ot (DeepJDOT) | yes | no | no | needs a target prediction at every step; for CFM that is an ODE solve (10–20 net calls) or a noisy one-step estimate, and its rationale is void on AFM (D2) |
+| spectral | yes | μ only | no | a spectrum loss on the prediction; CFM has no μ, and on samples it costs an ODE solve per step |
+
+The shared method set is FDA, AdaBN and BN-fixed MMD (plus CORAL/DANN only if MMD acts).
+joint_ot and spectral stay UNet-only and are reported as such.
+
+*Scope.*
+- Same pairs, seeds and methods on every rung wherever a rung runs: a comparison across
+  rungs exists only where all three see the same cell.
+- **Tier 1, all three rungs (the commitment):**
+  1. Phase 1 on all 5 regions × seeds 42/43/44.
+  2. The 20-pair source-only matrix.
+  3. Oracle, FDA, AdaBN and MMD on a pre-registered core of 6 pairs, three regions both
+     ways:
+     - Spain ↔ Scandinavia: +312 % / −2 %, failing and control;
+     - Poland ↔ British Isles: +209 % / −1 %, a second failing/control pair;
+     - Alps ↔ British Isles: +31 % / +13 %, terrain.
+- **Tier 2, the goal:** the UNet on all 20 pairs (oracle, FDA, AdaBN, MMD), and AFM and CFM
+  extended to all 20 pairs as budget allows, failing cells first.
+- **Seeds:** 3 everywhere. In the failing cells the UNet seed spread is ~40 % of the gap, so
+  one seed cannot rank anything there.
+
+*Cost, rough. The per-run estimates are scaled, not measured on COSMO.*
+- COSMO UNet phase 1 measured 1.2–1.7 A100-h. A target-forward UNet run is about 2×; the
+  oracle is about 2×.
+- AFM/CFM: about 600 s/epoch, scaled from RainShift's ~1,050 s by train size. About 4 h for
+  phase 1 and 6–8 h with a target forward.
+
+| block | runs | A100-h |
+|---|---|---|
+| UNet, oracle and 3 methods on all 20 pairs | 240 | ~470 |
+| AFM + CFM phase 1 | 30 | ~120 |
+| AFM + CFM, Tier 1 core (6 pairs × 4 arms × 3 seeds × 2 models) | 144 | ~650 |
+| **Tier 1 + UNet on all pairs** | | **~1,250** |
+| AFM + CFM on the remaining 14 pairs (Tier 2) | 336 | ~1,550 |
+| **Everything on all pairs** | | **~2,800** |
+
+At gpu-normal's 6 GPUs per user, 1,250 A100-h is about 9 days of saturated queue, and
+2,800 about 20. That has to be cleared with Tom against the shared allocation before
+Tier 2.
+
+*Prerequisites, in order.*
+1. Port `--target_bn eval` to `train_afm.py`, with a test like `test_target_bn.py`.
+   Without it, AFM/CFM + MMD reproduces the known BN artefact.
+2. Implement CFM in `models/afm.py` / `train_afm.py`:
+   - a mode flag;
+   - start from N(0, I) with σ = 1 in log-normalised space;
+   - the encoder output concatenated as conditioning, no encoder loss, no σ_z;
+   - `--select_on crps`.
+
+   Smoke test, then a short LR check on one region (AFM's tuned LR is not automatically
+   CFM's).
+3. Ensemble scoring on COSMO through `evaluate.py`'s CRPS path, checked on one cell
+   against `cosmo_references.py`'s deterministic numbers. Add spread-skill and rank
+   histograms if missing.
+4. The C4 oracle and C5 UDA pairs are replaced by the Tier 1 core above, the same for all
+   three rungs.
+
+*Prediction, recorded before any run.*
+- The direction asymmetry and the four failing cells reappear on all three rungs: a
+  generative objective does not add support.
+- FDA and MMD do not close Spain→Scandinavia or Poland→British Isles on any rung; the
+  oracle does.
+- Whether CFM's spread widens in the failing cells is open; that is the reason to run it.
+- Not chosen: a cGAN (Harris et al. 2022) or score-based diffusion (Addison et al.). A
+  different family would add architecture as a second variable. Keep in reserve for review.
 
 **C7 — Climate shift (PGW +3K), cheap and high value.**
 - Preprocess the PGW run for 2 regions (Spain, Scandinavia), test years only (the 2094–2095
