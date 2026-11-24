@@ -5,6 +5,7 @@ import json
 import math
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -18,6 +19,9 @@ from data.dataset import inverse_transform, load_domain_stats
 from data.dataset_zarr import ClimateSRDatasetZarr, JointZarrDataset
 from models.afm import AFMModel
 from prob_metrics import crps_fair
+# One implementation of the eval-mode BatchNorm target pass for both arms
+# (B4.9; PLAN_COSMO.md C6 prerequisite 1).
+from train_unet import _bn_eval
 from uda import (
     DomainDiscriminator,
     coral_loss,
@@ -41,6 +45,9 @@ _NEEDS_TARGET_BATCH = _NEEDS_TARGET_FORWARD | {"fda"}
 # --uda_grad_ratio, as in train_unet.py: cap on the gradient-matched weight.
 _LAM_CAP = 100.0
 _GRAD_MATCHED = ("mmd", "mmd_ms", "dann")
+# CFM has no mu: spectral acts on mu, and joint_ot's label-transfer term needs
+# a target prediction at every step (an ODE solve for CFM). PLAN_COSMO.md C6.
+_CFM_REFUSED = {"spectral", "joint_ot"}
 
 
 def _tag(s, t):
@@ -165,9 +172,16 @@ def build_ema(model, decay):
 
 def train_one_epoch(
     model, src_ld, tgt_ld, opt, uda_comp, method, lam_eff, beta, device, epoch, total, dann_weight=5e-4,
-    jdot_alpha=1.0, jdot_reg=0.1, ema=None, grad_ratio=0.0, lam_state=None,
+    jdot_alpha=1.0, jdot_reg=0.1, ema=None, grad_ratio=0.0, lam_state=None, target_bn="train",
 ):
-    """grad_ratio > 0 (mmd / mmd_ms / dann), as in train_unet.py: instead of
+    """target_bn: "train" (default, every AFM run to date) forwards the target
+    batch through the encoder with train-mode BatchNorm, which mixes target
+    statistics into the running averages (and, through the EMA's buffers,
+    into best.pt). "eval" uses the running statistics and never updates them
+    (train_unet._bn_eval, B4.9). Only the encoder sees target data during
+    training; the flow net never does, so the flag changes the encoder only.
+
+    grad_ratio > 0 (mmd / mmd_ms / dann), as in train_unet.py: instead of
     lam_eff (dann_weight for DANN), weight the alignment term so that its
     gradient on the encoder's dynamic encoder and bottleneck is grad_ratio
     times the task gradient there. The task is flow + enc_w * enc, so a
@@ -184,6 +198,7 @@ def train_one_epoch(
     alpha = dann_grl_schedule(epoch, total) if method == "dann" else 1.0
     need_tgt = method in _NEEDS_TARGET_BATCH
     tgt_it = iter(tgt_ld) if need_tgt else None
+    tgt_ctx = (lambda: _bn_eval(model)) if target_bn == "eval" else nullcontext
     matched = grad_ratio > 0 and method in _GRAD_MATCHED
     if matched:
         # model.encoder's own names: model.named_parameters() would also match
@@ -209,23 +224,30 @@ def train_one_epoch(
         task = out["total_loss"]
         uda = torch.tensor(0.0, device=device)
 
+        # Every target forward runs under tgt_ctx (eval-mode BN with
+        # --target_bn eval, a no-op otherwise).
         if method == "coral":
-            _, tf = model(xt, st, extract_features=True)
+            with tgt_ctx():
+                _, tf = model(xt, st, extract_features=True)
             uda = uda_comp["loss_fn"](out["features"]["bottleneck"], tf["bottleneck"])
         elif method == "mmd":
-            _, tf = model(xt, st, extract_features=True)
+            with tgt_ctx():
+                _, tf = model(xt, st, extract_features=True)
             uda = uda_comp["loss_fn"](out["features"]["bottleneck"], tf["bottleneck"])
         elif method == "mmd_ms":
-            _, tf = model(xt, st, extract_features=True)
+            with tgt_ctx():
+                _, tf = model(xt, st, extract_features=True)
             uda = uda_comp["loss_fn"](out["features"], tf, levels=uda_comp["levels"])
         elif method == "dann":
-            _, tf = model(xt, st, extract_features=True)
+            with tgt_ctx():
+                _, tf = model(xt, st, extract_features=True)
             uda = dann_loss(uda_comp["disc"], out["features"]["bottleneck"], tf["bottleneck"], alpha)
         elif method == "joint_ot":
             # Joint alignment needs the target PREDICTION as well as target
             # features: the label-transfer cost couples source labels to the
             # model's output at target inputs.
-            tp_pred, tf = model(xt, st, extract_features=True)
+            with tgt_ctx():
+                tp_pred, tf = model(xt, st, extract_features=True)
             uda = uda_comp["loss_fn"](
                 out["features"]["bottleneck"], tf["bottleneck"], ys, tp_pred,
                 alpha=jdot_alpha, reg=jdot_reg,
@@ -235,7 +257,8 @@ def train_one_epoch(
             # than re-running the encoder on xs: a third forward doubles the
             # cost and updates this batch's BatchNorm running stats twice.
             sp = out["mu"] if "mu" in out else model.encoder(xs, ss)
-            tp = model.encoder(xt, st)
+            with tgt_ctx():
+                tp = model.encoder(xt, st)
             uda = uda_comp["loss_fn"](sp, tp)
 
         # Standard fixed-or-scheduled weighting. lam_eff is computed once per
@@ -335,7 +358,13 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
         src_val_crps = build_crps_loader(args, args.source_path, ss, _bs)
         tgt_val_crps = build_crps_loader(args, args.target_path, ss, _bs) if args.joint_training else None
 
-    model = AFMModel(9, 2, 1, args.base_features, encoder_loss_weight=_ew).to(device)
+    model = AFMModel(9, 2, 1, args.base_features, encoder_loss_weight=_ew,
+                     mode=args.afm_mode, cond_ch=args.cond_ch).to(device)
+    # CFM has no cheap point forecast (deterministic_predict samples), so the
+    # per-epoch deterministic validation is skipped; it selects on CRPS
+    # (enforced in parse_args).
+    det_val = args.afm_mode == "afm"
+    nan_val = {"loss": float("nan"), "mae_mm": float("nan")}
     # With --ema_decay > 0, every validation score, the selection and best.pt
     # use the EMA copy; best.pt stays a plain AFMModel state dict, so the
     # evaluation and AdaBN paths load it unchanged.
@@ -347,7 +376,9 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
     opt = build_optimizer(model, _lr, ep, _er)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
 
-    tag = f"afm_{_tag(args.source_path, args.target_path)}__{args.uda_method}"
+    # Run directories are afm_* or cfm_*: evaluate.py infers the model from
+    # the prefix (and CFM's cond_ch from config.json).
+    tag = f"{args.afm_mode}_{_tag(args.source_path, args.target_path)}__{args.uda_method}"
     out = Path(args.output_dir) / tag
     out.mkdir(parents=True, exist_ok=True)
 
@@ -385,10 +416,10 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
             args.epochs,
             dann_weight=args.dann_weight,
             jdot_alpha=args.jdot_alpha, jdot_reg=args.jdot_reg, ema=ema,
-            grad_ratio=args.uda_grad_ratio, lam_state=lam_state,
+            grad_ratio=args.uda_grad_ratio, lam_state=lam_state, target_bn=args.target_bn,
         )
         sched.step()
-        val = evaluate(ev, src_val, device, ss)
+        val = evaluate(ev, src_val, device, ss) if det_val else nan_val
 
         # Validation CRPS of the sampled ensemble. With --select_on mse the
         # checkpoint is chosen on the encoder mean mu alone, and the flow
@@ -406,7 +437,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
         # argument -- selecting an oracle on source risk alone biases the
         # addressable budget downwards.
         val_tgt = None
-        if args.joint_training:
+        if args.joint_training and det_val:
             val_tgt = evaluate(ev, tgt_val, device, ss)
         if args.select_on == "crps":
             src_sel, tgt_sel = crps_src, crps_tgt
@@ -498,7 +529,7 @@ def run_training(args, device, lr=None, lambda_uda=None, batch_size=None, fda_be
         combo = (
             Path(args.output_dir)
             / "best_hp"
-            / f"afm_{_tag(args.source_path, args.target_path)}__{args.uda_method}.json"
+            / f"{args.afm_mode}_{_tag(args.source_path, args.target_path)}__{args.uda_method}.json"
         )
         combo.parent.mkdir(parents=True, exist_ok=True)
         combo.write_text(json.dumps(cfg, indent=2))
@@ -559,13 +590,13 @@ def _adabn_afm(model, loader, device, steps=20, max_batches=100, seed=0):
             break
         x, s = x.to(device), s.to(device)
         x = model._match_dyn(x, s)
-        mu = model.encoder(x, s)
-        noise = torch.randn(mu.shape, generator=g, device=mu.device, dtype=torch.float32)
-        z = mu.float() + model.sigma_z * noise
+        # AFM: z = mu + sigma_z * eps, flow conditioned on x. CFM: z = eps,
+        # flow conditioned on x and the encoder's field (AFMModel.start_state).
+        f_dyn, z = model.start_state(x, s, generator=g)
         for i in range(steps):
-            t = torch.full((mu.shape[0],), i * dt, device=mu.device)
-            v1 = model.flow_net(z, t, x, s).float()
-            v2 = model.flow_net(z + v1 * dt / 2, t + dt / 2, x, s).float()
+            t = torch.full((z.shape[0],), i * dt, device=z.device)
+            v1 = model.flow_net(z, t, f_dyn, s).float()
+            v2 = model.flow_net(z + v1 * dt / 2, t + dt / 2, f_dyn, s).float()
             z = z + v2 * dt
     model.eval()
 
@@ -679,9 +710,27 @@ def parse_args():
         default=None,
         help="Cap the number of chunks per split (smoke tests). " "Replaces the old --subset_size.",
     )
+    p.add_argument("--target_bn", default="train", choices=["train", "eval"],
+                   help="BatchNorm mode of the encoder's target forward (B4.9): 'train' (every AFM run to date) "
+                        "mixes target statistics into the running averages; 'eval' uses the running statistics "
+                        "and never updates them (train_unet._bn_eval). Needs a side tree.")
+    p.add_argument("--afm_mode", default="afm", choices=["afm", "cfm"],
+                   help="'afm': Adaptive Flow Matching (flow from mu + sigma_z eps, encoder MSE). 'cfm': plain "
+                        "conditional flow matching, flow from N(0, I), encoder output = --cond_ch conditioning "
+                        "channels, flow loss only (PLAN_COSMO.md C6). Run directories are prefixed afm_/cfm_.")
+    p.add_argument("--cond_ch", type=int, default=8,
+                   help="cfm: channels of the encoder's conditioning field fed to the flow net.")
     args = p.parse_args()
     if args.uda_grad_ratio > 0 and args.uda_method not in _GRAD_MATCHED:
         p.error(f"--uda_grad_ratio applies to {', '.join(_GRAD_MATCHED)} only")
+    if args.target_bn == "eval" and args.uda_method not in _NEEDS_TARGET_FORWARD:
+        p.error(f"--target_bn eval only changes methods with a target forward "
+                f"({sorted(_NEEDS_TARGET_FORWARD)}), not {args.uda_method}")
+    if args.afm_mode == "cfm":
+        if args.uda_method in _CFM_REFUSED:
+            p.error(f"--afm_mode cfm does not support {args.uda_method} (no mu; PLAN_COSMO.md C6)")
+        if args.select_on != "crps":
+            p.error("--afm_mode cfm has no cheap point forecast: use --select_on crps")
     return args
 
 
