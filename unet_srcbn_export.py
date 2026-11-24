@@ -20,6 +20,15 @@ train mode under no_grad at the run's batch size (torch seed 1000), write
 fields; written last, so evaluate.py sees a finished run). Only BatchNorm
 buffers change. Refuses existing run directories and methods that never
 forward the target (none, fda, adabn).
+
+--control (MILESTONES M1, "Source-BN control") inverts the method check: it
+accepts only none and fda, which never forward the target, so their trained
+BN statistics are already source-only (an EMA, momentum 0.1, over training;
+FDA's are over FDA-styled source batches). Re-estimating them the same way
+measures what the re-estimation alone does -- the cumulative average over
+200 batches of the final weights against the training EMA -- which the
+target-forward rows must be read against. adabn is refused either way: its
+BN is meant to be the target's. config.json records srcbn_control.
 """
 
 import argparse
@@ -35,6 +44,7 @@ from data.dataset_zarr import ClimateSRDatasetZarr
 from evaluate import load_model
 
 TARGET_FORWARD = {"coral", "mmd", "mmd_ms", "dann", "joint_ot", "spectral"}
+CONTROL = {"none", "fda"}
 
 
 @torch.no_grad()
@@ -65,14 +75,26 @@ def main():
     p.add_argument("--runs", nargs="+", required=True, help="phase-2 run dirs <src>__to__<tgt>__<method>")
     p.add_argument("--out_root", required=True)
     p.add_argument("--n_batches", type=int, default=200)
+    p.add_argument("--control", action="store_true",
+                   help="accept only none/fda runs (source-BN control), see the docstring")
     args = p.parse_args()
 
     device = torch.device("cuda")
     out_root = Path(args.out_root)
     runs = [Path(r) for r in args.runs]
-    bad = [r.name for r in runs if r.name.split("__")[-1] not in TARGET_FORWARD]
+    allowed = CONTROL if args.control else TARGET_FORWARD
+    bad = [r.name for r in runs if r.name.split("__")[-1] not in allowed]
     if bad:
+        if args.control:
+            raise SystemExit(f"ERROR: --control takes only {sorted(CONTROL)} runs; got {bad}.")
         raise SystemExit(f"ERROR: {bad} do not forward the target in training; nothing to remove.")
+    if args.control:
+        # The source-only tag __none is shared with the oracle (CLAUDE.md):
+        # a jointly trained run here would be a different control.
+        joint = [r.name for r in runs
+                 if json.loads((r / "config.json").read_text()).get("joint_training")]
+        if joint:
+            raise SystemExit(f"ERROR: {joint} are joint (oracle) runs, not source-only.")
     clash = [r.name for r in runs if (out_root / r.name).exists()]
     if clash:
         raise SystemExit(f"ERROR: {clash} already exist in {out_root}; not overwriting.")
@@ -85,7 +107,8 @@ def main():
         d.mkdir(parents=True)
         torch.save(model.state_dict(), d / "best.pt")
         (d / "config.json").write_text(json.dumps(
-            {**cfg, "srcbn_from": str(run / "best.pt"), "srcbn_n_batches": n}, indent=2))
+            {**cfg, "srcbn_from": str(run / "best.pt"), "srcbn_n_batches": n,
+             "srcbn_control": args.control}, indent=2))
         print(f"  {run.name}: {n} source batches -> {d}", flush=True)
         del model
         torch.cuda.empty_cache()

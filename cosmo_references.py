@@ -15,6 +15,13 @@ use no learning:
 A reference depends only on the target region, so there are 5 x 4 rows; every
 cell (source -> target) of the transfer matrix shares its target's rows.
 
+RainShift (MILESTONES M1, L4; PLAN.md R5 step 4) uses the same script on its
+stores: input `tp` is ERA5's own precipitation (m, hourly, x1000 -> mm/h) on
+80 x 80, the target IMERG on 200 x 200. 200 is not a multiple of 80, so
+block_tp is not defined and is left out (its block error column is NaN);
+bicubic_tp is then a weak reference (report/aies/NOTES.md). COSMO, where the
+output is a multiple of the input, is unchanged.
+
 Metrics as evaluate.py: per-sample mean over pixels, then mean over samples,
 for mse_log_e01 / mse_log_e001 (log(mm + floor)); mae_mm, rmse_mm, bias_mm
 over all pixels. Added: wet fraction (>= 0.1 mm/h) and maximum of the
@@ -76,22 +83,27 @@ def score_region(root):
     di = xr.open_zarr(root / "test_data_in.zarr")
     do = xr.open_zarr(root / "test_data_out.zarr")
     n = do.sizes["time"]
+    n_in, n_out_full = di["tp"].shape[-1], do["precipitation"].shape[-1]
+    blocks = n_out_full % n_in == 0
+    refs = REFS if blocks else tuple(r for r in REFS if r != "block_tp")
     acc = {r: {"se": 0.0, "ae": 0.0, "bias": 0.0, "wet": 0, "max": 0.0,
-               **{f"log_{f}": [] for f in FLOORS_MM}} for r in REFS}
-    t_wet, t_max, n_pix, block_err = 0, 0.0, 0, 0.0
+               **{f"log_{f}": [] for f in FLOORS_MM}} for r in refs}
+    t_wet, t_max, n_pix = 0, 0.0, 0
+    block_err = 0.0 if blocks else float("nan")
     for t0 in range(0, n, CHUNK):
         sl = slice(t0, t0 + CHUNK)
         y = np.clip(np.nan_to_num(do["precipitation"].isel(time=sl).values.astype(np.float32),
                                   nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
         tp = np.nan_to_num(di["tp"].isel(time=sl).values.astype(np.float32), nan=0.0) * 1000.0
         n_out = y.shape[1]
-        b = n_out // tp.shape[1]
-        ym = y.reshape(y.shape[0], tp.shape[1], b, tp.shape[1], b).mean(axis=(2, 4))
-        block_err = max(block_err, float(np.abs(ym - tp).max()))
+        if blocks:
+            b = n_out // tp.shape[1]
+            ym = y.reshape(y.shape[0], tp.shape[1], b, tp.shape[1], b).mean(axis=(2, 4))
+            block_err = max(block_err, float(np.abs(ym - tp).max()))
         t_wet += int((y >= WET_MM).sum())
         t_max = max(t_max, float(y.max()))
         n_pix += y.size
-        for r in REFS:
+        for r in refs:
             p = predictions(r, tp, clim, n_out).astype(np.float64)
             d = p - y
             a = acc[r]
@@ -105,7 +117,7 @@ def score_region(root):
     di.close()
     do.close()
     rows = []
-    for r in REFS:
+    for r in refs:
         a = acc[r]
         rows.append({"reference": r, "n_samples": n,
                      "rmse_mm": np.sqrt(a["se"] / n_pix), "mae_mm": a["ae"] / n_pix,
@@ -133,7 +145,7 @@ def main():
             print(f"{r:18s} {row['reference']:12s} mse_log_e01 {row['mse_log_e01']:.4f}  "
                   f"mae {row['mae_mm']:.4f}  bias {row['bias_mm']:+.4f}  wet {row['wet_frac_pred']:.3f} "
                   f"(true {row['wet_frac_true']:.3f})  max {row['max_pred_mm']:.1f}", flush=True)
-        if rows[-1]["block_tp_max_abs_err_mm"] > 1e-3:
+        if rows[-1]["block_tp_max_abs_err_mm"] > 1e-3:  # False for NaN (no blocks)
             print(f"WARNING {r}: block mean of target differs from tp by "
                   f"{rows[-1]['block_tp_max_abs_err_mm']:.2e} mm/h")
     out.parent.mkdir(parents=True, exist_ok=True)
