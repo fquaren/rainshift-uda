@@ -1,0 +1,319 @@
+% Project status, 2026-11-24. Plain beamer, no branding.
+% Compile: pdflatex status_2026-11-24.tex (twice). Numbers from PLAN.md, PLAN_COSMO.md,
+% MILESTONES.md as of 2026-11-24.
+\documentclass[11pt,aspectratio=169,xcolor=table]{beamer}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{amssymb}
+\usepackage{array}
+
+\usetheme{default}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}{\leavevmode\hfill\insertframenumber\,/\,\inserttotalframenumber\hspace*{1em}\par\vskip0.5em}
+\setbeamertemplate{itemize items}{\textbullet}
+\setbeamerfont{frametitle}{series=\bfseries}
+\setbeamercolor{frametitle}{fg=black}
+\setbeamercolor{title}{fg=black}
+\setbeamercolor{structure}{fg=black!75}
+
+\definecolor{done}{gray}{0.55}
+\definecolor{plan}{gray}{0.85}
+\newcommand{\yes}{\textbf{yes}}
+\newcommand{\no}{no}
+\newcommand{\cdone}{\cellcolor{done}}
+\newcommand{\cplan}{\cellcolor{plan}}
+\newcommand{\take}[1]{\vfill\begin{block}{}#1\end{block}}
+\setbeamercolor{block body}{bg=black!6}
+
+\title{Unsupervised domain adaptation\\for precipitation downscaling}
+\subtitle{State of the project}
+\author{Filippo Quarenghi}
+\date{24 November 2026}
+
+\begin{document}
+
+%----------------------------------------------------------------------
+\begin{frame}[plain]
+\titlepage
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{The problem}
+\begin{itemize}
+  \item High-resolution rain observations are dense over Europe and North
+        America, sparse over most of the tropics.
+  \item Downscaling models are trained where observations exist and used
+        where they do not. Moved to another region, they lose much of their
+        skill.
+  \item \textbf{Unsupervised domain adaptation (UDA)} proposes a cheap fix:
+        during training, add the target region's \emph{inputs} (no rain
+        observations) and make the model treat both regions alike.
+  \item We test whether this works for precipitation downscaling, and when
+        it can work at all.
+\end{itemize}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Research questions}
+\begin{enumerate}
+  \item Does the relation \emph{rain given the atmosphere}, $P(Y\mid X)$,
+        differ between regions, or only the atmosphere, $P(X)$?
+  \item How much of the transfer gap could be recovered at best, and can
+        unlabelled target data find it?
+  \item Do UDA methods do inside the network what they claim to do?
+  \item Does the answer change with the model (deterministic vs.\
+        generative)?
+  \item Does a perfect-model setting, where the relation is shared by
+        construction, change the answer?
+\end{enumerate}
+\take{Organising idea: UDA can only help if $P(Y\mid X)$ is the same in both
+regions. That can be measured before any adaptation is trained.}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Setting}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{RainShift} & \textbf{COSMO perfect model} \\
+\midrule
+Input $\to$ target & ERA5 $\to$ IMERG & COSMO, coarse $\to$ 2.2\,km \\
+Coarse rain input & ERA5 rain, another product & exact block mean of the target \\
+Grid & $80^2 \to 200^2$ ($2.5\times$) & $20^2 \to 200^2$ ($10\times$) \\
+Regions & Europe W, Horn of Africa, Melanesia & 5 European regions \\
+ & (+ N.\ America E, W.\ Africa, no methods) & \\
+Directions & 6 with methods (20 without) & 20 \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{itemize}
+  \item \textbf{Models:} U-Net (deterministic); AFM, a flow-matching model
+        that starts from the U-Net's mean; CFM, plain conditional flow
+        matching (coded, not trained yet).
+  \item \textbf{Methods:} FDA, AdaBN, DANN, MMD, DeepJDOT, a spectral loss.
+        References: the \emph{oracle} (trained with target labels) and
+        few-shot fine-tuning.
+  \item \textbf{Score:} error of $\log(\text{rain} + 0.1\,\text{mm/h})$,
+        always checked against mm bias, wet fraction and maximum. 3 seeds.
+\end{itemize}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{How we cut the problem: a lessons-learned paper}
+\begin{itemize}
+  \item No method gives a real gain. A method paper is neither possible
+        nor the point.
+  \item What we have is general: how to tell in advance whether UDA can
+        help, and how a failing method can look successful.
+  \item Venue: AIES, \emph{Lessons Learned} article type. A full article
+        only if COSMO and RainShift contrast cleanly (decided with Tom in
+        December).
+\end{itemize}
+\medskip
+\textbf{The five lessons}
+\begin{enumerate}
+  \item Measure whether $P(Y\mid X)$ shifts before adapting.
+  \item Bound the problem with labels first (oracle, few-shot).
+  \item Check that the adaptation term acts as intended.
+  \item Evaluation choices can manufacture recovery.
+  \item A generative model does not change the diagnosis.
+\end{enumerate}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Lesson 1: the relation differs between RainShift regions}
+\small
+Test: within bins of two inputs, compare the rain distributions of two
+regions, against a null that shuffles whole weeks.
+
+\medskip
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Pair & binned on (CAPE, water vapour) & binned on (ERA5 rain, CAPE) \\
+\midrule
+Europe -- Horn      & \yes{} (0.28 vs.\ null 0.03) & \yes{} (0.10 vs.\ 0.04) \\
+Europe -- Melanesia & \yes{}, limited overlap      & \yes{} (0.06 vs.\ 0.02) \\
+Horn -- Melanesia   & \no{} (0.07 vs.\ 0.07)       & \yes{} (0.10 vs.\ 0.02) \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{itemize}
+  \item In COSMO, given the coarse rain, the fine-scale relation is nearly
+        the same in every pair (difference $\leq 0.01$).
+  \item Likely reason for the contrast: on RainShift, ERA5 rain and IMERG
+        are different products, and how they relate differs by region.
+  \item Caveat: upper bounds from two binned inputs; one calibration check
+        is still to run.
+\end{itemize}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Lesson 2: labels first}
+\begin{itemize}
+  \item \textbf{Oracle} (trained with labels from both regions): into the
+        tropics it reaches the target's own model, so the gap is fully
+        recoverable in principle. Into Europe it leaves 22--39\,\% of the
+        gap.
+  \item \textbf{Few-shot}: about 2{,}000 labelled target hours bring a
+        source model to the oracle in every direction.
+  \item So the gap is reducible, and cheaply with labels, but unlabelled
+        inputs do not tell the model which way to go.
+\end{itemize}
+\take{Before a UDA study, train the oracle and a few-shot curve. If a few
+thousand labels close the gap, the practical question is getting labels,
+not adaptation.}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Lesson 3: the alignment did not act; BatchNorm did}
+\begin{itemize}
+  \item Every method that runs target data through the network also mixes
+        target statistics into the BatchNorm layers.
+  \item Re-estimate those statistics on source data only, weights
+        unchanged: every method scores like no adaptation (U-Net, 3 seeds;
+        AFM). One exception, and it gets there with absurd pixels.
+  \item In the deployed network no method made the regions look alike: a
+        classifier still tells them apart 98--100\,\% of the time.
+  \item When we made the alignment act (BatchNorm kept out of the target
+        pass), MMD reached the oracle's log score into Melanesia in 3 of 3
+        seeds, but its mm error was worse in 2 of 3 (one seed up to
+        $9\times10^{6}$\,mm/h).
+  \item \textbf{Next check:} does plain ``more rain everywhere'' give the
+        same log score?
+\end{itemize}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Lesson 4: evaluation can manufacture recovery}
+\begin{itemize}
+  \item Tropical models applied to Europe predict no rain at all. They
+        score exactly like an all-zero field, so ``recovery'' there means
+        leaving zero.
+  \item Log scores hide absurd pixels: a DANN model with
+        $10^{6}$\,mm/h pixels scored well.
+  \item Horn and West Africa: the in-domain model is only 5--7\,\% better
+        than predicting zero. No method has room to show anything there.
+  \item The method ranking looked stable across seeds, but that came from
+        BatchNorm. Without it, no ranking is stable.
+  \item Every model, in-domain included, is far too dry.
+\end{itemize}
+\take{Always report: an all-zero and a climatology reference, mm bias, wet
+fraction, maximum, and at least three seeds.}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Lesson 5: a generative model does not change the diagnosis}
+\begin{itemize}
+  \item AFM's transfer gaps have the same shape as the U-Net's.
+  \item Tropical sources into Europe: the ensemble collapses to nearly dry
+        members.
+  \item One partial gain in the whole project: FDA into Europe beats
+        climatology in mm (CRPS 0.085--0.087 vs.\ 0.093\,mm). One model, two seeds.
+  \item A probabilistic score can reward spread alone when the baseline
+        ensemble has collapsed.
+\end{itemize}
+\take{Open: AFM still starts from a U-Net mean. Plain flow matching (CFM)
+on COSMO tests whether the conclusion depends on that.}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{COSMO perfect model: first results (no adaptation yet)}
+\begin{itemize}
+  \item \textbf{Transfer mostly works:} 10 of 20 directions are within seed
+        noise of the target's own model. On RainShift, none is.
+  \item \textbf{Failures depend on direction:} dry source $\to$ wet target
+        costs $+200$ to $+330\,\%$; the reverse costs $-3$ to $+6\,\%$.
+  \item \textbf{The cost is missing rain occurrence:} failing models rain
+        too rarely (wet fraction 0.05--0.09 vs.\ 0.11--0.14).
+  \item \textbf{Seeds disagree in the failing cells:} the source data do
+        not constrain the model there.
+\end{itemize}
+\take{Working hypothesis: a wet region contains the dry region's
+conditions, not the reverse. Unlabelled target inputs can say
+\emph{where} a model will fail, but not \emph{what} the rain is there.}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Where each question stands}
+\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.34\linewidth}>{\raggedright\arraybackslash}p{0.30\linewidth}>{\raggedright\arraybackslash}p{0.30\linewidth}@{}}
+\toprule
+Question & RainShift & COSMO \\
+\midrule
+1.\ Does $P(Y\mid X)$ shift? & yes; Horn--Melanesia depends on the test & barely, given coarse rain \\
+2.\ Recoverable, identifiable? & yes / no & oracle not run yet \\
+3.\ Do methods act? & no; BatchNorm did & not run yet \\
+4.\ Depends on the model? & no (AFM) & U-Net / AFM / CFM planned \\
+5.\ Perfect model different? & --- & transfer mostly works \\
+\bottomrule
+\end{tabular}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Next steps}
+\textbf{Until the decision meeting (mid-December)}
+\begin{itemize}
+  \item Run the ``more rain everywhere'' check; finish lesson 3.
+  \item Calibrate the lesson-1 test; finish the five-region RainShift
+        matrix and its shift tests.
+  \item A two-variable toy example of why unlabelled data cannot pick the
+        right model.
+  \item Spatial-structure scores (FSS, power spectra) for both datasets.
+  \item Prepare the generative models on COSMO: test run, learning rate,
+        ensemble scoring; then train AFM and CFM on 5 regions $\times$ 3
+        seeds.
+\end{itemize}
+\textbf{January--February: COSMO experiments}
+\begin{itemize}
+  \item U-Net, AFM, CFM on 6 core directions (Spain$\leftrightarrow$Scandinavia,
+        Poland$\leftrightarrow$British Isles, Alps$\leftrightarrow$British Isles):
+        oracle, FDA, AdaBN, MMD; 3 seeds.
+  \item U-Net on all 20 directions; few-shot; climate-change shift (+3\,K).
+\end{itemize}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Schedule}
+\small
+
+
+\begin{tabular}{@{}l|c|c|c|c|c@{}}
+ & Nov & Dec & Jan & Feb & Mar \\
+\hline
+RainShift closed, text of lessons 1--5      & \cdone & \cplan &    &    &    \\
+COSMO generative models: preparation, training & & \cplan &    &    &    \\
+\textbf{Decision meeting with Tom} (18 Dec) &    & \cplan &    &    &    \\
+COSMO: core directions, all three models    &    &    & \cplan &    &    \\
+COSMO: U-Net on all directions, +3\,K shift &    &    & \cplan & \cplan &    \\
+Final tables and figures, numbers frozen    &    &    &    & \cplan &    \\
+Writing                                     &    &    &    &    & \cplan \\
+\end{tabular}
+
+\medskip
+\begin{itemize}
+  \item Experiments done by end of February 2027, writing in March.
+  \item Compute: about 1{,}250 A100-hours for the core plan (about 9 days
+        of our full GPU quota), about 2{,}800 for everything. Needs Tom's
+        approval. Fallback: U-Net and CFM only.
+\end{itemize}
+\end{frame}
+
+%----------------------------------------------------------------------
+\begin{frame}{Decisions for the December meeting}
+\begin{enumerate}
+  \item \textbf{Paper type:} Lessons Learned (default) or a full article.
+  \item \textbf{Compute} for the three-model comparison on COSMO: core
+        only, full, or the reduced fallback.
+  \item \textbf{How to state Horn--Melanesia} in lesson 1: depends on one
+        test and on the calibration.
+  \item \textbf{Title.}
+\end{enumerate}
+\end{frame}
+
+\end{document}
